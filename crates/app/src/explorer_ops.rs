@@ -1627,8 +1627,9 @@ impl Explorer {
         }
         // Delete, copy and move change free space, so refresh the sidebar capacity bars.
         self.refresh_disk_space();
-        // Shelf items may have been moved or deleted.
+        // Shelf items and bookmarks may have been moved or deleted.
         self.recheck_shelf(cx);
+        self.recheck_bookmarks(cx);
         if let Some(id) = follow.job {
             if let Some(subject) = follow.subject.clone() {
                 crate::op_center::OpCenter::set_subject(cx, id, subject);

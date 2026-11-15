@@ -2737,6 +2737,15 @@ impl Explorer {
         }
     }
 
+    /// Opens a bookmark: folders navigate here, files open with the default app.
+    pub(crate) fn open_bookmark(&mut self, path: PathBuf, is_dir: bool, cx: &mut Context<Self>) {
+        if is_dir {
+            self.navigate(path, NavKind::New, cx);
+        } else {
+            self.open_file(path, cx);
+        }
+    }
+
     /// Opens with the default app. ShellExecuteExW loads third-party shell extensions, so it runs
     /// on a
     /// dedicated STA thread. Shortcuts (`.lnk`) to folders open in Arke instead of Explorer.

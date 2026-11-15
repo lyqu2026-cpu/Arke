@@ -56,8 +56,8 @@ Shell extensions from other programs run in a separate process, so a buggy one c
 - Each folder remembers its view and sort.
 - Tabs you can pin or save as workspaces. Split a tab into two panes with one shared preview,
   synchronized browsing and folder compare.
-- Spring-loaded folders, a shelf for collecting files from different folders, and a Home page
-  with recent files, drives and network locations.
+- Spring-loaded folders, a shelf for collecting files from different folders, bookmarks with
+  groups for folders and files, and a Home page with recent files, drives and network locations.
 
 **Preview**
 - A resizable preview pane and Quick Look (Space) for images, PDF, Word, Excel and PowerPoint,

@@ -6,7 +6,7 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use arke_core::filetype::FileKind;
+use arke_core::filetype::{FileKind, kind_for_extension};
 use gpui::{
     AnimationExt, AnyElement, App, ClickEvent, Context, Entity, ExternalPaths, MouseButton,
     MouseDownEvent, Pixels, Point, SharedString, Window, anchored, deferred, div, prelude::*, px,
@@ -14,12 +14,15 @@ use gpui::{
 };
 use rust_i18n::t;
 
+use super::saved::{error_text, field};
 use super::{DraggedTab, Tab, Workspace};
 use crate::a11y::A11yExt as _;
 use crate::assets::Icon;
+use crate::bookmarks::{Bookmark, BookmarkGroup, BookmarkStore, NameProblem};
 use crate::explorer::{DraggedFiles, Explorer, drop_external_into, drop_into, kind_icon};
 use crate::settings::{FAVORITES_LARGE, FAVORITES_MAX, SettingsStore};
 use crate::shell::{KnownFolder, Place, PlaceKind};
+use crate::text_input::{InputEvent, TextInput};
 use crate::theme::{self, UiFont as _};
 use crate::workspace::{Tooltip, TooltipBelowExt as _};
 
@@ -86,6 +89,26 @@ pub(super) enum SidebarAction {
     ShelfRemove(PathBuf),
     /// Go to a shelf item's folder and select it.
     ShelfReveal(PathBuf),
+    /// Open a bookmark: folders navigate, files open with the default app.
+    BookmarkOpen(u64),
+    BookmarkRename(u64),
+    BookmarkDelete(u64),
+    /// Move a bookmark to a group (`None` for ungrouped).
+    BookmarkMoveToGroup { id: u64, group: Option<u64> },
+    BookmarkMove { id: u64, up: bool },
+    /// Bookmark the active tab's folder.
+    BookmarkAddCurrent,
+    BookmarkNewGroup,
+    BookmarkGroupRename(u64),
+    BookmarkGroupDelete(u64),
+    BookmarkGroupMove { id: u64, up: bool },
+}
+
+/// What is being renamed inline in the sidebar.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum BookmarkRenameTarget {
+    Bookmark(u64),
+    Group(u64),
 }
 
 /// A pinned folder being dragged, from the tiles or the list.
@@ -603,7 +626,11 @@ impl Workspace {
         out
     }
 
-    pub(super) fn render_sidebar(&self, cx: &mut Context<Self>) -> impl IntoElement {
+    pub(super) fn render_sidebar(
+        &self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
         let explorer = self.active_view().read(cx);
         let current = explorer.display_path().map(Path::to_path_buf);
         let places = explorer.places.clone();
@@ -646,6 +673,7 @@ impl Workspace {
             .overflow_y_scroll()
             .children(pins)
             .children(self.render_shelf(cx))
+            .children(self.render_bookmarks(window, cx))
             .child(section_label(t!("sidebar.this_pc")))
             .children(devices)
             .children(network);
@@ -1325,6 +1353,18 @@ impl Workspace {
             | SidebarAction::ShelfClear
             | SidebarAction::ShelfRemove(_)
             | SidebarAction::ShelfReveal(_) => self.run_shelf_action(&action, window, cx),
+            SidebarAction::BookmarkOpen(_)
+            | SidebarAction::BookmarkRename(_)
+            | SidebarAction::BookmarkDelete(_)
+            | SidebarAction::BookmarkMoveToGroup { .. }
+            | SidebarAction::BookmarkMove { .. }
+            | SidebarAction::BookmarkAddCurrent
+            | SidebarAction::BookmarkNewGroup
+            | SidebarAction::BookmarkGroupRename(_)
+            | SidebarAction::BookmarkGroupDelete(_)
+            | SidebarAction::BookmarkGroupMove { .. } => {
+                self.run_bookmark_action(&action, window, cx);
+            }
             SidebarAction::OpenRecycleInNewTab => self.open_recycle(true, window, cx),
             SidebarAction::SetRecyclePinned(pinned) => Self::set_recycle_pinned(pinned, cx),
             SidebarAction::OpenInNewTab(path) => {
@@ -2055,5 +2095,538 @@ pub(crate) fn leave_drive_everywhere(drive: &Path, cx: &mut App) {
         if let Some(workspace) = window.downcast::<Workspace>() {
             let _ = workspace.update(cx, |ws, _, cx| ws.leave_drive(drive, cx));
         }
+    }
+}
+
+/// Icon kind for a bookmark, from what was recorded (no disk access).
+fn bookmark_kind(item: &Bookmark) -> FileKind {
+    if item.is_dir {
+        return FileKind::Folder;
+    }
+    item.path
+        .extension()
+        .and_then(|e| e.to_str())
+        .map_or(FileKind::Other, |e| kind_for_extension(&e.to_ascii_lowercase()))
+}
+
+impl Workspace {
+    /// The bookmarks section: header, groups (always expanded) with their items underneath,
+    /// then the ungrouped items.
+    pub(super) fn render_bookmarks(
+        &self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Vec<AnyElement> {
+        let bookmarks = BookmarkStore::global(cx).read(cx).bookmarks().clone();
+        let mut out = vec![self.bookmarks_header(cx)];
+        for group in bookmarks.groups() {
+            out.push(self.bookmark_group_header(group, window, cx));
+            for item in &group.items {
+                out.push(self.bookmark_row(item, true, bookmarks.groups(), window, cx));
+            }
+        }
+        for item in bookmarks.ungrouped() {
+            out.push(self.bookmark_row(item, false, bookmarks.groups(), window, cx));
+        }
+        if bookmarks.is_empty() {
+            out.push(
+                div()
+                    .h(theme::H_ROW)
+                    .flex()
+                    .flex_none()
+                    .items_center()
+                    .pl(theme::S_4 + theme::S_20 + theme::S_4)
+                    .pr(theme::S_8)
+                    .text_size(theme::FS_12)
+                    .text_color(theme::text_subtle())
+                    .child(t!("bookmarks.empty").into_owned())
+                    .into_any_element(),
+            );
+        }
+        out
+    }
+
+    /// The section header: star, title, count, and "+" to bookmark the active tab's folder.
+    /// Right click offers the same "+" plus "New group".
+    fn bookmarks_header(&self, cx: &mut Context<Self>) -> AnyElement {
+        let count = BookmarkStore::global(cx).read(cx).bookmarks().len();
+        let menu = vec![
+            (
+                t!("bookmarks.add_current").into_owned().into(),
+                SidebarAction::BookmarkAddCurrent,
+            ),
+            (
+                t!("bookmarks.new_group").into_owned().into(),
+                SidebarAction::BookmarkNewGroup,
+            ),
+        ];
+        div()
+            .id("bookmarks-row")
+            .a11y(gpui::Role::Button, t!("bookmarks.title"))
+            .relative()
+            .h(theme::H_ROW)
+            .flex()
+            .flex_none()
+            .items_center()
+            .gap(theme::S_4)
+            .pl(theme::S_4)
+            .pr(theme::S_8)
+            .rounded(theme::R_8)
+            .child(
+                svg()
+                    .path(Icon::Star.path())
+                    .size(theme::ICON)
+                    .flex_none()
+                    .text_color(theme::text_muted()),
+            )
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .truncate()
+                    .pl(theme::S_4)
+                    .child(t!("bookmarks.title").into_owned()),
+            )
+            .when(count > 0, |d| {
+                d.child(
+                    div()
+                        .flex_none()
+                        .text_size(theme::FS_12)
+                        .text_color(theme::text_subtle())
+                        .child(arke_core::format::format_count(count)),
+                )
+            })
+            .child(
+                div()
+                    .id("bookmarks-add")
+                    .a11y_button(t!("bookmarks.add_current"))
+                    .size(theme::S_20)
+                    .flex()
+                    .flex_none()
+                    .items_center()
+                    .justify_center()
+                    .rounded(theme::R_4)
+                    .hover(|s| s.bg(theme::wash_strong()))
+                    .child(
+                        svg()
+                            .path(Icon::Plus.path())
+                            .size(theme::ICON_SM)
+                            .text_color(theme::text_muted()),
+                    )
+                    .tooltip(tooltip_text(t!("bookmarks.add_current").into_owned()))
+                    .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
+                        cx.stop_propagation();
+                        this.bookmark_current_folder(cx);
+                    })),
+            )
+            .when(count == 0, |d| {
+                d.tooltip(tooltip_text(t!("bookmarks.tip").into_owned()))
+            })
+            .on_mouse_down(
+                MouseButton::Right,
+                cx.listener(move |this, e: &MouseDownEvent, _, cx| {
+                    this.open_sidebar_menu(e.position, menu.clone(), cx);
+                }),
+            )
+            .into_any_element()
+    }
+
+    /// A group header: its name and count. Right click renames, deletes, or reorders it.
+    fn bookmark_group_header(
+        &self,
+        group: &BookmarkGroup,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        if let Some((_, input, _)) = self.bookmark_renaming.as_ref().filter(|(target, _, _)| {
+            *target == BookmarkRenameTarget::Group(group.id)
+        }) {
+            return div()
+                .flex()
+                .flex_col()
+                .gap(theme::S_4)
+                .pl(theme::S_4 + theme::S_20 + theme::S_4)
+                .pr(theme::S_4)
+                .child(field(input, window, cx))
+                .children(self.bookmark_rename_error.clone().map(error_text))
+                .into_any_element();
+        }
+        let id = group.id;
+        let menu = vec![
+            (
+                t!("bookmarks.rename_group").into_owned().into(),
+                SidebarAction::BookmarkGroupRename(id),
+            ),
+            (
+                t!("bookmarks.delete_group").into_owned().into(),
+                SidebarAction::BookmarkGroupDelete(id),
+            ),
+            (
+                t!("bookmarks.move_group_up").into_owned().into(),
+                SidebarAction::BookmarkGroupMove { id, up: true },
+            ),
+            (
+                t!("bookmarks.move_group_down").into_owned().into(),
+                SidebarAction::BookmarkGroupMove { id, up: false },
+            ),
+        ];
+        div()
+            .id(("bookmarks-group", id as usize))
+            .h(theme::H_ROW)
+            .flex()
+            .flex_none()
+            .items_center()
+            .gap(theme::S_4)
+            .pl(theme::S_4 + theme::S_20 + theme::S_4)
+            .pr(theme::S_8)
+            .rounded(theme::R_8)
+            .hover(|s| s.bg(theme::wash()))
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .truncate()
+                    .text_color(theme::text())
+                    .child(group.name.clone()),
+            )
+            .child(
+                div()
+                    .flex_none()
+                    .text_size(theme::FS_12)
+                    .text_color(theme::text_subtle())
+                    .child(arke_core::format::format_count(group.items.len())),
+            )
+            .on_mouse_down(
+                MouseButton::Right,
+                cx.listener(move |this, e: &MouseDownEvent, _, cx| {
+                    this.open_sidebar_menu(e.position, menu.clone(), cx);
+                }),
+            )
+            .into_any_element()
+    }
+
+    /// One bookmark row: its name, dimmed when missing. Click opens it; right click offers
+    /// open, rename, delete, move to a group, and reorder.
+    #[allow(
+        clippy::too_many_lines,
+        reason = "One row's look, menu and remove button, kept together like the shelf rows"
+    )]
+    fn bookmark_row(
+        &self,
+        item: &Bookmark,
+        grouped: bool,
+        groups: &[BookmarkGroup],
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let id = item.id;
+        // Grouped items sit one indent deeper than ungrouped ones.
+        let indent = if grouped {
+            theme::S_4 + theme::S_20 + theme::S_4 + theme::S_20
+        } else {
+            theme::S_4 + theme::S_20 + theme::S_4
+        };
+        if let Some((_, input, _)) = self.bookmark_renaming.as_ref().filter(|(target, _, _)| {
+            *target == BookmarkRenameTarget::Bookmark(id)
+        }) {
+            return div()
+                .flex()
+                .flex_col()
+                .gap(theme::S_4)
+                .pl(indent)
+                .pr(theme::S_4)
+                .child(field(input, window, cx))
+                .children(self.bookmark_rename_error.clone().map(error_text))
+                .into_any_element();
+        }
+        let path = item.path.clone();
+        let name = item.name.clone();
+        let missing = item.missing;
+        let tip = if missing {
+            t!("bookmarks.missing", path = path.display()).into_owned()
+        } else {
+            path.display().to_string()
+        };
+        let group: SharedString = format!("bookmark-row-{id}").into();
+        let mut menu: Vec<(SharedString, SidebarAction)> = vec![
+            (
+                t!("bookmarks.open").into_owned().into(),
+                SidebarAction::BookmarkOpen(id),
+            ),
+            (
+                t!("bookmarks.rename").into_owned().into(),
+                SidebarAction::BookmarkRename(id),
+            ),
+            (
+                t!("bookmarks.delete").into_owned().into(),
+                SidebarAction::BookmarkDelete(id),
+            ),
+        ];
+        for other in groups {
+            if other.items.iter().any(|b| b.id == id) {
+                continue;
+            }
+            menu.push((
+                t!("bookmarks.move_to_group", name = other.name.clone())
+                    .into_owned()
+                    .into(),
+                SidebarAction::BookmarkMoveToGroup {
+                    id,
+                    group: Some(other.id),
+                },
+            ));
+        }
+        menu.push((
+            t!("bookmarks.move_to_ungrouped").into_owned().into(),
+            SidebarAction::BookmarkMoveToGroup { id, group: None },
+        ));
+        menu.push((
+            t!("bookmarks.move_up").into_owned().into(),
+            SidebarAction::BookmarkMove { id, up: true },
+        ));
+        menu.push((
+            t!("bookmarks.move_down").into_owned().into(),
+            SidebarAction::BookmarkMove { id, up: false },
+        ));
+        let spoken = (name.clone(), missing);
+        div()
+            .id(("bookmark-item", id as usize))
+            .a11y_lazy(gpui::Role::ListItem, move || {
+                let (name, missing) = &spoken;
+                let state = if *missing {
+                    t!("bookmarks.missing_short").into_owned()
+                } else {
+                    String::new()
+                };
+                crate::a11y::item_label(name, &[state.as_str()])
+            })
+            .group(group.clone())
+            .h(theme::H_ROW)
+            .flex()
+            .flex_none()
+            .items_center()
+            .gap(theme::S_8)
+            .pl(indent)
+            .pr(theme::S_4)
+            .rounded(theme::R_8)
+            .cursor_pointer()
+            .hover(|s| s.bg(theme::wash()))
+            .when(missing, |d| d.opacity(0.5))
+            .child(kind_icon(bookmark_kind(item), theme::ICON))
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .truncate()
+                    .when(missing, gpui::Styled::line_through)
+                    .child(name),
+            )
+            .child(
+                div()
+                    .id(("bookmark-remove", id as usize))
+                    .a11y_button(t!("bookmarks.delete"))
+                    .size(theme::S_20)
+                    .flex()
+                    .flex_none()
+                    .items_center()
+                    .justify_center()
+                    .rounded(theme::R_4)
+                    .invisible()
+                    .group_hover(group, gpui::Styled::visible)
+                    .hover(|s| s.bg(theme::wash_strong()))
+                    .child(
+                        svg()
+                            .path(Icon::Close.path())
+                            .size(theme::ICON_SM)
+                            .text_color(theme::text_muted()),
+                    )
+                    .tooltip(tooltip_text(t!("bookmarks.delete").into_owned()))
+                    .on_click(cx.listener(move |_, _: &ClickEvent, _, cx| {
+                        cx.stop_propagation();
+                        BookmarkStore::global(cx).update(cx, |s, cx| s.remove(id, cx));
+                    })),
+            )
+            .tooltip(tooltip_text(tip))
+            .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                this.open_bookmark(id, cx);
+            }))
+            .on_mouse_down(
+                MouseButton::Right,
+                cx.listener(move |this, e: &MouseDownEvent, _, cx| {
+                    this.open_sidebar_menu(e.position, menu.clone(), cx);
+                }),
+            )
+            .into_any_element()
+    }
+
+    /// Runs a bookmark action from the sidebar menu or buttons.
+    pub(super) fn run_bookmark_action(
+        &mut self,
+        action: &SidebarAction,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        match action {
+            SidebarAction::BookmarkOpen(id) => self.open_bookmark(*id, cx),
+            SidebarAction::BookmarkRename(id) => {
+                if let Some(name) = self.bookmark_name(BookmarkRenameTarget::Bookmark(*id), cx) {
+                    self.start_bookmark_rename(
+                        BookmarkRenameTarget::Bookmark(*id),
+                        name,
+                        window,
+                        cx,
+                    );
+                }
+            }
+            SidebarAction::BookmarkDelete(id) => {
+                BookmarkStore::global(cx).update(cx, |s, cx| s.remove(*id, cx));
+            }
+            SidebarAction::BookmarkMoveToGroup { id, group } => {
+                BookmarkStore::global(cx).update(cx, |s, cx| s.move_to_group(*id, *group, cx));
+            }
+            SidebarAction::BookmarkMove { id, up } => {
+                BookmarkStore::global(cx).update(cx, |s, cx| s.move_within(*id, *up, cx));
+            }
+            SidebarAction::BookmarkAddCurrent => self.bookmark_current_folder(cx),
+            SidebarAction::BookmarkNewGroup => {
+                let base = t!("bookmarks.new_group").to_string();
+                let mut name = base.clone();
+                let mut n = 2;
+                loop {
+                    match BookmarkStore::global(cx).update(cx, |s, cx| s.add_group(&name, cx)) {
+                        Ok(id) => {
+                            self.start_bookmark_rename(
+                                BookmarkRenameTarget::Group(id),
+                                name,
+                                window,
+                                cx,
+                            );
+                            break;
+                        }
+                        Err(NameProblem::Taken) => {
+                            name = format!("{base} {n}");
+                            n += 1;
+                        }
+                        Err(NameProblem::Empty) => break,
+                    }
+                }
+            }
+            SidebarAction::BookmarkGroupRename(id) => {
+                if let Some(name) = self.bookmark_name(BookmarkRenameTarget::Group(*id), cx) {
+                    self.start_bookmark_rename(BookmarkRenameTarget::Group(*id), name, window, cx);
+                }
+            }
+            SidebarAction::BookmarkGroupDelete(id) => {
+                BookmarkStore::global(cx).update(cx, |s, cx| s.delete_group(*id, cx));
+            }
+            SidebarAction::BookmarkGroupMove { id, up } => {
+                BookmarkStore::global(cx).update(cx, |s, cx| s.move_group(*id, *up, cx));
+            }
+            _ => {}
+        }
+    }
+
+    /// Opens a bookmark in the active tab: folders navigate, files open with the default app.
+    fn open_bookmark(&mut self, id: u64, cx: &mut Context<Self>) {
+        let Some((path, is_dir)) = BookmarkStore::global_ref(cx).and_then(|s| {
+            s.bookmarks()
+                .groups()
+                .iter()
+                .flat_map(|g| g.items.iter())
+                .chain(s.bookmarks().ungrouped())
+                .find(|b| b.id == id)
+                .map(|b| (b.path.clone(), b.is_dir))
+        }) else {
+            return;
+        };
+        self.active_view()
+            .update(cx, |e, cx| e.open_bookmark(path, is_dir, cx));
+    }
+
+    /// Bookmarks the active tab's folder (the "+" in the section header).
+    fn bookmark_current_folder(&mut self, cx: &mut Context<Self>) {
+        let Some(path) = self.shelf_destination(cx) else {
+            return;
+        };
+        let added = BookmarkStore::global(cx).update(cx, |s, cx| s.add(&path, true, cx));
+        self.active_view().update(cx, |e, cx| {
+            e.notice = Some(if added {
+                tn!("bookmarks.added", 1).into_owned()
+            } else {
+                tn!("bookmarks.already", 1).into_owned()
+            });
+            cx.notify();
+        });
+    }
+
+    /// The current name of a bookmark or group, for prefilling the rename field.
+    fn bookmark_name(&self, target: BookmarkRenameTarget, cx: &App) -> Option<String> {
+        let bookmarks = BookmarkStore::global_ref(cx)?.bookmarks();
+        match target {
+            BookmarkRenameTarget::Bookmark(id) => bookmarks
+                .groups()
+                .iter()
+                .flat_map(|g| g.items.iter())
+                .chain(bookmarks.ungrouped())
+                .find(|b| b.id == id)
+                .map(|b| b.name.clone()),
+            BookmarkRenameTarget::Group(id) => bookmarks
+                .groups()
+                .iter()
+                .find(|g| g.id == id)
+                .map(|g| g.name.clone()),
+        }
+    }
+
+    /// Starts an inline rename in the sidebar, like the saved workspaces panel.
+    fn start_bookmark_rename(
+        &mut self,
+        target: BookmarkRenameTarget,
+        name: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let input = cx.new(|cx| TextInput::new(String::new(), cx));
+        input.update(cx, |input, cx| {
+            input.set_text(name, cx);
+            input.select_all_text(cx);
+        });
+        let focus = input.read(cx).focus_handle(cx);
+        window.focus(&focus, cx);
+        let events = cx.subscribe_in(&input, window, |this, _, event, window, cx| match event {
+            InputEvent::Confirm => this.finish_bookmark_rename(window, cx),
+            InputEvent::Cancel => this.cancel_bookmark_rename(window, cx),
+            InputEvent::Changed => {
+                this.bookmark_rename_error = None;
+                cx.notify();
+            }
+        });
+        self.bookmark_renaming = Some((target, input, events));
+        self.bookmark_rename_error = None;
+        cx.notify();
+    }
+
+    fn finish_bookmark_rename(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some((target, input, _)) = self.bookmark_renaming.as_ref() else {
+            return;
+        };
+        let (target, to) = (*target, input.read(cx).committed_text());
+        let result = BookmarkStore::global(cx).update(cx, |s, cx| match target {
+            BookmarkRenameTarget::Bookmark(id) => s.rename(id, &to, cx),
+            BookmarkRenameTarget::Group(id) => s.rename_group(id, &to, cx),
+        });
+        match result {
+            Ok(()) => self.cancel_bookmark_rename(window, cx),
+            Err(problem) => {
+                self.bookmark_rename_error = Some(problem.to_string().into());
+                cx.notify();
+            }
+        }
+    }
+
+    fn cancel_bookmark_rename(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
+        self.bookmark_renaming = None;
+        self.bookmark_rename_error = None;
+        cx.notify();
     }
 }

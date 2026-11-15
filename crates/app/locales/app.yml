@@ -4028,6 +4028,108 @@ shelf.nothing_to_do:
   zh-TW: "暫存架上的項目已在這個資料夾中"
   zh-CN: "暂存架上的项目已在此文件夹中"
 
+# ─── Bookmarks
+menu.add_to_bookmarks:
+  en: Add to bookmarks
+  zh-TW: 加入書籤
+  zh-CN: 加入书签
+bookmarks.title:
+  en: Bookmarks
+  zh-TW: 書籤
+  zh-CN: 书签
+bookmarks.tip:
+  en: "Bookmark the folders and files you keep coming back to. Right-click the header for more options."
+  zh-TW: "把常去的資料夾和檔案加到書籤。右鍵點標題有更多選項。"
+  zh-CN: "把常去的文件夹和文件加到书签。右键点标题有更多选项。"
+bookmarks.empty:
+  en: "No bookmarks yet"
+  zh-TW: "還沒有書籤"
+  zh-CN: "还没有书签"
+bookmarks.add_current:
+  en: "Bookmark this folder"
+  zh-TW: "把這個資料夾加入書籤"
+  zh-CN: "把这个文件夹加入书签"
+bookmarks.new_group:
+  en: "New group"
+  zh-TW: "新增群組"
+  zh-CN: "新建分组"
+bookmarks.open:
+  en: Open
+  zh-TW: 開啟
+  zh-CN: 打开
+bookmarks.rename:
+  en: Rename
+  zh-TW: 重新命名
+  zh-CN: 重命名
+bookmarks.delete:
+  en: Delete
+  zh-TW: 刪除
+  zh-CN: 删除
+bookmarks.rename_group:
+  en: "Rename group"
+  zh-TW: "重新命名群組"
+  zh-CN: "重命名分组"
+bookmarks.delete_group:
+  en: "Delete group"
+  zh-TW: "刪除群組"
+  zh-CN: "删除分组"
+bookmarks.move_group_up:
+  en: "Move group up"
+  zh-TW: "群組上移"
+  zh-CN: "分组上移"
+bookmarks.move_group_down:
+  en: "Move group down"
+  zh-TW: "群組下移"
+  zh-CN: "分组下移"
+bookmarks.move_to_group:
+  en: "Move to %{name}"
+  zh-TW: "移動到 %{name}"
+  zh-CN: "移动到 %{name}"
+bookmarks.move_to_ungrouped:
+  en: "Move to Ungrouped"
+  zh-TW: "移動到未分組"
+  zh-CN: "移动到未分组"
+bookmarks.move_up:
+  en: "Move up"
+  zh-TW: 上移
+  zh-CN: 上移
+bookmarks.move_down:
+  en: "Move down"
+  zh-TW: 下移
+  zh-CN: 下移
+bookmarks.missing:
+  en: "No longer at %{path}"
+  zh-TW: "已不在 %{path}"
+  zh-CN: "已不在 %{path}"
+bookmarks.missing_short:
+  en: Missing
+  zh-TW: 找不到
+  zh-CN: 找不到
+bookmarks.added_one:
+  en: "Added 1 bookmark"
+  zh-TW: "已加入 1 個書籤"
+  zh-CN: "已加入 1 个书签"
+bookmarks.added_other:
+  en: "Added %{count} bookmarks"
+  zh-TW: "已加入 %{count} 個書籤"
+  zh-CN: "已加入 %{count} 个书签"
+bookmarks.already_one:
+  en: "Already bookmarked"
+  zh-TW: "已經在書籤中"
+  zh-CN: "已经在书签中"
+bookmarks.already_other:
+  en: "All %{count} are already bookmarked"
+  zh-TW: "這 %{count} 個項目都已經在書籤中"
+  zh-CN: "这 %{count} 个项目都已经在书签中"
+bookmarks.name_empty:
+  en: "Type a name first"
+  zh-TW: "請先輸入名稱"
+  zh-CN: "请先输入名称"
+bookmarks.name_taken:
+  en: "That name is already used"
+  zh-TW: "這個名稱已經有人用了"
+  zh-CN: "这个名称已经被占用了"
+
 # ─── Screen reader names (read out, never shown)
 a11y.sidebar:
   en: Navigation pane

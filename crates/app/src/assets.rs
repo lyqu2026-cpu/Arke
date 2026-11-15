@@ -68,6 +68,7 @@ icons![
     CloudSyncing => "cloud-syncing",
     CloudError => "cloud-error",
     Shelf => "shelf",
+    Star => "star",
     // Symlink/junction badge over an item's icon (fill, frame, arrow)
     LinkBadgeFill => "link-badge-fill",
     LinkBadgeFrame => "link-badge-frame",

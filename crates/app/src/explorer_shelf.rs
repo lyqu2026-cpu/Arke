@@ -8,6 +8,7 @@ use gpui::{Context, Window};
 use rust_i18n::t;
 
 use super::{AddToShelf, Explorer};
+use crate::bookmarks::BookmarkStore;
 use crate::shelf::ShelfStore;
 
 impl Explorer {
@@ -117,5 +118,11 @@ impl Explorer {
     pub(super) fn recheck_shelf(&self, cx: &mut Context<Self>) {
         let fs = Arc::clone(&self.services.fs);
         ShelfStore::global(cx).update(cx, |s, cx| s.recheck(fs, cx));
+    }
+
+    /// After a file operation: bookmarks may have moved or been deleted.
+    pub(super) fn recheck_bookmarks(&self, cx: &mut Context<Self>) {
+        let fs = Arc::clone(&self.services.fs);
+        BookmarkStore::global(cx).update(cx, |s, cx| s.recheck(fs, cx));
     }
 }

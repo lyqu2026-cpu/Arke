@@ -29,6 +29,7 @@ use crate::explorer::{Explorer, ExplorerEvent, PaneInfo, Services, kind_icon};
 use crate::net_dialog::{NetDialog, NetDialogEvent, NetDialogKind};
 use crate::palette::{Candidate, LocationPalette, PaletteEvent, Source, Target};
 use crate::settings::{SettingsStore, TabLayout};
+use crate::text_input::TextInput;
 use crate::theme::{self, UiFont as _};
 
 #[path = "workspace_backup.rs"]
@@ -316,6 +317,12 @@ pub(crate) struct Workspace {
     shelf_open: bool,
     /// Repaint when the shelf changes (any window may change it).
     _shelf: Subscription,
+    /// Repaint when the bookmarks change (any window may change them).
+    _bookmarks: Subscription,
+    /// Bookmark or group being renamed in the sidebar: what it is and the input.
+    bookmark_renaming:
+        Option<(sidebar::BookmarkRenameTarget, Entity<TextInput>, Subscription)>,
+    bookmark_rename_error: Option<SharedString>,
     last_viewport_width: gpui::Pixels,
     /// The active tab's shared preview at the last render (split view with the preview on).
     shared_preview: Option<crate::explorer::SharedPreview>,
@@ -547,6 +554,9 @@ impl Workspace {
             // Shelf items may have been moved or deleted outside Arke.
             let fs = Arc::clone(&this.services.fs);
             crate::shelf::ShelfStore::global(cx).update(cx, |s, cx| s.recheck(fs, cx));
+            // Bookmarks may have been moved or deleted outside Arke.
+            let fs = Arc::clone(&this.services.fs);
+            crate::bookmarks::BookmarkStore::global(cx).update(cx, |s, cx| s.recheck(fs, cx));
             // Global search: probe network locations that were unreachable last time.
             if let Some(global) = crate::global_search::GlobalSearch::global(cx) {
                 global.update(cx, super::global_search::GlobalSearch::recheck_network);
@@ -571,6 +581,8 @@ impl Workspace {
         let saved_workspaces = cx.observe(&saved_workspaces, |_, _, cx| cx.notify());
         let shelf_store = crate::shelf::ShelfStore::global(cx);
         let shelf = cx.observe(&shelf_store, |_, _, cx| cx.notify());
+        let bookmarks_store = crate::bookmarks::BookmarkStore::global(cx);
+        let bookmarks = cx.observe(&bookmarks_store, |_, _, cx| cx.notify());
         // Remember window position and size once moving or resizing settles.
 
         let bounds = cx.observe_window_bounds(window, |this: &mut Self, window, cx| {
@@ -602,6 +614,9 @@ impl Workspace {
             dragging_pin: false,
             shelf_open: false,
             _shelf: shelf,
+            _bookmarks: bookmarks,
+            bookmark_renaming: None,
+            bookmark_rename_error: None,
             last_viewport_width: px(1200.),
             shared_preview: None,
             _appearance: appearance,
@@ -1996,7 +2011,7 @@ impl Render for Workspace {
                     .flex_col()
                     .when(!horizontal, |d| d.child(self.render_brand_row(cx)))
                     .child(self.render_home_button(cx))
-                    .child(self.render_sidebar(cx))
+                    .child(self.render_sidebar(window, cx))
                     .child(self.render_settings_button(cx)),
             )
             // Settings and Recycle Bin pages replace the panes; the sidebar stays.

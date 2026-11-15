@@ -605,8 +605,9 @@ impl WorkspacesPanel {
     }
 }
 
-/// A text field in the panel (the same look as the network dialog's).
-fn field(input: &Entity<TextInput>, window: &Window, cx: &App) -> impl IntoElement {
+/// A text field in the panel (the same look as the network dialog's). Also used for inline
+/// renames in the sidebar.
+pub(super) fn field(input: &Entity<TextInput>, window: &Window, cx: &App) -> impl IntoElement {
     let focused = input.focus_handle(cx).is_focused(window);
     div()
         .flex_1()
@@ -626,7 +627,7 @@ fn field(input: &Entity<TextInput>, window: &Window, cx: &App) -> impl IntoEleme
         .child(input.clone())
 }
 
-fn error_text(error: SharedString) -> impl IntoElement {
+pub(super) fn error_text(error: SharedString) -> impl IntoElement {
     div()
         .text_size(theme::FS_12)
         .text_color(theme::danger())

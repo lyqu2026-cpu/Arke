@@ -39,6 +39,7 @@ mod a11y;
 mod assets;
 mod bench;
 mod bench_index;
+mod bookmarks;
 mod brand;
 mod build_info;
 mod crashlog;
@@ -445,6 +446,15 @@ fn app_main(mut args: Args) {
                 None
             } else {
                 shelf::default_path()
+            },
+            cx,
+        );
+        // Bookmarks, next to the settings file too
+        bookmarks::BookmarkStore::init(
+            if bench.is_some() {
+                None
+            } else {
+                bookmarks::default_path()
             },
             cx,
         );

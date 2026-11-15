@@ -34,6 +34,7 @@ use super::ops::{CopyFiles, CutFiles, DeleteFiles, NewFolder, PasteFiles, Rename
 use super::{AppEvent, Explorer, ExplorerEvent, Refresh, ViewDetails, ViewMode, spawn_thread};
 use crate::a11y::A11yExt as _;
 use crate::assets::Icon;
+use crate::bookmarks::BookmarkStore;
 use crate::settings::SettingsStore;
 use crate::shell::{ShellMenu, ShellMenuEntry};
 use crate::theme::{self, UiFont as _};
@@ -158,6 +159,8 @@ pub(crate) enum MenuCommand {
     FreeUpSpace,
     /// Put the targets on the shelf.
     AddToShelf,
+    /// Put the targets in the bookmarks (ungrouped).
+    AddToBookmarks,
 }
 
 /// Apps offered under "Open with" (name, exe). Discovered once in the background at startup.
@@ -279,6 +282,7 @@ const fn glyph_for(command: MenuCommand) -> Option<Icon> {
         C::ToggleSearchNetwork | C::SearchInFolder => Icon::Search,
         C::FreeUpSpace => Icon::Cloud,
         C::AddToShelf => Icon::Shelf,
+        C::AddToBookmarks => Icon::Star,
         _ => return None,
     })
 }
@@ -1062,6 +1066,11 @@ impl Explorer {
             Some("Ctrl+Shift+A"),
             C::AddToShelf,
         ));
+        entries.push(item(
+            t!("menu.add_to_bookmarks"),
+            None,
+            C::AddToBookmarks,
+        ));
         entries.push(item(t!("menu.copy_path"), None, C::CopyPath));
         // The tree names nested rows by their path below the folder shown.
         if self.tree_active() {
@@ -1274,6 +1283,28 @@ impl Explorer {
 
     // ───────────────────────── Running commands ─────────────────────────
 
+    /// "Add to bookmarks": puts the selection in the bookmarks (ungrouped).
+    fn add_selection_to_bookmarks(&mut self, cx: &mut Context<Self>) {
+        let targets = self.menu_targets();
+        if targets.is_empty() {
+            return;
+        }
+        let total = targets.len();
+        let added = BookmarkStore::global(cx).update(cx, |s, cx| {
+            let mut added = 0;
+            for (path, is_dir) in targets {
+                added += usize::from(s.add(&path, is_dir, cx));
+            }
+            added
+        });
+        self.notice = Some(if added == 0 {
+            tn!("bookmarks.already", total).into_owned()
+        } else {
+            tn!("bookmarks.added", added).into_owned()
+        });
+        cx.notify();
+    }
+
     #[allow(
         clippy::too_many_lines,
         reason = "One arm per command; splitting it up would scatter them"
@@ -1418,6 +1449,7 @@ impl Explorer {
                 }
             }
             C::AddToShelf => self.add_paths_to_shelf(targets.clone(), cx),
+            C::AddToBookmarks => self.add_selection_to_bookmarks(cx),
             C::OpenFileLocation => {
                 if let Some((path, false)) = targets.first().cloned() {
                     let shell = Arc::clone(&self.services.shell);
