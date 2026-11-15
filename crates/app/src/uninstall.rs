@@ -9,8 +9,9 @@
 //! 4. Delete the Start menu and "Start with Windows" shortcuts.
 //! 5. Delete saved SFTP/WebDAV passwords (Credential Manager, `Arke:<host>`).
 //! 6. Clear the taskbar jump list.
-//! 7. Delete `%LOCALAPPDATA%\Arke` (index, log, downloaded updates) and, unless settings are
-//!    kept, `%APPDATA%\Arke` (settings, workspaces, trusted host keys).
+//! 7. Delete `<exe dir>\data` (settings, index, log, downloaded updates, trusted host keys),
+//!    unless settings are kept; the legacy `%APPDATA%\Arke` and `%LOCALAPPDATA%\Arke` folders
+//!    from before the portable layout go too when settings are not kept.
 //! 8. Delete the exe once this process has exited (a hidden `cmd` that retries until the file is
 //!    free), unless Scoop or winget installed it: then the package manager owns it. A copy the
 //!    installer put in place is left to its uninstaller, which runs this with `--quiet` first and
@@ -18,7 +19,8 @@
 //!    Arke from this PC" starts that uninstaller instead.
 //!
 //! - Only Arke's own folders are deleted: a folder must be exactly `<base>\Arke` under the
-//!   expected base and never a drive root or a profile folder, otherwise it is refused.
+//!   expected base and never a drive root or a profile folder, or the `data` folder next to
+//!   this exe, otherwise it is refused.
 //! - The app doesn't remove itself in-process: it starts `arke --uninstall --wait-pid <pid>` and
 //!   quits, so nothing of its own is open while the files go. That process shows the summary.
 //! - Without `--quiet`, the command line asks first in a message box (a GUI program can't read
@@ -130,9 +132,10 @@ pub(crate) enum Step {
     DeleteShortcut(Shortcut, PathBuf),
     ForgetPasswords,
     ClearJumpList,
-    /// `%LOCALAPPDATA%\Arke`: rebuilt by Arke, nothing of the user's.
+    /// `<exe dir>\data` when settings are not kept (index, log and updates live there too,
+    /// next to the settings, so there is nothing separate to delete).
     DeleteData(PathBuf),
-    /// `%APPDATA%\Arke`: settings, workspaces, trusted host keys.
+    /// `<exe dir>\data`: settings, workspaces, trusted host keys.
     DeleteSettings(PathBuf),
     KeepSettings(PathBuf),
     DeleteExe(PathBuf),
@@ -148,12 +151,15 @@ pub(crate) fn plan(m: &Machine, keep_settings: bool) -> Vec<Step> {
     if m.service {
         steps.push(Step::RemoveService);
     }
+    // Everything Arke owns lives in `data` next to this exe now (see
+    // `settings::data_dir`); the settings file is in there too, so keeping settings
+    // means leaving that whole folder alone.
+    let data = m.exe.parent().map(|dir| dir.join("data"));
     steps.push(Step::RestoreFolderHandler {
-        settings: m
-            .appdata
+        settings: data
             .as_ref()
             .filter(|_| keep_settings)
-            .map(|a| arke(a).join("settings.json")),
+            .map(|d| d.join("settings.json")),
     });
     if let Some(appdata) = &m.appdata {
         // The installer's own Start menu shortcut goes with its uninstaller.
@@ -172,15 +178,28 @@ pub(crate) fn plan(m: &Machine, keep_settings: bool) -> Vec<Step> {
         steps.push(Step::ForgetPasswords);
         steps.push(Step::ClearJumpList);
     }
-    if let Some(local) = &m.local_appdata {
-        steps.push(Step::DeleteData(arke(local)));
-    }
-    if let Some(appdata) = &m.appdata {
+    if let Some(data) = &data {
         steps.push(if keep_settings {
-            Step::KeepSettings(arke(appdata))
+            Step::KeepSettings(data.clone())
         } else {
-            Step::DeleteSettings(arke(appdata))
+            Step::DeleteSettings(data.clone())
         });
+    }
+    // Legacy folders from before the portable layout: only removed when settings
+    // are not kept, and never twice when one already is the data folder.
+    if !keep_settings {
+        if let Some(local) = &m.local_appdata {
+            let legacy = arke(local);
+            if Some(&legacy) != data.as_ref() {
+                steps.push(Step::DeleteData(legacy));
+            }
+        }
+        if let Some(appdata) = &m.appdata {
+            let legacy = arke(appdata);
+            if Some(&legacy) != data.as_ref() {
+                steps.push(Step::DeleteSettings(legacy));
+            }
+        }
     }
     steps.push(match m.manager {
         Some(manager) => Step::KeepExe(manager),
@@ -414,7 +433,7 @@ fn run_step(step: &Step, exe: &Path) -> Outcome {
         },
         Step::ClearJumpList => crate::win_jumplist::clear()
             .map_or_else(|e| Outcome::Failed(e.to_string()), |()| Outcome::Done(None)),
-        Step::DeleteData(folder) | Step::DeleteSettings(folder) => delete_folder(folder),
+        Step::DeleteData(folder) | Step::DeleteSettings(folder) => delete_folder(folder, exe),
         Step::KeepSettings(_) | Step::KeepExe(_) | Step::LeaveToSetup => Outcome::Done(None),
         Step::DeleteExe(path) => match check_exe(path) {
             Err(refused) => Outcome::Failed(refused.to_string()),
@@ -426,9 +445,13 @@ fn run_step(step: &Step, exe: &Path) -> Outcome {
     }
 }
 
-/// Deletes one of Arke's folders after [`check_folder`].
-fn delete_folder(folder: &Path) -> Outcome {
-    if let Err(refused) = check_folder(folder) {
+/// Deletes one of Arke's folders after [`check_folder`]. The `data` folder next to
+/// `exe` is Arke's own too, even though it isn't named `Arke`.
+fn delete_folder(folder: &Path, exe: &Path) -> Outcome {
+    let is_data = exe
+        .parent()
+        .is_some_and(|dir| dir.join("data") == folder);
+    if !is_data && let Err(refused) = check_folder(folder) {
         return Outcome::Failed(refused.to_string());
     }
     match std::fs::symlink_metadata(folder) {
@@ -661,6 +684,7 @@ mod tests {
                 ),
                 Step::ForgetPasswords,
                 Step::ClearJumpList,
+                Step::DeleteSettings(PathBuf::from(r"C:\Users\me\AppData\Tools\data")),
                 Step::DeleteData(PathBuf::from(r"C:\Users\me\AppData\Local\Arke")),
                 Step::DeleteSettings(PathBuf::from(r"C:\Users\me\AppData\Roaming\Arke")),
                 Step::DeleteExe(PathBuf::from(r"C:\Users\me\AppData\Tools\arke.exe")),
@@ -717,15 +741,19 @@ mod tests {
         );
         assert!(steps.contains(&Step::RestoreFolderHandler {
             settings: Some(PathBuf::from(
-                r"C:\Users\me\AppData\Roaming\Arke\settings.json"
+                r"C:\Users\me\scoop\apps\arke\current\data\settings.json"
             ))
         }));
         assert!(steps.contains(&Step::KeepSettings(PathBuf::from(
-            r"C:\Users\me\AppData\Roaming\Arke"
+            r"C:\Users\me\scoop\apps\arke\current\data"
         ))));
         assert!(
             !steps.iter().any(|s| matches!(s, Step::DeleteSettings(_))),
             "{steps:?}"
+        );
+        assert!(
+            !steps.iter().any(|s| matches!(s, Step::DeleteData(_))),
+            "the data folder holds the kept settings: {steps:?}"
         );
         // Passwords go even when settings stay.
         assert!(steps.contains(&Step::ForgetPasswords));
@@ -758,8 +786,13 @@ mod tests {
         assert!(
             !steps
                 .iter()
-                .any(|s| matches!(s, Step::DeleteShortcut(..) | Step::DeleteSettings(_)))
+                .any(|s| matches!(s, Step::DeleteShortcut(..))),
+            "no shortcuts without APPDATA: {steps:?}"
         );
+        // The data folder comes from the exe, not APPDATA, so it is still planned.
+        assert!(steps.contains(&Step::DeleteSettings(PathBuf::from(
+            r"C:\Temp\arke-test\Tools\data"
+        ))));
         assert!(steps.contains(&Step::DeleteData(PathBuf::from(
             r"C:\Temp\arke-test\Local\Arke"
         ))));
@@ -796,13 +829,35 @@ mod tests {
         std::fs::create_dir_all(&neighbour).unwrap();
         std::fs::write(neighbour.join("keep.txt"), b"mine").unwrap();
 
-        assert_eq!(delete_folder(&arke), Outcome::Done(None));
+        assert_eq!(delete_folder(&arke, &root.join("arke.exe")), Outcome::Done(None));
         assert!(!arke.exists());
         assert!(neighbour.join("keep.txt").exists(), "neighbours stay");
         assert!(roaming.exists(), "the parent stays");
-        assert!(matches!(delete_folder(&arke), Outcome::Skipped(_)));
-        assert!(matches!(delete_folder(&neighbour), Outcome::Failed(_)));
+        assert!(matches!(
+            delete_folder(&arke, &root.join("arke.exe")),
+            Outcome::Skipped(_)
+        ));
+        assert!(matches!(
+            delete_folder(&neighbour, &root.join("arke.exe")),
+            Outcome::Failed(_)
+        ));
         assert!(neighbour.exists());
+        // The `data` folder next to the exe is Arke's own too, but only there:
+        // the same folder next to another exe is refused.
+        let data = root.join("data");
+        std::fs::create_dir_all(&data).unwrap();
+        std::fs::write(data.join("settings.json"), b"{}").unwrap();
+        assert_eq!(
+            delete_folder(&data, &root.join("arke.exe")),
+            Outcome::Done(None)
+        );
+        assert!(!data.exists());
+        std::fs::create_dir_all(&data).unwrap();
+        assert!(matches!(
+            delete_folder(&data, &root.join("elsewhere").join("other.exe")),
+            Outcome::Failed(_)
+        ));
+        assert!(data.exists());
         std::fs::remove_dir_all(&root).unwrap();
     }
 

@@ -2,7 +2,7 @@
 //! default).
 //!
 //! - Indexes local fixed drives (no network or removable drives), stored at
-//!   `%LOCALAPPDATA%\Arke\index.bin`.
+//!   `<exe dir>\data\index.bin`.
 //! - The walk runs on a background thread at lowest I/O priority (`THREAD_MODE_BACKGROUND_BEGIN`).
 //! - Core logic is in `arke_core::index_service`; this module handles toggling, status and
 //!   dispatching queries.
@@ -715,9 +715,9 @@ pub(crate) fn local_drives(shell: &dyn Shell) -> Vec<PathBuf> {
         .collect()
 }
 
-/// `%LOCALAPPDATA%\Arke\index.bin` (string handling only).
+/// `<exe dir>\data\index.bin` (string handling only).
 pub(crate) fn default_cache_path() -> Option<PathBuf> {
-    std::env::var_os("LOCALAPPDATA").map(|dir| PathBuf::from(dir).join("Arke").join("index.bin"))
+    crate::settings::data_dir().map(|dir| dir.join("index.bin"))
 }
 
 /// Whether a path is on the network (`\\server\share\…` or a mapped drive). Uses the path and the

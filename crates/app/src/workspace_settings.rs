@@ -1597,12 +1597,11 @@ fn about_link(
         .into_any_element()
 }
 
-/// "Licenses": writes the embedded license texts to `%LOCALAPPDATA%\Arke` as a `.txt`, which every
+/// "Licenses": writes the embedded license texts to `<exe dir>\data` as a `.txt`, which every
 /// PC can open (Notepad by default), and opens it. On a background thread.
 fn open_licenses() {
     crate::explorer::spawn_thread("open-licenses", || {
-        let Some(dir) = std::env::var_os("LOCALAPPDATA").map(|d| PathBuf::from(d).join("Arke"))
-        else {
+        let Some(dir) = crate::settings::data_dir() else {
             return;
         };
         let path = dir.join("THIRD_PARTY_LICENSES.txt");

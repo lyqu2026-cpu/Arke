@@ -1,5 +1,5 @@
 //! Trusted SSH host keys, in OpenSSH `known_hosts` format, kept in Arke's own file
-//! (`%APPDATA%\Arke\known_hosts`), not the user's `~/.ssh`.
+//! (`<exe dir>\data\known_hosts`), not the user's `~/.ssh`.
 //!
 //! Lines are `host[,host...] algorithm base64 [comment]`; non-default ports are written
 //! `[host]:port`. Hashed (`|1|`) and marker (`@revoked`) lines from a copied OpenSSH file are

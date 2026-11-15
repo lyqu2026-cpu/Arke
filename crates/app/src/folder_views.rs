@@ -1,7 +1,7 @@
 //! Per-folder view memory, like Windows File Explorer: the view mode, icon size and sort the user
 //! picked in a folder come back whenever that folder is opened again, in any tab and after a restart.
 //!
-//! Stored in its own file, `%APPDATA%\Arke\folder_views.json`, next to `settings.json` rather than
+//! Stored in its own file, `<exe dir>\data\folder_views.json`, next to `settings.json` rather than
 //! inside it:
 //! - it can hold up to [`MAX_FOLDERS`] entries; inside `settings.json` they would bury the settings a
 //!   person might want to read or edit by hand;
@@ -30,8 +30,8 @@ pub(crate) const MAX_FOLDERS: usize = 1000;
 /// A burst of changes (clicking through sort columns) becomes one write.
 const SAVE_DELAY: Duration = Duration::from_millis(500);
 /// How long startup waits for the file (read in the background, usually 1–2 ms), so the first
-/// window already opens its folder the remembered way. A slow `%APPDATA%` doesn't hold up the
-/// window: the views are applied once they arrive.
+/// window already opens its folder the remembered way. A slow drive holding the exe folder
+/// doesn't hold up the window: the views are applied once they arrive.
 const STARTUP_WAIT: Duration = Duration::from_millis(60);
 /// Written into the file so a later format can tell old files apart.
 const FILE_VERSION: u32 = 1;
@@ -374,7 +374,7 @@ fn save(path: &Path, file: &StoredFile) -> Result<(), FolderViewsError> {
     std::fs::rename(&tmp, path).map_err(write_err)
 }
 
-/// `%APPDATA%\Arke\folder_views.json`, next to the settings (string work only).
+/// `<exe dir>\data\folder_views.json`, next to the settings (string work only).
 pub(crate) fn default_path() -> Option<PathBuf> {
     crate::settings::default_path().map(|p| p.with_file_name("folder_views.json"))
 }

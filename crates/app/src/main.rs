@@ -240,7 +240,7 @@ fn main() -> std::process::ExitCode {
     if args.get(1).map(String::as_str) == Some(INDEXD_ARG) {
         return arke_indexd::cli::run(args[2..].to_vec(), Some(INDEXD_ARG));
     }
-    // Before app_main: no log file (it would hold %LOCALAPPDATA%\Arke open), residency or window.
+    // Before app_main: no log file (it would hold `<exe dir>\data` open), residency or window.
     if args.get(1).map(String::as_str) == Some(uninstall::ARG) {
         rust_i18n::set_locale(&win::ui_locale());
         return uninstall::run_cli(&args[2..]);

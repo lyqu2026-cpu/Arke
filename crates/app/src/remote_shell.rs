@@ -234,15 +234,14 @@ impl arke_remote::dav::Transport for NoHttp {
     }
 }
 
-/// The app's remote hub: host keys in `%APPDATA%\Arke\known_hosts`, downloads
+/// The app's remote hub: host keys in `<exe dir>\data\known_hosts`, downloads
 /// under `%TEMP%\Arke\remote`, passwords in Credential Manager. Applies the saved locations' key
 /// files. Touches no network.
 pub(crate) fn start(
     store: &gpui::Entity<crate::settings::SettingsStore>,
     cx: &gpui::App,
 ) -> Arc<Remotes> {
-    let known_hosts =
-        std::env::var_os("APPDATA").map(|dir| PathBuf::from(dir).join("Arke").join("known_hosts"));
+    let known_hosts = crate::settings::data_dir().map(|dir| dir.join("known_hosts"));
     let transport: Arc<dyn arke_remote::dav::Transport> = match arke_remote::http::WinHttp::new() {
         Ok(http) => Arc::new(http),
         Err(err) => {

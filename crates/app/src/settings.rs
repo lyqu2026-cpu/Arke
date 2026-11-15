@@ -1,6 +1,6 @@
 //! User settings: pins, favorite tiles, recent folders, tab layout, density, and the Settings page toggles.
 //!
-//! Stored in `%APPDATA%\Arke\settings.json`, never the registry. Reads and writes happen on background
+//! Stored in `<exe dir>\data\settings.json`, never the registry. Reads and writes happen on background
 //! threads. Startup renders with defaults and updates once the file is read. Writes are debounced to
 //! coalesce bursts, and go to a temp file that is then renamed so a crash cannot leave a broken file.
 //!
@@ -19,7 +19,7 @@ use crate::explorer::ViewMode;
 const SAVE_DELAY: Duration = Duration::from_millis(500);
 /// How long startup waits for the settings file (read in the background, usually 1-2 ms). If it arrives
 /// in time the first window opens with the saved size, tabs and language; otherwise defaults are used
-/// and the file is applied when it arrives (e.g. %APPDATA% on a slow network).
+/// and the file is applied when it arrives (e.g. a slow drive holding the exe folder).
 const STARTUP_WAIT: Duration = Duration::from_millis(60);
 /// Number of recent folders to remember.
 pub(crate) const RECENT_MAX: usize = 50;
@@ -925,9 +925,17 @@ impl SettingsStore {
     }
 }
 
-/// `%APPDATA%\Arke\settings.json` (string handling only).
+/// Where Arke keeps its own files: a `data` folder next to the exe, so a copy of Arke is
+/// self-contained (settings, folder views, workspaces, history, shelf, index, log, updates,
+/// trusted host keys). `None` when the exe path can't be read.
+pub(crate) fn data_dir() -> Option<PathBuf> {
+    let exe = std::env::current_exe().ok()?;
+    exe.parent().map(|dir| dir.join("data"))
+}
+
+/// `<exe dir>\data\settings.json` (string handling only).
 pub(crate) fn default_path() -> Option<PathBuf> {
-    std::env::var_os("APPDATA").map(|dir| PathBuf::from(dir).join("Arke").join("settings.json"))
+    data_dir().map(|dir| dir.join("settings.json"))
 }
 
 /// Turns "Open folders in Arke" off in the settings file (for `--restore-explorer`, which runs

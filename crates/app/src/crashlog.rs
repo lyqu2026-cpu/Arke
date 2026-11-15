@@ -1,4 +1,4 @@
-//! Log file and crash records at `%LOCALAPPDATA%\Arke\arke.log`.
+//! Log file and crash records at `<exe dir>\data\arke.log`.
 //!
 //! Release builds have no console, so logs go to a file written by a background
 //! thread; the file restarts once it exceeds 512 KB. Panics are logged with the
@@ -43,7 +43,7 @@ pub(crate) fn init() {
         builder.filter_module("lopdf", log::LevelFilter::Off);
     }
     let to_file = !cfg!(debug_assertions) && std::env::var_os("ARKE_LOG_STDERR").is_none();
-    let dir = std::env::var_os("LOCALAPPDATA").map(|d| PathBuf::from(d).join("Arke"));
+    let dir = crate::settings::data_dir();
     if to_file && let Some(dir) = dir {
         let path = dir.join("arke.log");
         let (tx, rx) = flume::unbounded::<Vec<u8>>();

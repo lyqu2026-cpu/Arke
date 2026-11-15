@@ -6,7 +6,7 @@
 //!   Only resource checks are skipped: the app defers a rebuild in battery saver, which would make
 //!   the benchmark wait forever.
 //! - The index is written to a fresh folder under `%TEMP%` that is deleted afterwards. The user's
-//!   real index, settings and logs (`%APPDATA%\Arke`, `%LOCALAPPDATA%\Arke`) are never touched.
+//!   real index, settings and logs (`<exe dir>\data`) are never touched.
 //! - Headless: no window, tray or single-instance pipe, so a running Arke is left alone. Logging
 //!   is off unless `RUST_LOG` is set, then it goes to stderr.
 //! - Release builds are GUI programs without a console, so the report goes to the console of the

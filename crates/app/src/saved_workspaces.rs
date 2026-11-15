@@ -1,7 +1,7 @@
 //! Saved workspaces: a named set of tabs (with their split panes and folders) to come back to,
 //! like "Work" or "Photos". Opening one replaces the open tabs except the pinned ones.
 //!
-//! Stored in its own file, `%APPDATA%\Arke\workspaces.json`, next to `settings.json` (like
+//! Stored in its own file, `<exe dir>\data\workspaces.json`, next to `settings.json` (like
 //! `folder_views.json`): the entries are this computer's paths, so they stay out of settings
 //! export and import, and a damaged file only loses the saved workspaces. The file is read and
 //! written on background threads only.
@@ -215,7 +215,7 @@ fn save(path: &Path, list: &[SavedWorkspace]) -> Result<(), WorkspacesError> {
     std::fs::rename(&tmp, path).map_err(write_err)
 }
 
-/// `%APPDATA%\Arke\workspaces.json`, next to the settings (string work only).
+/// `<exe dir>\data\workspaces.json`, next to the settings (string work only).
 pub(crate) fn default_path() -> Option<PathBuf> {
     crate::settings::default_path().map(|p| p.with_file_name("workspaces.json"))
 }

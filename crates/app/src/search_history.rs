@@ -1,7 +1,7 @@
 //! Search history: which files the user opens and which folders they visit, so "This PC" search
 //! ranks the copy they actually use first (`arke_core::frecency`, `arke_core::rank`).
 //!
-//! Local only: `%APPDATA%\Arke\search_history.json`, next to the settings but not inside them (it
+//! Local only: `<exe dir>\data\search_history.json`, next to the settings but not inside them (it
 //! holds this computer's paths, so it stays out of settings export and backups). At most
 //! [`arke_core::frecency::MAX_ITEMS`] items, each fading with time. Settings › Search turns it off
 //! (nothing is recorded or used) and clears it.
@@ -155,7 +155,7 @@ fn save(path: &Path, file: &StoredFile) -> Result<(), HistoryError> {
     std::fs::rename(&tmp, path).map_err(write_err)
 }
 
-/// `%APPDATA%\Arke\search_history.json`, next to the settings (string work only).
+/// `<exe dir>\data\search_history.json`, next to the settings (string work only).
 pub(crate) fn default_path() -> Option<PathBuf> {
     crate::settings::default_path().map(|p| p.with_file_name("search_history.json"))
 }

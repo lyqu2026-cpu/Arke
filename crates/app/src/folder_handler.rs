@@ -21,7 +21,7 @@ pub(crate) struct Handler {
 }
 
 impl Handler {
-    /// The real thing: this exe, the current user's registry, `%APPDATA%\Arke`'s backup file.
+    /// The real thing: this exe, the current user's registry, `<exe dir>\data`'s backup file.
     /// `None` when the exe or the settings folder is unknown, or when a test environment asks to
     /// keep the shell alone.
     pub(crate) fn real() -> Option<Self> {
@@ -97,7 +97,7 @@ impl Handler {
     }
 }
 
-/// `%APPDATA%\Arke`.
+/// `<exe dir>\data`.
 fn settings_dir() -> Option<PathBuf> {
     crate::settings::default_path()?
         .parent()

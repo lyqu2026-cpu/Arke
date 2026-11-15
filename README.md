@@ -138,7 +138,7 @@ real-time antivirus scanning on, which slows every program down. File system cac
   fast Recycle Bin (on by default for local drives); both restore from the Windows Recycle Bin as
   usual.
 
-Your numbers will differ. Arke logs its own timings in `%LOCALAPPDATA%\Arke\arke.log`.
+Your numbers will differ. Arke logs its own timings in `<exe dir>\data\arke.log`.
 
 Run `arke --bench index` to measure the index on your machine.
 
@@ -148,7 +148,7 @@ Run `arke --bench index` to measure the index on your machine.
 
 Download `arke-<version>.exe` (or `arke-<version>-arm64.exe` for ARM64 PCs) from
 [Releases](https://github.com/Koimsurai/Arke/releases) and run it. It's a single executable: no installer and no runtime. Settings are stored in
-`%APPDATA%\Arke`.
+a `data` folder next to the exe, so a copy of Arke is self-contained.
 
 Prefer an installer? `arke-<version>-setup.exe` (or `arke-<version>-arm64-setup.exe`) installs Arke
 for your account without administrator approval, or for all users in Program Files, and adds it to
@@ -250,13 +250,13 @@ change is the optional "Open folders in Arke" setting, which registers Arke as t
 the shell opens, "Show in folder" of browsers and editors included, starts Arke instead of File
 Explorer; whatever Arke can't show, such as Control Panel, is handed straight to Explorer) and, only
 with "Win+E and the File Explorer icon open Arke too", the Win+E handler. Whatever was there before
-is saved to `%APPDATA%\Arke\folder-handler-backup.json` and put back exactly when you turn the
+is saved to `<exe dir>\data\folder-handler-backup.json` and put back exactly when you turn the
 setting off or run `arke --restore-explorer`. Arke also keeps watching for new Explorer windows for
 the cases the registration can't reach, such as `explorer.exe /select,...`. On PCs where Windows
 sends Win+E straight to File Explorer without asking the registration (a change Windows has been
 rolling out since late 2026), Arke takes Win+E with a keyboard hook while it runs in the background:
-it only reacts to E while a Windows key is held and records nothing. Settings live in `%APPDATA%\Arke`, the search index, log and
-downloaded updates in `%LOCALAPPDATA%\Arke`. "Start when I sign in to Windows" is a shortcut in your Startup
+it only reacts to E while a Windows key is held and records nothing. Settings, the search index, log and
+downloaded updates live in a `data` folder next to the exe. "Start when I sign in to Windows" is a shortcut in your Startup
 folder, and "Show Arke in the Start menu" one in your Start menu folder. Passwords for SFTP and WebDAV locations go to Windows Credential Manager, and only when
 you tick "Remember". The optional search service is the only part that needs administrator
 approval. The installer, if you use it, adds the uninstall entry Windows lists in Settings › Apps
@@ -270,7 +270,7 @@ all-users install.
 
 Settings › About › **Remove Arke from this PC**. It removes the search service if you installed it
 (Windows asks for administrator approval for that part), the Start menu and "Start when I sign in to
-Windows" shortcuts, saved SFTP and WebDAV passwords, the jump list, `%LOCALAPPDATA%\Arke`, `%APPDATA%\Arke`
+Windows" shortcuts, saved SFTP and WebDAV passwords, the jump list, the `data` folder next to the exe
 (unless you tick "Keep my settings") and finally the exe itself, then shows what it removed.
 
 From a terminal or a script: `arke --uninstall`, with `--keep-settings`, `--quiet` (no dialogs,

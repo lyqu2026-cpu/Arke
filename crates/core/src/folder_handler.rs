@@ -15,7 +15,7 @@
 //!
 //! Everything goes through the [`Registry`] trait (the app implements it with the Win32 registry
 //! API; tests use [`MemoryRegistry`]) and the [`BackupStore`] trait (the previous values are saved
-//! to `%APPDATA%\Arke\folder-handler-backup.json` before the first write). Turning it off puts
+//! to `<exe dir>\data\folder-handler-backup.json` before the first write). Turning it off puts
 //! every value back exactly as it was and deletes only the keys Arke created. All operations are
 //! idempotent and safe to repeat after a partial run.
 

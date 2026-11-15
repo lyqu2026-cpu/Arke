@@ -3,7 +3,7 @@
 //!
 //! - Channels: stable sees stable only; RC sees RC and stable; nightly sees everything. Versions
 //!   compare by SemVer (`0.2.0-nightly.20261110` < `0.2.0-rc.1` < `0.2.0`).
-//! - Downloads go to `%LOCALAPPDATA%\Arke\updates`, verified against `.sha256` when present.
+//! - Downloads go to `<exe dir>\data\updates`, verified against `.sha256` when present.
 //! - Swap: a running exe can be renamed on Windows, so `arke.exe` -> `arke.exe.old` and the new one
 //!   becomes `arke.exe`, rolled back on failure. Then start the new one
 //!   (`--after-update <old pid>`, which waits for this process to exit before taking over
@@ -107,8 +107,8 @@ pub(crate) enum UpdateError {
     /// This build's own version does not parse.
     #[error("version")]
     BadVersion,
-    /// `LOCALAPPDATA` is not set, so there is nowhere to download to.
-    #[error("LOCALAPPDATA")]
+    /// The exe folder could not be read, so there is nowhere to download to.
+    #[error("data folder")]
     NoUpdatesDir,
     /// The release list or a file could not be fetched.
     #[error(transparent)]
@@ -259,7 +259,7 @@ pub(crate) fn check(channel: Channel) -> Result<Option<Release>, UpdateError> {
 }
 
 fn updates_dir() -> Option<PathBuf> {
-    std::env::var_os("LOCALAPPDATA").map(|d| PathBuf::from(d).join("Arke").join("updates"))
+    crate::settings::data_dir().map(|dir| dir.join("updates"))
 }
 
 /// Download the new version (background thread) and verify SHA-256. `progress(downloaded, total)`.

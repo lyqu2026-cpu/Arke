@@ -5,7 +5,7 @@
 //! - Items that no longer exist stay listed as missing until removed. Existence is rechecked on a
 //!   background thread (on activation, after file operations, when the shelf opens).
 //! - Items moved out of the shelf leave it once the move is done; copies stay.
-//! - Kept across restarts in `%APPDATA%\Arke\shelf.json`, read and written on background threads
+//! - Kept across restarts in `<exe dir>\data\shelf.json`, read and written on background threads
 //!   only (like the folder views; see `folder_views.rs` for why it isn't in `settings.json`).
 
 use std::collections::HashSet;
@@ -228,7 +228,7 @@ fn save(path: &Path, items: Vec<ShelfItem>) -> Result<(), ShelfError> {
     std::fs::rename(&tmp, path).map_err(write_err)
 }
 
-/// `%APPDATA%\Arke\shelf.json`, next to the settings.
+/// `<exe dir>\data\shelf.json`, next to the settings.
 pub(crate) fn default_path() -> Option<PathBuf> {
     crate::settings::default_path().map(|p| p.with_file_name("shelf.json"))
 }
