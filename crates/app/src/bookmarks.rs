@@ -87,11 +87,11 @@ impl Bookmarks {
         &self.ungrouped
     }
 
-    pub(crate) const fn len(&self) -> usize {
+    pub(crate) fn len(&self) -> usize {
         self.groups.iter().map(|g| g.items.len()).sum::<usize>() + self.ungrouped.len()
     }
 
-    pub(crate) const fn is_empty(&self) -> bool {
+    pub(crate) fn is_empty(&self) -> bool {
         self.len() == 0
     }
 

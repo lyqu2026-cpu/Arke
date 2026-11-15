@@ -8,8 +8,8 @@ use std::sync::Arc;
 
 use arke_core::filetype::{FileKind, kind_for_extension};
 use gpui::{
-    AnimationExt, AnyElement, App, ClickEvent, Context, Entity, ExternalPaths, MouseButton,
-    MouseDownEvent, Pixels, Point, SharedString, Window, anchored, deferred, div, prelude::*, px,
+    AnimationExt, AnyElement, App, ClickEvent, Context, Entity, ExternalPaths, Focusable,
+    MouseButton, MouseDownEvent, Pixels, Point, SharedString, Window, anchored, deferred, div, prelude::*, px,
     relative, svg,
 };
 use rust_i18n::t;
