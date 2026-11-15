@@ -1,0 +1,94 @@
+# Fork-only: build Arke exe on demand, without cutting a version tag.
+# Upstream release.yml only runs on a v* tag push, and `cargo xtask publish`
+# posts to the repo in release.toml, so a fork must point release.toml at
+# itself (done on this branch) before any publish step can work.
+# Run from Actions > build-exe > Run workflow. The exe lands in dist/ and is
+# uploaded as an artifact; with "publish release" on, it also creates the
+# v<version> release in this fork via `cargo xtask publish --prebuilt`.
+name: build-exe
+
+on:
+  workflow_dispatch:
+    inputs:
+      channel:
+        description: "Release channel (stable = Cargo.toml version)"
+        type: choice
+        options: [stable, rc, nightly]
+        default: stable
+      arch:
+        description: "Architecture to build"
+        type: choice
+        options: [x64, arm64, both]
+        default: x64
+      publish_release:
+        description: "Also create the v<version> release in this fork"
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: taiki-e/install-action@cfdb7ed4ccc7c7dce37759eae89dc5674b469b39 # v2.90.3
+        with:
+          tool: cargo-about
+      - name: add ARM64 target
+        if: inputs.arch != 'x64'
+        run: rustup target add aarch64-pc-windows-msvc
+      # The installers (installer/arke.iss) need Inno Setup 6.6 or later for dark mode.
+      - name: install Inno Setup
+        run: choco install innosetup --version 6.7.1 --no-progress -y
+      - name: build
+        shell: bash
+        env:
+          CHANNEL: ${{ inputs.channel }}
+          ARCH: ${{ inputs.arch }}
+          ARKE_REQUIRE_SETUP: "1"
+        run: |
+          if [ "$ARCH" = "both" ]; then
+            cargo xtask build "$CHANNEL"
+          else
+            cargo xtask build "$CHANNEL" --arch "$ARCH"
+          fi
+          ls -l dist
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: arke-exe-${{ inputs.channel }}-${{ inputs.arch }}
+          path: dist/
+          if-no-files-found: error
+          retention-days: 30
+
+  publish:
+    if: inputs.publish_release
+    needs: build
+    runs-on: windows-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: arke-exe-*
+          path: dist
+          merge-multiple: true
+      - name: publish release
+        shell: bash
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          CHANNEL: ${{ inputs.channel }}
+          ARCH: ${{ inputs.arch }}
+        run: |
+          if [ "$ARCH" = "both" ]; then
+            cargo xtask publish "$CHANNEL" --prebuilt
+          else
+            cargo xtask publish "$CHANNEL" --arch "$ARCH" --prebuilt
+          fi
