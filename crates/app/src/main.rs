@@ -522,23 +522,25 @@ fn app_main(mut args: Args) {
                 cx,
             );
         }
-        // Auto-update: delete the old binary left from last time; check a bit after startup so it
-        // doesn't compete, then every hour while Arke keeps running (it can stay in the
-        // notification area for days). `auto_check` only checks when 20 hours have passed.
+        // Auto-update: delete the old binary left from last time.
         if bench.is_none() {
             explorer::spawn_thread("update-cleanup", update::clean_up_old);
-            cx.spawn(async |cx| {
-                cx.background_executor()
-                    .timer(Duration::from_secs(15))
-                    .await;
-                loop {
-                    cx.update(update::auto_check);
-                    cx.background_executor()
-                        .timer(Duration::from_secs(3600))
-                        .await;
-                }
-            })
-            .detach();
+            // Fork: the automatic update check is disabled, so starting Arke never
+            // touches the network. The loop below used to check 15 seconds after
+            // startup and then every hour while Arke kept running; checking still
+            // works from Settings ("Check now") and when the update channel changes.
+            // cx.spawn(async |cx| {
+            //     cx.background_executor()
+            //         .timer(Duration::from_secs(15))
+            //         .await;
+            //     loop {
+            //         cx.update(update::auto_check);
+            //         cx.background_executor()
+            //             .timer(Duration::from_secs(3600))
+            //             .await;
+            //     }
+            // })
+            // .detach();
         }
         let benchmarking = bench.is_some();
         let first_window_opened = if background {

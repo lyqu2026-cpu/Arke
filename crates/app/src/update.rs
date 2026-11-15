@@ -702,23 +702,24 @@ pub(crate) fn channel_changed(channel: Channel, cx: &mut App) {
 }
 
 /// Automatic check after startup: when enabled and more than 20 hours since the last check (nightly
-/// ships daily).
-pub(crate) fn auto_check(cx: &mut App) {
-    let settings = crate::settings::SettingsStore::global(cx)
-        .read(cx)
-        .settings
-        .clone();
-    if !settings.update_auto || build_info::RELEASES_REPO.is_empty() || package_manager().is_some()
-    {
-        return;
-    }
-    let due = settings
-        .update_checked
-        .is_none_or(|at| unix_now().saturating_sub(at) > 20 * 3600);
-    if due {
-        start_check(settings.update_channel(), cx);
-    }
-}
+/// ships daily). Fork: disabled (see main.rs) so starting Arke never touches the network; checking
+/// still works from Settings ("Check now") and when the update channel changes.
+// pub(crate) fn auto_check(cx: &mut App) {
+//     let settings = crate::settings::SettingsStore::global(cx)
+//         .read(cx)
+//         .settings
+//         .clone();
+//     if !settings.update_auto || build_info::RELEASES_REPO.is_empty() || package_manager().is_some()
+//     {
+//         return;
+//     }
+//     let due = settings
+//         .update_checked
+//         .is_none_or(|at| unix_now().saturating_sub(at) > 20 * 3600);
+//     if due {
+//         start_check(settings.update_channel(), cx);
+//     }
+// }
 
 fn unix_now() -> u64 {
     std::time::SystemTime::now()
