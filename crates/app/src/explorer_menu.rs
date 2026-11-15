@@ -1067,7 +1067,6 @@ impl Explorer {
             C::AddToShelf,
         ));
         entries.push(item(t!("menu.copy_path"), None, C::CopyPath));
-        entries.push(item(t!("menu.add_to_bookmarks"), None, C::AddToBookmarks));
         // The tree names nested rows by their path below the folder shown.
         if self.tree_active() {
             entries.push(item(
@@ -1076,6 +1075,7 @@ impl Explorer {
                 C::CopyRelativePath,
             ));
         }
+        entries.push(item(t!("menu.add_to_bookmarks"), None, C::AddToBookmarks));
         entries.extend([
             item(t!("menu.reveal_in_explorer"), None, C::RevealInExplorer),
             item(t!("menu.properties"), None, C::Properties),
