@@ -1066,11 +1066,7 @@ impl Explorer {
             Some("Ctrl+Shift+A"),
             C::AddToShelf,
         ));
-        entries.push(item(
-            t!("menu.add_to_bookmarks"),
-            None,
-            C::AddToBookmarks,
-        ));
+        entries.push(item(t!("menu.add_to_bookmarks"), None, C::AddToBookmarks));
         entries.push(item(t!("menu.copy_path"), None, C::CopyPath));
         // The tree names nested rows by their path below the folder shown.
         if self.tree_active() {

@@ -627,9 +627,7 @@ fn run_step(step: &Step, exe: &Path) -> Outcome {
 /// Deletes one of Arke's folders after [`check_folder`]. The `data` folder next to
 /// `exe` is Arke's own too, even though it isn't named `Arke`.
 fn delete_folder(folder: &Path, exe: &Path) -> Outcome {
-    let is_data = exe
-        .parent()
-        .is_some_and(|dir| dir.join("data") == folder);
+    let is_data = exe.parent().is_some_and(|dir| dir.join("data") == folder);
     if !is_data && let Err(refused) = check_folder(folder) {
         return Outcome::Failed(refused.to_string());
     }
@@ -1042,9 +1040,7 @@ mod tests {
         assert!(!steps.contains(&Step::ForgetPasswords));
         assert!(!steps.contains(&Step::ClearJumpList));
         assert!(
-            !steps
-                .iter()
-                .any(|s| matches!(s, Step::DeleteShortcut(..))),
+            !steps.iter().any(|s| matches!(s, Step::DeleteShortcut(..))),
             "no shortcuts without APPDATA: {steps:?}"
         );
         // The data folder comes from the exe, not APPDATA, so it is still planned.
@@ -1087,7 +1083,10 @@ mod tests {
         std::fs::create_dir_all(&neighbour).unwrap();
         std::fs::write(neighbour.join("keep.txt"), b"mine").unwrap();
 
-        assert_eq!(delete_folder(&arke, &root.join("arke.exe")), Outcome::Done(None));
+        assert_eq!(
+            delete_folder(&arke, &root.join("arke.exe")),
+            Outcome::Done(None)
+        );
         assert!(!arke.exists());
         assert!(neighbour.join("keep.txt").exists(), "neighbours stay");
         assert!(roaming.exists(), "the parent stays");

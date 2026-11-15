@@ -9,8 +9,8 @@ use std::sync::Arc;
 use arke_core::filetype::{FileKind, kind_for_extension};
 use gpui::{
     AnimationExt, AnyElement, App, ClickEvent, Context, Entity, ExternalPaths, Focusable,
-    MouseButton, MouseDownEvent, Pixels, Point, SharedString, Window, anchored, deferred, div, prelude::*, px,
-    relative, svg,
+    MouseButton, MouseDownEvent, Pixels, Point, SharedString, Window, anchored, deferred, div,
+    prelude::*, px, relative, svg,
 };
 use rust_i18n::t;
 
@@ -94,14 +94,23 @@ pub(super) enum SidebarAction {
     BookmarkRename(u64),
     BookmarkDelete(u64),
     /// Move a bookmark to a group (`None` for ungrouped).
-    BookmarkMoveToGroup { id: u64, group: Option<u64> },
-    BookmarkMove { id: u64, up: bool },
+    BookmarkMoveToGroup {
+        id: u64,
+        group: Option<u64>,
+    },
+    BookmarkMove {
+        id: u64,
+        up: bool,
+    },
     /// Bookmark the active tab's folder.
     BookmarkAddCurrent,
     BookmarkNewGroup,
     BookmarkGroupRename(u64),
     BookmarkGroupDelete(u64),
-    BookmarkGroupMove { id: u64, up: bool },
+    BookmarkGroupMove {
+        id: u64,
+        up: bool,
+    },
 }
 
 /// What is being renamed inline in the sidebar.
@@ -2106,7 +2115,9 @@ fn bookmark_kind(item: &Bookmark) -> FileKind {
     item.path
         .extension()
         .and_then(|e| e.to_str())
-        .map_or(FileKind::Other, |e| kind_for_extension(&e.to_ascii_lowercase()))
+        .map_or(FileKind::Other, |e| {
+            kind_for_extension(&e.to_ascii_lowercase())
+        })
 }
 
 impl Workspace {
@@ -2238,9 +2249,11 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        if let Some((_, input, _)) = self.bookmark_renaming.as_ref().filter(|(target, _, _)| {
-            *target == BookmarkRenameTarget::Group(group.id)
-        }) {
+        if let Some((_, input, _)) = self
+            .bookmark_renaming
+            .as_ref()
+            .filter(|(target, _, _)| *target == BookmarkRenameTarget::Group(group.id))
+        {
             return div()
                 .flex()
                 .flex_col()
@@ -2326,9 +2339,11 @@ impl Workspace {
         } else {
             theme::S_4 + theme::S_20 + theme::S_4
         };
-        if let Some((_, input, _)) = self.bookmark_renaming.as_ref().filter(|(target, _, _)| {
-            *target == BookmarkRenameTarget::Bookmark(id)
-        }) {
+        if let Some((_, input, _)) = self
+            .bookmark_renaming
+            .as_ref()
+            .filter(|(target, _, _)| *target == BookmarkRenameTarget::Bookmark(id))
+        {
             return div()
                 .flex()
                 .flex_col()

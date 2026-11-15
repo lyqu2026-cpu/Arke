@@ -320,8 +320,11 @@ pub(crate) struct Workspace {
     /// Repaint when the bookmarks change (any window may change them).
     _bookmarks: Subscription,
     /// Bookmark or group being renamed in the sidebar: what it is and the input.
-    bookmark_renaming:
-        Option<(sidebar::BookmarkRenameTarget, Entity<TextInput>, Subscription)>,
+    bookmark_renaming: Option<(
+        sidebar::BookmarkRenameTarget,
+        Entity<TextInput>,
+        Subscription,
+    )>,
     bookmark_rename_error: Option<SharedString>,
     last_viewport_width: gpui::Pixels,
     /// The active tab's shared preview at the last render (split view with the preview on).

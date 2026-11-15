@@ -324,11 +324,7 @@ impl Bookmarks {
             let key = folder_key(path);
             let mut item = None;
             for group in self.groups.iter_mut() {
-                if let Some(found) = group
-                    .items
-                    .iter_mut()
-                    .find(|b| folder_key(&b.path) == key)
-                {
+                if let Some(found) = group.items.iter_mut().find(|b| folder_key(&b.path) == key) {
                     item = Some(found);
                     break;
                 }
@@ -627,12 +623,7 @@ impl BookmarkStore {
     }
 
     /// Moves a bookmark to a group (`None` for ungrouped).
-    pub(crate) fn move_to_group(
-        &mut self,
-        id: u64,
-        group: Option<u64>,
-        cx: &mut Context<Self>,
-    ) {
+    pub(crate) fn move_to_group(&mut self, id: u64, group: Option<u64>, cx: &mut Context<Self>) {
         if self.bookmarks.move_to_group(id, group) {
             self.edited = true;
             self.schedule_save(cx);
@@ -789,15 +780,17 @@ mod tests {
         // Same path in another case: not added again.
         assert!(!bookmarks.add(Path::new(r"c:\DOCS\REPORT.docx"), false));
         assert_eq!(bookmarks.len(), 2);
-        let first = &bookmarks.ungrouped()[0];
-        assert_eq!(first.name, "report.docx");
-        assert_eq!(first.id, 1);
-        assert!(!first.is_dir);
+        let first_id = bookmarks.ungrouped()[0].id;
+        let first_name = bookmarks.ungrouped()[0].name.clone();
+        let first_is_dir = bookmarks.ungrouped()[0].is_dir;
+        assert_eq!(first_name, "report.docx");
+        assert_eq!(first_id, 1);
+        assert!(!first_is_dir);
         assert!(bookmarks.ungrouped()[1].is_dir);
         assert!(bookmarks.contains(Path::new(r"C:\docs\report.docx")));
         assert!(!bookmarks.contains(Path::new(r"C:\docs\other.docx")));
-        assert!(bookmarks.remove(first.id));
-        assert!(!bookmarks.remove(first.id));
+        assert!(bookmarks.remove(first_id));
+        assert!(!bookmarks.remove(first_id));
         assert_eq!(bookmarks.len(), 1);
     }
 
@@ -829,10 +822,7 @@ mod tests {
         assert!(bookmarks.move_group(other, true));
         assert_eq!(bookmarks.groups()[0].id, other);
         assert!(!bookmarks.move_group(other, true));
-        assert_eq!(
-            bookmarks.add_group("other"),
-            Err(NameProblem::Taken)
-        );
+        assert_eq!(bookmarks.add_group("other"), Err(NameProblem::Taken));
         assert_eq!(bookmarks.add_group("  "), Err(NameProblem::Empty));
         assert_eq!(
             bookmarks.rename_group(work, "Other"),
@@ -894,7 +884,11 @@ mod tests {
         .unwrap();
         let loaded = load(&file).unwrap();
         assert_eq!(loaded.groups().len(), 1);
-        assert_eq!(loaded.groups()[0].items.len(), 1, "bad and repeated items are skipped");
+        assert_eq!(
+            loaded.groups()[0].items.len(),
+            1,
+            "bad and repeated items are skipped"
+        );
         assert!(loaded.ungrouped().is_empty(), "nameless items are skipped");
         // The next id never goes backwards, so a later add gets a fresh id.
         let mut loaded = loaded;
