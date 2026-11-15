@@ -411,9 +411,30 @@ fn parse(bytes: &[u8], path: &Path) -> Result<Bookmarks, BookmarksError> {
     let mut max_id = 0;
     if let Some(list) = value.get("groups").and_then(serde_json::Value::as_array) {
         for v in list {
-            let Ok(mut group) = serde_json::from_value::<BookmarkGroup>(v.clone()) else {
+            // A group with one bad item still loads: read the group fields and
+            // each item on its own instead of failing the whole group.
+            let Some(obj) = v.as_object() else {
                 continue;
             };
+            let (Some(id), Some(name)) = (
+                obj.get("id").and_then(serde_json::Value::as_u64),
+                obj.get("name").and_then(serde_json::Value::as_str),
+            ) else {
+                continue;
+            };
+            let mut group = BookmarkGroup {
+                id,
+                name: name.to_owned(),
+                items: Vec::new(),
+            };
+            if let Some(items) = obj.get("items").and_then(serde_json::Value::as_array) {
+                for iv in items {
+                    let Ok(item) = serde_json::from_value::<Bookmark>(iv.clone()) else {
+                        continue;
+                    };
+                    group.items.push(item);
+                }
+            }
             // Drop bad or repeated items inside the group, keeping the rest.
             let mut kept = Vec::new();
             for item in group.items.drain(..) {
