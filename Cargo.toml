@@ -12,7 +12,7 @@ members = [
 default-members = ["crates/app", "crates/indexd"]
 
 [workspace.package]
-version = "0.6.0"
+version = "0.5.2"
 edition = "2024"
 rust-version = "1.100"
 license = "AGPL-3.0-only"
