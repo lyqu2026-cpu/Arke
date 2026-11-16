@@ -2121,8 +2121,8 @@ fn bookmark_kind(item: &Bookmark) -> FileKind {
 }
 
 impl Workspace {
-    /// The bookmarks section: header, groups (always expanded) with their items underneath,
-    /// then the ungrouped items.
+    /// The bookmarks section: header, groups with their items underneath (a collapsed group
+    /// shows only its header), then the ungrouped items.
     pub(super) fn render_bookmarks(
         &self,
         window: &mut Window,
@@ -2132,8 +2132,10 @@ impl Workspace {
         let mut out = vec![self.bookmarks_header(cx)];
         for group in bookmarks.groups() {
             out.push(self.bookmark_group_header(group, window, cx));
-            for item in &group.items {
-                out.push(self.bookmark_row(item, true, bookmarks.groups(), window, cx));
+            if !group.collapsed {
+                for item in &group.items {
+                    out.push(self.bookmark_row(item, true, bookmarks.groups(), window, cx));
+                }
             }
         }
         for item in bookmarks.ungrouped() {
@@ -2265,6 +2267,7 @@ impl Workspace {
                 .into_any_element();
         }
         let id = group.id;
+        let collapsed = group.collapsed;
         let menu = vec![
             (
                 t!("bookmarks.rename_group").into_owned().into(),
@@ -2283,6 +2286,19 @@ impl Workspace {
                 SidebarAction::BookmarkGroupMove { id, up: false },
             ),
         ];
+        // The chevron sits in the slot the left padding used to leave empty, so the name
+        // stays where it was. Right when collapsed, down when expanded, like the tree.
+        let chevron = svg()
+            .path(Icon::ChevronRight.path())
+            .size(theme::ICON_SM)
+            .text_color(theme::text_subtle());
+        let chevron = if collapsed {
+            chevron.into_any_element()
+        } else {
+            chevron
+                .with_transformation(gpui::Transformation::rotate(gpui::percentage(0.25)))
+                .into_any_element()
+        };
         div()
             .id(("bookmarks-group", id as usize))
             .h(theme::H_ROW)
@@ -2290,10 +2306,19 @@ impl Workspace {
             .flex_none()
             .items_center()
             .gap(theme::S_4)
-            .pl(theme::S_4 + theme::S_20 + theme::S_4)
+            .pl(theme::S_4)
             .pr(theme::S_8)
             .rounded(theme::R_8)
             .hover(|s| s.bg(theme::wash()))
+            .child(
+                div()
+                    .size(theme::S_20)
+                    .flex()
+                    .flex_none()
+                    .items_center()
+                    .justify_center()
+                    .child(chevron),
+            )
             .child(
                 div()
                     .flex_1()
@@ -2309,6 +2334,9 @@ impl Workspace {
                     .text_color(theme::text_subtle())
                     .child(arke_core::format::format_count(group.items.len())),
             )
+            .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                this.toggle_bookmark_group(id, cx);
+            }))
             .on_mouse_down(
                 MouseButton::Right,
                 cx.listener(move |this, e: &MouseDownEvent, _, cx| {
@@ -2556,6 +2584,11 @@ impl Workspace {
         };
         self.active_view()
             .update(cx, |e, cx| e.open_bookmark(path, is_dir, cx));
+    }
+
+    /// Flips a bookmark group's collapsed state (clicking its header).
+    fn toggle_bookmark_group(&self, id: u64, cx: &mut Context<Self>) {
+        BookmarkStore::global(cx).update(cx, |s, cx| s.toggle_group_collapsed(id, cx));
     }
 
     /// Bookmarks the active tab's folder (the "+" in the section header).

@@ -45,6 +45,9 @@ pub(crate) struct BookmarkGroup {
     pub(crate) name: String,
     #[serde(default)]
     pub(crate) items: Vec<Bookmark>,
+    /// Hidden in the sidebar until the header is clicked again; kept in the file.
+    #[serde(default)]
+    pub(crate) collapsed: bool,
 }
 
 /// Why a name can't be used. Display is the localized message shown under the name field.
@@ -263,6 +266,7 @@ impl Bookmarks {
             id,
             name,
             items: Vec::new(),
+            collapsed: false,
         });
         Ok(id)
     }
@@ -294,6 +298,15 @@ impl Bookmarks {
         };
         let group = self.groups.remove(ix);
         self.ungrouped.extend(group.items);
+        true
+    }
+
+    /// Flips a group's collapsed state. Returns whether the group was there.
+    pub(crate) fn toggle_group_collapsed(&mut self, id: u64) -> bool {
+        let Some(group) = self.groups.iter_mut().find(|g| g.id == id) else {
+            return false;
+        };
+        group.collapsed = !group.collapsed;
         true
     }
 
@@ -426,6 +439,10 @@ fn parse(bytes: &[u8], path: &Path) -> Result<Bookmarks, BookmarksError> {
                 id,
                 name: name.to_owned(),
                 items: Vec::new(),
+                collapsed: obj
+                    .get("collapsed")
+                    .and_then(serde_json::Value::as_bool)
+                    .unwrap_or(false),
             };
             if let Some(items) = obj.get("items").and_then(serde_json::Value::as_array) {
                 for iv in items {
@@ -710,6 +727,15 @@ impl BookmarkStore {
         }
     }
 
+    /// Flips a group's collapsed state; the state is saved with the bookmarks.
+    pub(crate) fn toggle_group_collapsed(&mut self, id: u64, cx: &mut Context<Self>) {
+        if self.bookmarks.toggle_group_collapsed(id) {
+            self.edited = true;
+            self.schedule_save(cx);
+            cx.notify();
+        }
+    }
+
     /// Checks on a background thread which bookmarks still exist.
     pub(crate) fn recheck(&mut self, fs: Arc<dyn Fs>, cx: &mut Context<Self>) {
         if self.bookmarks.is_empty() {
@@ -856,6 +882,32 @@ mod tests {
         assert_eq!(bookmarks.rename(id, "  "), Err(NameProblem::Empty));
         assert!(bookmarks.rename(id, "Photos").is_ok());
         assert_eq!(bookmarks.ungrouped()[0].name, "Photos");
+    }
+
+    #[test]
+    fn groups_collapse_and_persist() {
+        let dir = std::env::temp_dir()
+            .join(format!("arke-bookmarks-collapse-{}", std::process::id()));
+        let file = dir.join("bookmarks.json");
+        let mut bookmarks = Bookmarks::default();
+        let work = bookmarks.add_group("Work").unwrap();
+        bookmarks.add_to_group(Some(work), Path::new(r"C:\a"), true);
+        assert!(!bookmarks.groups()[0].collapsed);
+        assert!(bookmarks.toggle_group_collapsed(work));
+        assert!(bookmarks.groups()[0].collapsed);
+        assert!(!bookmarks.toggle_group_collapsed(999));
+        save(&file, &bookmarks).unwrap();
+        let loaded = load(&file).unwrap();
+        assert!(loaded.groups()[0].collapsed, "collapsed survives a restart");
+        assert_eq!(loaded.groups()[0].items.len(), 1);
+        // A file from before this feature (no "collapsed" key) loads expanded.
+        std::fs::write(
+            &file,
+            br#"{"version":1,"next_id":9,"groups":[{"id":3,"name":"Work","items":[]}],"ungrouped":[]}"#,
+        )
+        .unwrap();
+        assert!(!load(&file).unwrap().groups()[0].collapsed);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
