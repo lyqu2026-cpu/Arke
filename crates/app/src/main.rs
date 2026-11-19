@@ -628,8 +628,15 @@ fn follow_drive_removals(cx: &mut App) {
     let events = win_devnotify::start();
     cx.spawn(async move |cx| {
         while let Ok(event) = events.recv_async().await {
-            let win_devnotify::DriveEvent::Leaving(drive) = event;
-            cx.update(|cx| workspace::leave_drive_everywhere(&drive, cx));
+            cx.update(|cx| match event {
+                win_devnotify::DriveEvent::Leaving(drive) => {
+                    workspace::leave_drive_everywhere(&drive, cx);
+                    workspace::reload_places_everywhere(cx);
+                }
+                win_devnotify::DriveEvent::Arrived(_) => {
+                    workspace::reload_places_everywhere(cx);
+                }
+            });
         }
     })
     .detach();

@@ -2573,3 +2573,13 @@ pub(crate) fn leave_drive_everywhere(drive: &Path, cx: &mut App) {
         }
     }
 }
+
+/// A drive arrived or left: every window re-enumerates its places, so the sidebar lists the new
+/// drive (or drops the gone one) at once instead of waiting for a new tab.
+pub(crate) fn reload_places_everywhere(cx: &mut App) {
+    for window in cx.windows() {
+        if let Some(workspace) = window.downcast::<Workspace>() {
+            let _ = workspace.update(cx, |ws, _, cx| ws.reload_all_places(cx));
+        }
+    }
+}

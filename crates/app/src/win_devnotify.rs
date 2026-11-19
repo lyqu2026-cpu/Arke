@@ -41,6 +41,8 @@ const DRIVE_CDROM: u32 = 5;
 pub(crate) enum DriveEvent {
     /// The drive is being removed or dismounted: tabs showing it should move away.
     Leaving(PathBuf),
+    /// A drive arrived: the sidebar should list it without waiting for a new tab.
+    Arrived(PathBuf),
 }
 
 /// A device message about one volume.
@@ -322,7 +324,10 @@ fn on_device_change(wparam: WPARAM, lparam: LPARAM) {
             let volume = unsafe { &*(lparam.0 as *const DEV_BROADCAST_VOLUME) };
             for letter in letters(volume.dbcv_unitmask) {
                 match kind {
-                    DBT_DEVICEARRIVAL => watcher.watch(letter),
+                    DBT_DEVICEARRIVAL => {
+                        watcher.watch(letter);
+                        let _ = watcher.events.send(DriveEvent::Arrived(root(letter)));
+                    }
                     DBT_DEVICEREMOVECOMPLETE => watcher.apply(letter, DevEvent::Removed),
                     _ => {}
                 }
