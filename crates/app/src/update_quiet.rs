@@ -366,7 +366,7 @@ pub(crate) fn show_ready(cx: &mut App) -> bool {
 
 /// The hourly check: an update found on a metered connection downloads once it isn't.
 // Fork: only called from the disabled `auto_check` (see update.rs).
-#[allow(dead_code)]
+#[allow(dead_code, reason = "only called from the disabled auto_check")]
 pub(crate) fn resume(cx: &mut App) {
     if !enabled(cx) {
         return;

@@ -907,7 +907,8 @@ impl Settings {
                 if tiles.len() >= FAVORITES_MAX {
                     let to = to.min(tiles.len() - 1);
                     let bumped = std::mem::replace(&mut tiles[to], moved);
-                    groups[g].items.insert(i.min(groups[g].items.len()), bumped);
+                    let at = i.min(groups[g].items.len());
+                    groups[g].items.insert(at, bumped);
                 } else {
                     tiles.insert(to.min(tiles.len()), moved);
                 }
@@ -935,7 +936,8 @@ impl Settings {
                     // Unpinned folders cannot be added by dragging.
                     return;
                 };
-                groups[g].items.insert(to.min(groups[g].items.len()), moved);
+                let at = to.min(groups[g].items.len());
+                groups[g].items.insert(at, moved);
             }
             // Unpinned folders cannot be added by dragging.
             _ => return,
@@ -1508,7 +1510,7 @@ impl Settings {
                 .map(str::to_owned);
             Some((path, custom))
         };
-        let mut keep_name =
+        let keep_name =
             |path: &Path, name: Option<String>, names: &mut crate::place_names::Names| {
                 if let Some(name) = name {
                     names.insert(crate::place_names::key(path), name);

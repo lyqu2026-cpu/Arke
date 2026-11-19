@@ -61,7 +61,7 @@ pub(super) enum PinArea {
 }
 
 impl PinArea {
-    const fn slot(self, ix: usize) -> PinSlot {
+    pub(super) const fn slot(self, ix: usize) -> PinSlot {
         match self {
             Self::Tiles => PinSlot::Tile(ix),
             Self::List => PinSlot::List(ix),

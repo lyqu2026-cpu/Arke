@@ -876,7 +876,7 @@ pub(super) enum FavIcon {
 }
 
 /// Draws a favorite's icon at `size`.
-pub(super) fn fav_icon_el(icon: FavIcon, size: Pixels, color: gpui::Hsla) -> AnyElement {
+pub(super) fn fav_icon_el(icon: FavIcon, size: Pixels, color: impl Into<gpui::Hsla>) -> AnyElement {
     match icon {
         FavIcon::Place(icon) => crate::assets::tinted(icon, size, color),
         FavIcon::File(kind) => kind_icon(kind, size),
