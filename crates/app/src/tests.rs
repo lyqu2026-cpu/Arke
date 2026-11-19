@@ -5255,13 +5255,13 @@ fn context_menu_items_selection_and_keyboard(cx: &mut TestAppContext) {
     assert_eq!(labels.first(), Some(&t!("menu.new_folder").into_owned()));
     cx.simulate_keystrokes("escape");
 
-    // Keyboard: Shift+F10 opens the menu; Down x6 then Enter runs the sixth enabled item (after
-    // "Add to shelf"). Cut, copy, rename and delete are in the icon row, and the keyboard uses
-    // their shortcuts.
+    // Keyboard: Shift+F10 opens the menu; Down x7 then Enter runs the seventh enabled item (after
+    // "Add to shelf"; files also offer "Add to favorites" near the top). Cut, copy, rename and
+    // delete are in the icon row, and the keyboard uses their shortcuts.
     *shell.clipboard_text.lock() = None;
     cx.simulate_keystrokes("home down shift-f10");
     assert!(menu_labels(&view, cx).is_some());
-    cx.simulate_keystrokes("down down down down down down enter");
+    cx.simulate_keystrokes("down down down down down down down enter");
     wait_shell("copy path", || shell.clipboard_text.lock().is_some());
     assert_eq!(
         shell.clipboard_text.lock().as_deref(),
