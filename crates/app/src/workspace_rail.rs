@@ -16,7 +16,7 @@ use gpui::{
 };
 use rust_i18n::t;
 
-use super::sidebar::{SidebarAction, display_name};
+use super::sidebar::{SidebarAction, display_name, fav_icon_el, favorite_is_file, favorite_kind};
 use super::{OpenPalette, ToggleSidebar, Workspace};
 
 /// Sidebar state that isn't a setting.
@@ -40,6 +40,8 @@ pub(super) struct SidebarUi {
     peek_ghost_task: Option<gpui::Task<()>>,
     /// The mapped drive or network place being renamed in place.
     pub(super) place_rename: Option<super::place_rename::PlaceRename>,
+    /// The favorite group being renamed in place.
+    pub(super) group_rename: Option<super::place_rename::GroupRename>,
 }
 use crate::a11y::A11yExt as _;
 use crate::assets::Icon;
@@ -352,7 +354,7 @@ impl Workspace {
             .enumerate()
             .map(|(ix, (path, label, kf_icon))| {
                 let here = current.as_deref() == Some(path.as_path());
-                let tint = crate::assets::tinted(
+                let tint = fav_icon_el(
                     kf_icon,
                     theme::icon(),
                     if here {
@@ -384,7 +386,7 @@ impl Workspace {
             .map(Path::to_path_buf)
     }
 
-    /// A button that opens a folder here (middle click: in a new tab).
+    /// A button that opens a favorite here (middle click: a folder in a new tab).
     fn rail_folder(
         id: impl Into<ElementId>,
         icon_el: AnyElement,
@@ -396,12 +398,16 @@ impl Workspace {
         let (open, background) = (path.clone(), path);
         rail_button(id, icon_el, label, here)
             .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
-                this.navigate_active(open.clone(), window, cx);
+                this.open_favorite(open.clone(), window, cx);
             }))
             .on_mouse_down(
                 MouseButton::Middle,
                 cx.listener(move |this, _: &MouseDownEvent, window, cx| {
-                    this.open_in_background(background.clone(), window, cx);
+                    if favorite_is_file(&background) {
+                        this.open_favorite(background.clone(), window, cx);
+                    } else {
+                        this.open_in_background(background.clone(), window, cx);
+                    }
                 }),
             )
             .into_any_element()
@@ -418,7 +424,10 @@ impl Workspace {
             let label = display_name(&path);
             out.push(Self::rail_folder(
                 ("rail-pin", ix),
-                kind_icon(FileKind::Folder, theme::icon()),
+                kind_icon(
+                    favorite_kind(&path).unwrap_or(FileKind::Folder),
+                    theme::icon(),
+                ),
                 &label,
                 path,
                 here,

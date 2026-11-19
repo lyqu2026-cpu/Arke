@@ -42,11 +42,23 @@ pub(crate) enum PinPlace {
     Already,
 }
 
-/// Drop target for a dragged pin: an index in the tiles or the list (past the end means last).
+/// Drop target for a dragged pin: an index in the tiles or the list (past the end means last),
+/// or an item index in a favorite group.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum PinSlot {
     Tile(usize),
     List(usize),
+    Group(usize, usize),
+}
+
+/// A named group of favorites in the list under the tiles. Items are folders or files.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub(crate) struct FavoriteGroup {
+    pub(crate) name: String,
+    pub(crate) items: Vec<PathBuf>,
+    /// Hidden in the sidebar until the header is clicked again; kept in the file.
+    pub(crate) collapsed: bool,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -449,6 +461,11 @@ pub(crate) struct Settings {
     /// Pinned folders on the tiles (at most [`FAVORITES_MAX`]). `None` means the defaults
     /// (Desktop, Downloads, Documents, Pictures, Music, Videos).
     pub(crate) favorites: Option<Vec<PathBuf>>,
+    /// Named groups of favorites under the pinned list, in user order.
+    pub(crate) favorite_groups: Vec<FavoriteGroup>,
+    /// The fork's old `bookmarks.json` (beside this file) has been imported into the
+    /// favorites above; never import twice.
+    pub(crate) bookmarks_migrated: bool,
     /// Recycle Bin row at the end of the pinned list.
     pub(crate) recycle_pinned: bool,
     /// Recent folders, newest first (for Ctrl+T).
@@ -650,6 +667,8 @@ impl Default for Settings {
         Self {
             pinned: Vec::new(),
             favorites: None,
+            favorite_groups: Vec::new(),
+            bookmarks_migrated: false,
             recycle_pinned: true,
             recent: Vec::new(),
             tab_layout: TabLayout::default(),
@@ -822,7 +841,16 @@ impl Settings {
 
     /// Whether the folder is pinned, on the tiles or in the list.
     pub(crate) fn is_pinned(&self, path: &Path, places: &[crate::shell::Place]) -> bool {
-        self.pinned.iter().any(|p| p == path) || self.tiles(places).iter().any(|p| p == path)
+        self.pinned.iter().any(|p| p == path)
+            || self.tiles(places).iter().any(|p| p == path)
+            || self.group_of(path).is_some()
+    }
+
+    /// The group holding `path`, if any.
+    pub(crate) fn group_of(&self, path: &Path) -> Option<usize> {
+        self.favorite_groups
+            .iter()
+            .position(|g| g.items.iter().any(|p| p == path))
     }
 
     /// Pins to the tiles if there is room, otherwise to the list. Already pinned folders stay put. Returns where it went.
@@ -846,14 +874,25 @@ impl Settings {
     pub(crate) fn place_pin(&mut self, path: &Path, slot: PinSlot, places: &[crate::shell::Place]) {
         let mut tiles = self.tiles(places);
         let mut list = self.pinned.clone();
+        let mut groups = self.favorite_groups.clone();
         let in_tiles = tiles.iter().position(|p| p == path);
         let in_list = list.iter().position(|p| p == path);
-        match (slot, in_tiles, in_list) {
-            (PinSlot::Tile(to), Some(from), _) => {
+        let in_group = groups
+            .iter()
+            .enumerate()
+            .find_map(|(g, group)| group.items.iter().position(|p| p == path).map(|i| (g, i)));
+        // A group slot past the last group goes nowhere (the group was deleted mid-drag).
+        if let PinSlot::Group(g, _) = slot
+            && g >= groups.len()
+        {
+            return;
+        }
+        match (slot, in_tiles, in_list, in_group) {
+            (PinSlot::Tile(to), Some(from), _, _) => {
                 let moved = tiles.remove(from);
                 tiles.insert(to.min(tiles.len()), moved);
             }
-            (PinSlot::Tile(to), None, Some(from)) => {
+            (PinSlot::Tile(to), None, Some(from), _) => {
                 let moved = list.remove(from);
                 if tiles.len() >= FAVORITES_MAX {
                     let to = to.min(tiles.len() - 1);
@@ -863,19 +902,47 @@ impl Settings {
                     tiles.insert(to.min(tiles.len()), moved);
                 }
             }
-            (PinSlot::List(to), _, Some(from)) => {
+            (PinSlot::Tile(to), None, None, Some((g, i))) => {
+                let moved = groups[g].items.remove(i);
+                if tiles.len() >= FAVORITES_MAX {
+                    let to = to.min(tiles.len() - 1);
+                    let bumped = std::mem::replace(&mut tiles[to], moved);
+                    groups[g].items.insert(i.min(groups[g].items.len()), bumped);
+                } else {
+                    tiles.insert(to.min(tiles.len()), moved);
+                }
+            }
+            (PinSlot::List(to), _, Some(from), _) => {
                 let moved = list.remove(from);
                 list.insert(to.min(list.len()), moved);
             }
-            (PinSlot::List(to), Some(from), None) => {
+            (PinSlot::List(to), Some(from), None, _) => {
                 let moved = tiles.remove(from);
                 list.insert(to.min(list.len()), moved);
+            }
+            (PinSlot::List(to), None, None, Some((g, i))) => {
+                let moved = groups[g].items.remove(i);
+                list.insert(to.min(list.len()), moved);
+            }
+            (PinSlot::Group(g, to), _, _, _) => {
+                let moved = if let Some(from) = in_tiles {
+                    tiles.remove(from)
+                } else if let Some(from) = in_list {
+                    list.remove(from)
+                } else if let Some((from_g, i)) = in_group {
+                    groups[from_g].items.remove(i)
+                } else {
+                    // Unpinned folders cannot be added by dragging.
+                    return;
+                };
+                groups[g].items.insert(to.min(groups[g].items.len()), moved);
             }
             // Unpinned folders cannot be added by dragging.
             _ => return,
         }
         self.favorites = Some(tiles);
         self.pinned = list;
+        self.favorite_groups = groups;
     }
 
     /// Puts a folder in at `slot`, an insertion point (a tile or list index, past the end means
@@ -888,8 +955,15 @@ impl Settings {
         slot: PinSlot,
         places: &[crate::shell::Place],
     ) -> PinSlot {
+        // A group slot past the last group goes nowhere (the group was deleted mid-drag).
+        if let PinSlot::Group(g, _) = slot
+            && g >= self.favorite_groups.len()
+        {
+            return slot;
+        }
         let mut tiles = self.tiles(places);
         let mut list = self.pinned.clone();
+        let mut groups = self.favorite_groups.clone();
         // Takes the folder out of `items`; `at` counted with it still there.
         let take = |items: &mut Vec<PathBuf>, at: usize| -> usize {
             match items.iter().position(|p| p == path) {
@@ -904,6 +978,9 @@ impl Settings {
             PinSlot::Tile(at) => {
                 let at = take(&mut tiles, at).min(tiles.len());
                 list.retain(|p| p != path);
+                for group in &mut groups {
+                    group.items.retain(|p| p != path);
+                }
                 tiles.insert(at, path.to_path_buf());
                 if tiles.len() > FAVORITES_MAX
                     && let Some(last) = tiles.iter().rposition(|p| p != path)
@@ -915,22 +992,41 @@ impl Settings {
             PinSlot::List(at) => {
                 let at = take(&mut list, at).min(list.len());
                 tiles.retain(|p| p != path);
+                for group in &mut groups {
+                    group.items.retain(|p| p != path);
+                }
                 list.insert(at, path.to_path_buf());
                 PinSlot::List(at)
+            }
+            PinSlot::Group(g, at) => {
+                let at = take(&mut groups[g].items, at).min(groups[g].items.len());
+                tiles.retain(|p| p != path);
+                list.retain(|p| p != path);
+                for (ix, group) in groups.iter_mut().enumerate() {
+                    if ix != g {
+                        group.items.retain(|p| p != path);
+                    }
+                }
+                groups[g].items.insert(at, path.to_path_buf());
+                PinSlot::Group(g, at)
             }
         };
         self.favorites = Some(tiles);
         self.pinned = list;
+        self.favorite_groups = groups;
         landed
     }
 
-    /// Unpins, from the tiles or the list.
+    /// Unpins, from the tiles, the list or a group.
     pub(crate) fn unpin(&mut self, path: &Path, places: &[crate::shell::Place]) {
         let tiles = self.tiles(places);
         if tiles.iter().any(|p| p == path) {
             self.favorites = Some(tiles.into_iter().filter(|p| p != path).collect());
         }
         self.pinned.retain(|p| p != path);
+        for group in &mut self.favorite_groups {
+            group.items.retain(|p| p != path);
+        }
     }
 
     /// Pins or unpins. Returns where the pin went, or `None` when unpinned.
@@ -968,9 +1064,91 @@ impl Settings {
             return false;
         }
         self.pinned.retain(|p| p != path);
+        for group in &mut self.favorite_groups {
+            group.items.retain(|p| p != path);
+        }
         tiles.push(path.to_path_buf());
         self.favorites = Some(tiles);
         true
+    }
+
+    /// Adds an empty group at the end. Returns its index.
+    pub(crate) fn add_group(&mut self, name: String) -> usize {
+        self.favorite_groups.push(FavoriteGroup {
+            name,
+            items: Vec::new(),
+            collapsed: false,
+        });
+        self.favorite_groups.len() - 1
+    }
+
+    pub(crate) fn rename_group(&mut self, ix: usize, name: String) {
+        if let Some(group) = self.favorite_groups.get_mut(ix) {
+            group.name = name;
+        }
+    }
+
+    /// Deletes a group; its items go to the end of the pinned list (ungrouped), in order.
+    pub(crate) fn delete_group(&mut self, ix: usize) {
+        if ix < self.favorite_groups.len() {
+            let group = self.favorite_groups.remove(ix);
+            for item in group.items {
+                if !self.pinned.contains(&item) {
+                    self.pinned.push(item);
+                }
+            }
+        }
+    }
+
+    pub(crate) fn toggle_group_collapsed(&mut self, ix: usize) {
+        if let Some(group) = self.favorite_groups.get_mut(ix) {
+            group.collapsed = !group.collapsed;
+        }
+    }
+
+    /// Moves a group one step up or down among the groups.
+    pub(crate) fn move_group(&mut self, ix: usize, up: bool) {
+        let to = if up {
+            ix.checked_sub(1)
+        } else {
+            ix.checked_add(1)
+        };
+        if let Some(to) = to
+            && to < self.favorite_groups.len()
+        {
+            self.favorite_groups.swap(ix, to);
+        }
+    }
+
+    /// Moves a favorite (from the tiles, the list or another group) to the end of group `ix`.
+    /// A path that isn't a favorite yet is added there.
+    pub(crate) fn move_to_group(&mut self, path: &Path, ix: usize, places: &[crate::shell::Place]) {
+        if ix >= self.favorite_groups.len() {
+            return;
+        }
+        let tiles = self.tiles(places);
+        if tiles.iter().any(|p| p == path) {
+            self.favorites = Some(tiles.into_iter().filter(|p| p != path).collect());
+        }
+        self.pinned.retain(|p| p != path);
+        for (g, group) in self.favorite_groups.iter_mut().enumerate() {
+            if g != ix {
+                group.items.retain(|p| p != path);
+            }
+        }
+        let group = &mut self.favorite_groups[ix];
+        if !group.items.iter().any(|p| p == path) {
+            group.items.push(path.to_path_buf());
+        }
+    }
+
+    /// Moves a group item back to the ungrouped list (front, like [`Self::move_to_list`]).
+    pub(crate) fn move_to_ungrouped(&mut self, path: &Path) {
+        for group in &mut self.favorite_groups {
+            group.items.retain(|p| p != path);
+        }
+        self.pinned.retain(|p| p != path);
+        self.pinned.insert(0, path.to_path_buf());
     }
 }
 
@@ -1242,6 +1420,7 @@ fn parse_settings(bytes: &[u8], path: &Path) -> Option<Settings> {
                 .retain(|p| arke_core::net::server_of(p).is_some());
             settings.migrate_session();
             settings.migrate_single_window(bytes);
+            settings.migrate_bookmarks(path);
             Some(settings)
         }
         Err(err) => {
@@ -1293,6 +1472,84 @@ impl Settings {
             && let Some(old) = map.get(OLD).and_then(serde_json::Value::as_bool)
         {
             self.single_window = old;
+        }
+    }
+
+    /// The fork's bookmarks lived in `bookmarks.json` beside the settings file, before
+    /// favorites took over: ungrouped ones join the pinned list, groups become favorite
+    /// groups, and a custom name is kept as a place name. Runs once.
+    fn migrate_bookmarks(&mut self, settings_path: &Path) {
+        if self.bookmarks_migrated {
+            return;
+        }
+        self.bookmarks_migrated = true;
+        let Some(dir) = settings_path.parent() else {
+            return;
+        };
+        let Ok(bytes) = std::fs::read(dir.join("bookmarks.json")) else {
+            return;
+        };
+        let Ok(value) = serde_json::from_slice::<serde_json::Value>(&bytes) else {
+            return;
+        };
+        // One bookmark entry: its path, and its name when it isn't the item's own.
+        let entry = |v: &serde_json::Value| -> Option<(PathBuf, Option<String>)> {
+            let path = PathBuf::from(v.get("path")?.as_str()?);
+            let custom = v
+                .get("name")
+                .and_then(serde_json::Value::as_str)
+                .filter(|name| {
+                    let own = path.file_name().map_or_else(
+                        || path.display().to_string(),
+                        |n| n.to_string_lossy().into_owned(),
+                    );
+                    *name != own
+                })
+                .map(str::to_owned);
+            Some((path, custom))
+        };
+        let mut keep_name =
+            |path: &Path, name: Option<String>, names: &mut crate::place_names::Names| {
+                if let Some(name) = name {
+                    names.insert(crate::place_names::key(path), name);
+                }
+            };
+        if let Some(list) = value.get("ungrouped").and_then(serde_json::Value::as_array) {
+            for item in list {
+                if let Some((path, name)) = entry(item) {
+                    keep_name(&path, name, &mut self.place_names);
+                    if !self.pinned.contains(&path) && self.group_of(&path).is_none() {
+                        self.pinned.push(path);
+                    }
+                }
+            }
+        }
+        if let Some(groups) = value.get("groups").and_then(serde_json::Value::as_array) {
+            for group in groups {
+                let mut items = Vec::new();
+                if let Some(list) = group.get("items").and_then(serde_json::Value::as_array) {
+                    for item in list {
+                        if let Some((path, name)) = entry(item) {
+                            keep_name(&path, name, &mut self.place_names);
+                            if !items.contains(&path) {
+                                items.push(path);
+                            }
+                        }
+                    }
+                }
+                self.favorite_groups.push(FavoriteGroup {
+                    name: group
+                        .get("name")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or_default()
+                        .to_owned(),
+                    items,
+                    collapsed: group
+                        .get("collapsed")
+                        .and_then(serde_json::Value::as_bool)
+                        .unwrap_or(false),
+                });
+            }
         }
     }
 
@@ -1740,6 +1997,125 @@ mod tests {
         assert_eq!(tiles.len(), FAVORITES_MAX);
         assert_eq!(tiles[3], p(51));
         assert_eq!(full.pinned, [p(50), p(3)]);
+    }
+
+    #[test]
+    fn favorite_groups_hold_items_and_move_between_areas() {
+        let p = |n: usize| PathBuf::from(format!(r"D:\p{n}"));
+        let group = |name: &str, items: Vec<PathBuf>| FavoriteGroup {
+            name: name.into(),
+            items,
+            collapsed: false,
+        };
+        let mut s = Settings {
+            favorites: Some(vec![p(0)]),
+            pinned: vec![p(10)],
+            favorite_groups: vec![
+                group("Work", vec![p(20), p(21)]),
+                group("Play", vec![p(30)]),
+            ],
+            ..Settings::default()
+        };
+        // Group items count as pinned; unpinning removes them from the group.
+        assert!(s.is_pinned(&p(20), &[]));
+        assert_eq!(s.group_of(&p(30)), Some(1));
+        s.unpin(&p(21), &[]);
+        assert_eq!(s.favorite_groups[0].items, [p(20)]);
+
+        // Moving between areas by menu.
+        s.move_to_group(&p(10), 1, &[]);
+        assert_eq!(s.pinned, Vec::<PathBuf>::new());
+        assert_eq!(s.favorite_groups[1].items, [p(30), p(10)]);
+        s.move_to_ungrouped(&p(30));
+        assert_eq!(s.pinned, [p(30)]);
+        assert_eq!(s.favorite_groups[1].items, [p(10)]);
+        // An unpinned path can be added straight to a group.
+        s.move_to_group(&p(99), 0, &[]);
+        assert_eq!(s.favorite_groups[0].items, [p(20), p(99)]);
+
+        // Dragging: reorder in a group, move across groups, group item onto tiles.
+        s.place_pin(&p(99), PinSlot::Group(0, 0), &[]);
+        assert_eq!(s.favorite_groups[0].items, [p(99), p(20)]);
+        s.place_pin(&p(99), PinSlot::Group(1, usize::MAX), &[]);
+        assert_eq!(s.favorite_groups[0].items, [p(20)]);
+        assert_eq!(s.favorite_groups[1].items, [p(10), p(99)]);
+        s.place_pin(&p(20), PinSlot::Tile(0), &[]);
+        assert_eq!(s.favorites, Some(vec![p(20), p(0)]));
+        assert!(s.favorite_groups[0].items.is_empty());
+
+        // Inserting (a folder or file dragged in from a list) lands in the group.
+        let landed = s.insert_pin(&p(77), PinSlot::Group(0, 0), &[]);
+        assert_eq!(landed, PinSlot::Group(0, 0));
+        assert_eq!(s.favorite_groups[0].items, [p(77)]);
+        // Inserting elsewhere takes it back out of the group.
+        s.insert_pin(&p(77), PinSlot::List(0), &[]);
+        assert!(s.favorite_groups[0].items.is_empty());
+        assert_eq!(s.pinned, [p(77), p(30)]);
+
+        // Groups: add, rename, reorder, collapse, delete (items fall back to the list).
+        let ix = s.add_group("New".into());
+        assert_eq!(ix, 2);
+        s.rename_group(ix, "Later".into());
+        assert_eq!(s.favorite_groups[2].name, "Later");
+        s.move_group(2, true);
+        assert_eq!(s.favorite_groups[1].name, "Later");
+        s.toggle_group_collapsed(0);
+        assert!(s.favorite_groups[0].collapsed);
+        s.delete_group(2);
+        assert_eq!(s.favorite_groups.len(), 2);
+        assert_eq!(s.pinned, [p(77), p(30), p(10), p(99)]);
+    }
+
+    #[test]
+    fn old_bookmarks_file_becomes_favorites() {
+        let dir = std::env::temp_dir().join(format!("arke-bookmarks-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let settings_path = dir.join("settings.json");
+        std::fs::write(
+            dir.join("bookmarks.json"),
+            r#"{
+                "next_id": 9,
+                "groups": [
+                    {"id": 1, "name": "Work", "collapsed": true, "items": [
+                        {"id": 2, "name": "Notes", "path": "D:\\docs\\notes.txt", "is_dir": false},
+                        {"id": 3, "name": "proj", "path": "D:\\proj", "is_dir": true}
+                    ]}
+                ],
+                "ungrouped": [
+                    {"id": 4, "name": "music", "path": "D:\\music", "is_dir": true}
+                ]
+            }"#,
+        )
+        .unwrap();
+        let mut s = Settings::default();
+        s.migrate_bookmarks(&settings_path);
+        assert!(s.bookmarks_migrated);
+        assert_eq!(s.pinned, [PathBuf::from(r"D:\music")]);
+        assert_eq!(s.favorite_groups.len(), 1);
+        assert_eq!(s.favorite_groups[0].name, "Work");
+        assert!(s.favorite_groups[0].collapsed);
+        assert_eq!(
+            s.favorite_groups[0].items,
+            [
+                PathBuf::from(r"D:\docs\notes.txt"),
+                PathBuf::from(r"D:\proj")
+            ]
+        );
+        // The custom name is kept as a place name; the item's own name is not.
+        assert_eq!(
+            s.place_names
+                .get(&crate::place_names::key(Path::new(r"D:\docs\notes.txt"))),
+            Some(&"Notes".to_string())
+        );
+        assert!(
+            !s.place_names
+                .contains_key(&crate::place_names::key(Path::new(r"D:\proj")))
+        );
+        // Running again changes nothing.
+        s.migrate_bookmarks(&settings_path);
+        assert_eq!(s.favorite_groups.len(), 1);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// Folders dragged onto the sidebar go in at an insertion point, whether pinned before or not.

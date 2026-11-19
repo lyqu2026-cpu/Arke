@@ -7,7 +7,8 @@
 //!   a tile or row inserts.
 //! - Over the tiles they get a wash and a dashed "Add to favorites" slot after the last one: what
 //!   the drop does, and the end of the row to drop on.
-//! - Files can't be favorites: they get no mark, and the tiles take them into their folders.
+//! - A file dropped at an insertion point becomes a favorite too; dropped in the middle of a
+//!   folder tile or row it goes into that folder as before.
 //! - Where the drag would go in is reported on each mouse move ([`report`]) and holds for a few
 //!   pixels, across the gaps between tiles and rows ([`current`]).
 
@@ -51,11 +52,12 @@ pub(super) struct Mark {
 
 impl Global for PinDrop {}
 
-/// The two areas folders can be added to.
+/// The areas folders and files can be added to: the tiles, the ungrouped list, or a group.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum PinArea {
     Tiles,
     List,
+    Group(usize),
 }
 
 impl PinArea {
@@ -63,6 +65,7 @@ impl PinArea {
         match self {
             Self::Tiles => PinSlot::Tile(ix),
             Self::List => PinSlot::List(ix),
+            Self::Group(g) => PinSlot::Group(g, ix),
         }
     }
 }
@@ -153,7 +156,8 @@ impl PinDrag for DraggedTab {
 
 impl PinDrag for DraggedFiles {
     fn edges(&self, _: &Workspace, cx: &App) -> Option<bool> {
-        self.folders(cx).map(|_| true)
+        // Files and folders alike can be favorites; shelf items stay on the shelf.
+        (self.shelf.is_none() && !self.paths(cx).is_empty()).then_some(true)
     }
 }
 
@@ -190,7 +194,7 @@ impl Workspace {
         let slot = e.drag(cx).edges(self, cx).and_then(|edges| {
             let (start, len, at) = match area {
                 PinArea::Tiles => (b.left(), b.size.width, pos.x),
-                PinArea::List => (b.top(), b.size.height, pos.y),
+                PinArea::List | PinArea::Group(_) => (b.top(), b.size.height, pos.y),
             };
             zone(start.into(), len.into(), at.into(), ix, edges)
         });
@@ -247,6 +251,7 @@ impl Workspace {
                         at = match st.insert_pin(path, at, &places) {
                             PinSlot::Tile(ix) => PinSlot::Tile(ix + 1),
                             PinSlot::List(ix) => PinSlot::List(ix + 1),
+                            PinSlot::Group(g, ix) => PinSlot::Group(g, ix + 1),
                         };
                     }
                 },
@@ -256,19 +261,26 @@ impl Workspace {
         cx.notify();
     }
 
-    /// Folders dropped on a pin area at the cursor: added there. `false` (nothing done) when the
-    /// cursor isn't where they would be added.
+    /// Files and folders dropped on a pin area at the cursor: added there. `false` (nothing
+    /// done) when the cursor isn't where they would be added.
     pub(super) fn drop_files_to_pin(
         &mut self,
         dragged: &DraggedFiles,
         window: &Window,
         cx: &mut Context<Self>,
     ) -> bool {
-        let (Some(slot), Some(folders)) = (current(window, cx), dragged.folders(cx)) else {
+        let Some(slot) = current(window, cx) else {
             return false;
         };
+        if dragged.shelf.is_some() {
+            return false;
+        }
+        let paths = dragged.paths(cx);
+        if paths.is_empty() {
+            return false;
+        }
         crate::spring::note_drop(cx);
-        self.pin_paths(&folders, slot, cx);
+        self.pin_paths(&paths, slot, cx);
         true
     }
 
@@ -288,15 +300,15 @@ impl Workspace {
         let fs = Arc::clone(&self.services.fs);
         let (tx, rx) = flume::bounded::<Vec<PathBuf>>(1);
         crate::explorer::spawn_thread("pin-check", move || {
-            let folders = paths
+            let existing = paths
                 .into_iter()
-                .filter(|p| p.parent().is_none() || fs.stat(p).is_ok_and(|e| e.is_dir_like()))
+                .filter(|p| p.parent().is_none() || fs.stat(p).is_ok())
                 .collect();
-            let _ = tx.send(folders);
+            let _ = tx.send(existing);
         });
         cx.spawn(async move |this, cx| {
-            if let Ok(folders) = rx.recv_async().await {
-                let _ = this.update(cx, |this, cx| this.pin_paths(&folders, slot, cx));
+            if let Ok(existing) = rx.recv_async().await {
+                let _ = this.update(cx, |this, cx| this.pin_paths(&existing, slot, cx));
             }
         })
         .detach();

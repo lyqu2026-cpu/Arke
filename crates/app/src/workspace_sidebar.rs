@@ -54,6 +54,21 @@ pub(super) enum SidebarAction {
     MoveToList(PathBuf),
     /// Move a pinned list entry up to the tiles.
     MoveToTiles(PathBuf),
+    /// Open a favorite: a file with its default app, a folder here.
+    OpenFavorite(PathBuf),
+    /// Move a favorite into group `1` (its index in the favorite groups).
+    MoveToGroup(PathBuf, usize),
+    /// Move a favorite out of its group, to the ungrouped list.
+    MoveToUngrouped(PathBuf),
+    /// Put a favorite in a new group and start naming it.
+    NewGroupWith(PathBuf),
+    /// Rename favorite group `0` in place.
+    RenameGroup(usize),
+    /// Delete favorite group `0`; its items go to the ungrouped list.
+    DeleteGroup(usize),
+    /// Move favorite group `0` one step up or down.
+    MoveGroupUp(usize),
+    MoveGroupDown(usize),
     /// A folder picked in the back or forward button's menu: `steps` down that pane's history,
     /// where `path` was when the menu opened.
     HistoryJump {
@@ -112,12 +127,12 @@ pub(super) enum SidebarAction {
     ShelfReveal(PathBuf),
 }
 
-/// A pinned folder being dragged, from the tiles or the list.
+/// A pinned folder or file being dragged, from the tiles or the list.
 #[derive(Clone)]
 pub(super) struct DraggedPin {
     pub(super) path: PathBuf,
     label: SharedString,
-    icon: Icon,
+    icon: FavIcon,
     /// Dragged from the tiles: reorders them live while over other tiles (`workspace_tabdrag.rs`).
     pub(super) from_tile: bool,
 }
@@ -136,11 +151,7 @@ impl Render for DraggedPin {
             .ui_font()
             .text_size(theme::fs_14())
             .text_color(theme::text())
-            .child(crate::assets::tinted(
-                self.icon,
-                theme::icon(),
-                theme::text_muted(),
-            ))
+            .child(fav_icon_el(self.icon, theme::icon(), theme::text_muted()))
             .child(self.label.clone())
     }
 }
@@ -313,6 +324,39 @@ fn folder_menu(
             SidebarAction::MoveToTiles(path.to_path_buf()),
         ));
     }
+    items
+}
+
+/// Menu entries for moving a favorite between the ungrouped list and the groups: one per
+/// group (except the one it is in), "Move to Ungrouped" when it is in a group, and always
+/// a new group at the end.
+fn group_move_items(
+    settings: &crate::settings::Settings,
+    path: &Path,
+) -> Vec<(SharedString, SidebarAction)> {
+    let current = settings.group_of(path);
+    let mut items = Vec::new();
+    for (ix, group) in settings.favorite_groups.iter().enumerate() {
+        if current == Some(ix) {
+            continue;
+        }
+        items.push((
+            t!("bookmarks.move_to_group", name = group.name.as_str())
+                .to_string()
+                .into(),
+            SidebarAction::MoveToGroup(path.to_path_buf(), ix),
+        ));
+    }
+    if current.is_some() {
+        items.push((
+            t!("bookmarks.move_to_ungrouped").to_string().into(),
+            SidebarAction::MoveToUngrouped(path.to_path_buf()),
+        ));
+    }
+    items.push((
+        t!("bookmarks.new_group").to_string().into(),
+        SidebarAction::NewGroupWith(path.to_path_buf()),
+    ));
     items
 }
 
@@ -572,6 +616,7 @@ impl Workspace {
     /// bottom edge goes in above or below it (`workspace_pindrop.rs`).
     fn pin_list_row(
         &self,
+        area: PinArea,
         ix: usize,
         path: &Path,
         row: AnyElement,
@@ -581,37 +626,43 @@ impl Workspace {
         let dragged = DraggedPin {
             path: path.to_path_buf(),
             label: display_name(path).into(),
-            icon: Icon::Folder,
+            icon: favorite_kind(path).map_or(FavIcon::Place(Icon::Folder), FavIcon::File),
             from_tile: false,
         };
-        // Over this row, or over the "Pinned" heading (first in the list).
+        // Over this row, or over the area's heading (first in the area).
         let mark = match (self.pin_shown, self.pin_mark) {
-            (Some(_), Some(m)) if m.area == PinArea::List && m.ix == ix => {
+            (Some(_), Some(m)) if m.area == area && m.ix == ix => {
                 Some(pindrop::insertion_mark(false, m.before))
             }
-            (Some(PinSlot::List(0)), None) if ix == 0 => Some(pindrop::insertion_mark(false, true)),
+            (Some(slot), None) if slot == area.slot(0) && ix == 0 => {
+                Some(pindrop::insertion_mark(false, true))
+            }
             _ => None,
         };
         let row = div()
             .id(SharedString::from(format!("pin-row-{}", path.display())))
-            .debug_selector(move || format!("pin-row-{ix}"))
+            .debug_selector(move || match area {
+                PinArea::List => format!("pin-row-{ix}"),
+                PinArea::Group(g) => format!("pin-row-g{g}-{ix}"),
+                PinArea::Tiles => format!("pin-row-t{ix}"),
+            })
             .relative()
             .rounded(theme::r_8())
             .child(row)
             .children(mark)
             .on_drag_move(
                 cx.listener(move |this, e: &DragMoveEvent<DraggedTab>, _, cx| {
-                    this.pin_hover(PinArea::List, ix, e, cx);
+                    this.pin_hover(area, ix, e, cx);
                 }),
             )
             .on_drag_move(
                 cx.listener(move |this, e: &DragMoveEvent<DraggedFiles>, _, cx| {
-                    this.pin_hover(PinArea::List, ix, e, cx);
+                    this.pin_hover(area, ix, e, cx);
                 }),
             )
             .on_drag_move(
                 cx.listener(move |this, e: &DragMoveEvent<ExternalPaths>, _, cx| {
-                    this.pin_hover(PinArea::List, ix, e, cx);
+                    this.pin_hover(area, ix, e, cx);
                 }),
             )
             .with_pin_drops(cx)
@@ -620,7 +671,7 @@ impl Workspace {
             })
             .drag_over::<DraggedPin>(|s, _, _, _| s.bg(theme::signal_wash()))
             .on_drop(cx.listener(move |this, dragged: &DraggedPin, _, cx| {
-                this.place_pin(&dragged.path, crate::settings::PinSlot::List(ix), cx);
+                this.place_pin(&dragged.path, area.slot(ix), cx);
             }));
         match crate::workspace::pin_flash(path) {
             // Just pinned here: background fades out from the accent color.
@@ -635,16 +686,233 @@ impl Workspace {
         }
     }
 
+    /// A favorite file in the list or a group: opens with its default app. No tree (a file
+    /// has no subfolders to expand) and nothing drops into it.
+    fn favorite_file_row(
+        &self,
+        path: &Path,
+        label: String,
+        kind: FileKind,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let open = path.to_path_buf();
+        let settings = &SettingsStore::global(cx).read(cx).settings;
+        let places = self.active_view().read(cx).places.clone();
+        let tiles_full = settings.tiles(&places).len() >= FAVORITES_MAX;
+        let mut menu = vec![(
+            t!("bookmarks.open").to_string().into(),
+            SidebarAction::OpenFavorite(path.to_path_buf()),
+        )];
+        if !tiles_full {
+            menu.push((
+                t!("sidebar.move_to_tiles").to_string().into(),
+                SidebarAction::MoveToTiles(path.to_path_buf()),
+            ));
+        }
+        menu.extend(group_move_items(settings, path));
+        menu.push((
+            t!("sidebar.remove_favorite").to_string().into(),
+            SidebarAction::TogglePin(path.to_path_buf()),
+        ));
+        div()
+            .id(SharedString::from(format!("fav-file-{}", path.display())))
+            .a11y_lazy(gpui::Role::TreeItem, || label.clone())
+            .debug_selector({
+                let label = label.clone();
+                move || format!("sidebar {label}")
+            })
+            .h(theme::h_row())
+            .flex()
+            .flex_none()
+            .items_center()
+            .gap(theme::s_4())
+            // Lines up with the folder rows' icons (their chevron box is s_20 wide).
+            .pl(theme::s_4() + theme::s_20() + theme::s_4())
+            .pr(theme::s_8())
+            .rounded(theme::r_8())
+            .cursor_pointer()
+            .hover(|s| s.bg(theme::wash()))
+            .child(kind_icon(kind, theme::icon()))
+            .child(div().flex_1().min_w_0().truncate().child(label))
+            .tooltip(tooltip_text(path.display().to_string()))
+            .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
+                this.open_favorite(open.clone(), window, cx);
+            }))
+            .on_mouse_down(
+                MouseButton::Right,
+                cx.listener(move |this, e: &MouseDownEvent, _, cx| {
+                    this.open_sidebar_menu(e.position, menu.clone(), cx);
+                }),
+            )
+            .into_any_element()
+    }
+
+    /// A favorite group's header: collapses the group, renames in place, and takes drops of
+    /// pins and of dragged folders and files (they go in first, like the "Favorites" heading).
+    fn favorite_group_header(
+        &self,
+        g: usize,
+        group: &crate::settings::FavoriteGroup,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let open = !group.collapsed;
+        let name = group.name.clone();
+        let renaming = self.group_rename_input(g);
+        let menu = vec![
+            (
+                t!("bookmarks.rename_group").to_string().into(),
+                SidebarAction::RenameGroup(g),
+            ),
+            (
+                t!("bookmarks.move_group_up").to_string().into(),
+                SidebarAction::MoveGroupUp(g),
+            ),
+            (
+                t!("bookmarks.move_group_down").to_string().into(),
+                SidebarAction::MoveGroupDown(g),
+            ),
+            (
+                t!("bookmarks.delete_group").to_string().into(),
+                SidebarAction::DeleteGroup(g),
+            ),
+        ];
+        div()
+            .id(SharedString::from(format!("fav-group-{g}")))
+            .a11y_lazy(gpui::Role::Button, || name.clone())
+            .aria_expanded(open)
+            .relative()
+            .h(theme::h_row())
+            .flex()
+            .flex_none()
+            .items_center()
+            .gap(theme::s_4())
+            .pl(theme::s_4())
+            .pr(theme::s_8())
+            .rounded(theme::r_8())
+            .cursor_pointer()
+            .hover(|s| s.bg(theme::wash()))
+            .child(
+                div()
+                    .size(theme::s_20())
+                    .flex()
+                    .flex_none()
+                    .items_center()
+                    .justify_center()
+                    .child(
+                        svg()
+                            .path(Icon::ChevronRight.path())
+                            .size(theme::icon_sm())
+                            .text_color(theme::text_subtle())
+                            .when(open, |s| {
+                                s.with_transformation(gpui::Transformation::rotate(
+                                    gpui::percentage(0.25),
+                                ))
+                            }),
+                    ),
+            )
+            .child(match renaming {
+                Some(input) => crate::place_names::rename_box(input),
+                None => div()
+                    .flex_1()
+                    .min_w_0()
+                    .truncate()
+                    .pl(theme::s_4())
+                    .child(name)
+                    .into_any_element(),
+            })
+            .when(!group.items.is_empty(), |d| {
+                d.child(
+                    div()
+                        .flex_none()
+                        .text_size(theme::fs_12())
+                        .text_color(theme::text_subtle())
+                        .child(arke_core::format::format_count(group.items.len())),
+                )
+            })
+            // With no row below to show it (collapsed or empty), the header shows where a
+            // dragged folder or file would go in.
+            .when(
+                self.pin_shown == Some(PinSlot::Group(g, 0))
+                    && self.pin_mark.is_none()
+                    && (group.collapsed || group.items.is_empty()),
+                |d| d.child(pindrop::insertion_mark(false, false)),
+            )
+            .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                if this.group_rename_input(g).is_none() {
+                    SettingsStore::global(cx).update(cx, |s, cx| {
+                        s.update(|st| st.toggle_group_collapsed(g), cx);
+                    });
+                }
+            }))
+            .on_mouse_down(
+                MouseButton::Right,
+                cx.listener(move |this, e: &MouseDownEvent, _, cx| {
+                    this.open_sidebar_menu(e.position, menu.clone(), cx);
+                }),
+            )
+            .on_drag_move(cx.listener(move |this, e: &DragMoveEvent<DraggedTab>, _, cx| {
+                this.pin_hover_at(PinSlot::Group(g, 0), e, cx);
+            }))
+            .on_drag_move(cx.listener(move |this, e: &DragMoveEvent<DraggedFiles>, _, cx| {
+                this.pin_hover_at(PinSlot::Group(g, 0), e, cx);
+            }))
+            .on_drag_move(cx.listener(move |this, e: &DragMoveEvent<ExternalPaths>, _, cx| {
+                this.pin_hover_at(PinSlot::Group(g, 0), e, cx);
+            }))
+            .with_pin_drops(cx)
+            .drag_over::<DraggedPin>(|s, _, _, _| s.bg(theme::signal_wash()))
+            .on_drop(cx.listener(move |this, dragged: &DraggedPin, _, cx| {
+                this.place_pin(&dragged.path, PinSlot::Group(g, 0), cx);
+            }))
+            .into_any_element()
+    }
+}
+
+/// A favorite's icon: a place/folder/drive line icon, or a file's layered kind icon.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum FavIcon {
+    Place(Icon),
+    File(FileKind),
+}
+
+/// Draws a favorite's icon at `size`.
+pub(super) fn fav_icon_el(icon: FavIcon, size: Pixels, color: gpui::Hsla) -> AnyElement {
+    match icon {
+        FavIcon::Place(icon) => crate::assets::tinted(icon, size, color),
+        FavIcon::File(kind) => kind_icon(kind, size),
+    }
+}
+
+/// Whether a favorite path is a file, guessed from its extension (no disk access in render,
+/// like the Home page's icons). A folder with a file-like name ("my.project") has an unknown
+/// extension and stays a folder; an extensionless file is the rare miss.
+pub(super) fn favorite_is_file(path: &Path) -> bool {
+    favorite_kind(path).is_some()
+}
+
+/// The file kind of a favorite path, `None` for folders (see [`favorite_is_file`]).
+pub(super) fn favorite_kind(path: &Path) -> Option<FileKind> {
+    let ext = path.extension()?.to_str()?.to_ascii_lowercase();
+    match arke_core::filetype::kind_for_extension(&ext) {
+        FileKind::Other => None,
+        kind => Some(kind),
+    }
+}
+
+impl Workspace {
     /// Favorite tiles: the user's list, or six common folders by default.
-    pub(super) fn favorites(&self, cx: &mut Context<Self>) -> Vec<(PathBuf, String, Icon)> {
+    pub(super) fn favorites(&self, cx: &mut Context<Self>) -> Vec<(PathBuf, String, FavIcon)> {
         let places = self.active_view().read(cx).places.clone();
         let icon_for = |path: &Path| {
             match places.iter().find(|p| p.path == path) {
-                Some(p) => place_icon(p.kind),
-                // Neither a known folder nor a listed drive: drive roots (e.g. an unplugged USB
-                // stick) get the drive icon, the rest a folder.
-                None if path.parent().is_none() => Icon::Drive,
-                None => Icon::Folder,
+                Some(p) => FavIcon::Place(place_icon(p.kind)),
+                // Neither a known folder nor a listed drive: a file by its extension, drive
+                // roots (e.g. an unplugged USB stick) the drive icon, the rest a folder.
+                None => match favorite_kind(path) {
+                    Some(kind) => FavIcon::File(kind),
+                    None if path.parent().is_none() => FavIcon::Place(Icon::Drive),
+                    None => FavIcon::Place(Icon::Folder),
+                },
             }
         };
         let names = SettingsStore::global(cx)
@@ -653,10 +921,13 @@ impl Workspace {
             .place_names
             .clone();
         let label_for = |path: &Path| {
-            places.iter().find(|p| p.path == path).map_or_else(
-                || display_name(path),
-                |p| crate::place_names::place_label(&names, p),
-            )
+            // A custom name (kept from the old bookmarks) wins over the default label.
+            crate::place_names::shown_name(&names, path).unwrap_or_else(|| {
+                places.iter().find(|p| p.path == path).map_or_else(
+                    || display_name(path),
+                    |p| crate::place_names::place_label(&names, p),
+                )
+            })
         };
         SettingsStore::global(cx)
             .read(cx)
@@ -678,6 +949,8 @@ impl Workspace {
     fn render_pins(&self, current: Option<&Path>, cx: &mut Context<Self>) -> Vec<AnyElement> {
         let settings = &SettingsStore::global(cx).read(cx).settings;
         let pinned = settings.pinned.clone();
+        let groups = settings.favorite_groups.clone();
+        let names = settings.place_names.clone();
         let recycle_pinned = settings.recycle_pinned;
         let favorites = self.favorites(cx);
         // Up to 6 favorites use 3 large tiles per row; more shrink to 4 per row, like Arc.
@@ -692,22 +965,62 @@ impl Workspace {
                 self.tile_drag_shell(ix, &path, tile, cx)
             })
             .collect();
+        // A favorite's label in the list: its custom name when it has one.
+        let fav_label = |path: &Path| {
+            crate::place_names::shown_name(&names, path).unwrap_or_else(|| display_name(path))
+        };
         let mut pinned_rows = Vec::new();
         for (ix, path) in pinned.iter().enumerate() {
             let row_at = pinned_rows.len();
-            self.render_tree(
-                path,
-                display_name(path),
-                None,
-                None,
-                0,
-                current,
-                &mut pinned_rows,
-                cx,
-            );
+            match favorite_kind(path) {
+                Some(kind) => {
+                    pinned_rows.push(self.favorite_file_row(path, fav_label(path), kind, cx));
+                }
+                None => self.render_tree(
+                    path,
+                    fav_label(path),
+                    None,
+                    None,
+                    0,
+                    current,
+                    &mut pinned_rows,
+                    cx,
+                ),
+            }
             // The list row itself (not its expanded children) is draggable: reorder or drop onto tiles.
             let row = pinned_rows.remove(row_at);
-            pinned_rows.insert(row_at, self.pin_list_row(ix, path, row, cx));
+            pinned_rows.insert(row_at, self.pin_list_row(PinArea::List, ix, path, row, cx));
+        }
+        // The groups, after the ungrouped list: a header each, then their items (unless collapsed).
+        let mut group_rows = Vec::new();
+        for (g, group) in groups.iter().enumerate() {
+            group_rows.push(self.favorite_group_header(g, group, cx));
+            if group.collapsed {
+                continue;
+            }
+            for (ix, path) in group.items.iter().enumerate() {
+                let row_at = group_rows.len();
+                match favorite_kind(path) {
+                    Some(kind) => {
+                        group_rows.push(self.favorite_file_row(path, fav_label(path), kind, cx));
+                    }
+                    None => self.render_tree(
+                        path,
+                        fav_label(path),
+                        None,
+                        None,
+                        0,
+                        current,
+                        &mut group_rows,
+                        cx,
+                    ),
+                }
+                let row = group_rows.remove(row_at);
+                group_rows.insert(
+                    row_at,
+                    self.pin_list_row(PinArea::Group(g), ix, path, row, cx),
+                );
+            }
         }
         // With an empty list, a dragged tile still needs somewhere to drop.
         let list_drop = (pinned.is_empty() && self.dragging_pin).then(|| {
@@ -765,11 +1078,13 @@ impl Workspace {
                 .into_any_element(),
         ];
         // The Recycle Bin is pinned by default and always sits last; it cannot be dragged.
-        if recycle_pinned {
-            pinned_rows.push(self.render_recycle_row(cx));
-        }
+        let recycle_row = recycle_pinned.then(|| self.render_recycle_row(cx));
         // No pins, no section. "Pin to sidebar" makes it appear; no placeholder text.
-        if !pinned_rows.is_empty() || list_drop.is_some() {
+        if !pinned_rows.is_empty()
+            || !group_rows.is_empty()
+            || recycle_row.is_some()
+            || list_drop.is_some()
+        {
             out.push(
                 div()
                     .id("pin-list-label")
@@ -807,6 +1122,22 @@ impl Workspace {
         out.extend(pinned_rows.into_iter().enumerate().map(|(ix, row)| {
             div()
                 .id(("pinned", ix))
+                .flex()
+                .flex_col()
+                .child(row)
+                .into_any_element()
+        }));
+        out.extend(group_rows.into_iter().enumerate().map(|(ix, row)| {
+            div()
+                .id(("fav-group-row", ix))
+                .flex()
+                .flex_col()
+                .child(row)
+                .into_any_element()
+        }));
+        out.extend(recycle_row.map(|row| {
+            div()
+                .id("pinned-recycle")
                 .flex()
                 .flex_col()
                 .child(row)
@@ -1047,11 +1378,17 @@ impl Workspace {
     ) -> Vec<(SharedString, SidebarAction)> {
         let places = self.active_view().read(cx).places.clone();
         let settings = &SettingsStore::global(cx).read(cx).settings;
-        let in_list = depth == 0 && settings.pinned.iter().any(|p| p == path);
+        let pinned = settings.is_pinned(path, &places);
+        // "Move to tiles" is for list and group entries alike.
+        let in_list = depth == 0
+            && (settings.pinned.iter().any(|p| p == path) || settings.group_of(path).is_some());
         let tiles_full = settings.tiles(&places).len() >= FAVORITES_MAX;
-        let mut items = folder_menu(path, settings.is_pinned(path, &places), in_list, tiles_full);
+        let mut items = folder_menu(path, pinned, in_list, tiles_full);
         if depth > 0 {
             return items;
+        }
+        if pinned {
+            items.extend(group_move_items(settings, path));
         }
         let net_place = settings.net_places.iter().any(|p| p == path);
         let mapped = self
@@ -1164,7 +1501,7 @@ impl Workspace {
         ix: usize,
         path: &Path,
         label: String,
-        icon: Icon,
+        icon: FavIcon,
         here: bool,
         large: bool,
         cx: &mut Context<Self>,
@@ -1172,6 +1509,7 @@ impl Workspace {
         let open = path.to_path_buf();
         let tab_path = path.to_path_buf();
         let menu_path = path.to_path_buf();
+        let is_file = matches!(icon, FavIcon::File(_));
         let workspace = cx.entity().downgrade();
         let dragged = DraggedPin {
             path: path.to_path_buf(),
@@ -1200,7 +1538,7 @@ impl Workspace {
                 d.text_color(theme::text_muted())
                     .hover(|s| s.bg(theme::wash_strong()).text_color(theme::text()))
             })
-            .child(crate::assets::tinted(
+            .child(fav_icon_el(
                 icon,
                 if large { theme::s_20() } else { crate::theme::scaled_px(18.) },
                 if here {
@@ -1210,7 +1548,9 @@ impl Workspace {
                 },
             ))
             .child(div().max_w_full().px(theme::s_4()).truncate().child(label))
-            .with_file_drop(path.to_path_buf(), cx)
+            // A file tile takes no drops into it (there is no folder to drop into); the grid
+            // still takes dragged folders and files as new favorites around it.
+            .when(!is_file, |d| d.with_file_drop(path.to_path_buf(), cx))
             // Drag to reorder (live, see `tile_drag_shell`) or onto the list below.
             .on_drag(dragged, move |dragged, _, _, cx| {
                 start_pin_drag(&workspace, dragged, cx)
@@ -1228,36 +1568,46 @@ impl Workspace {
                 this.place_pin(&dragged.path, crate::settings::PinSlot::Tile(ix), cx);
             }))
             .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
-                this.navigate_active(open.clone(), window, cx);
+                this.open_favorite(open.clone(), window, cx);
             }))
             .on_mouse_down(
                 MouseButton::Middle,
                 cx.listener(move |this, _: &MouseDownEvent, window, cx| {
-                    this.open_in_background(tab_path.clone(), window, cx);
+                    if favorite_is_file(&tab_path) {
+                        this.open_favorite(tab_path.clone(), window, cx);
+                    } else {
+                        this.open_in_background(tab_path.clone(), window, cx);
+                    }
                 }),
             )
             .on_mouse_down(
                 MouseButton::Right,
                 cx.listener(move |this, e: &MouseDownEvent, _, cx| {
                     let p = menu_path.clone();
-                    this.open_sidebar_menu(
-                        e.position,
-                        vec![
+                    let settings = &SettingsStore::global(cx).read(cx).settings;
+                    let mut items = vec![
+                        if favorite_is_file(&p) {
+                            (
+                                t!("bookmarks.open").to_string().into(),
+                                SidebarAction::OpenFavorite(p.clone()),
+                            )
+                        } else {
                             (
                                 t!("sidebar.open_in_new_tab").to_string().into(),
                                 SidebarAction::OpenInNewTab(p.clone()),
-                            ),
-                            (
-                                t!("sidebar.move_to_list").to_string().into(),
-                                SidebarAction::MoveToList(p.clone()),
-                            ),
-                            (
-                                t!("sidebar.remove_favorite").to_string().into(),
-                                SidebarAction::TogglePin(p),
-                            ),
-                        ],
-                        cx,
-                    );
+                            )
+                        },
+                        (
+                            t!("sidebar.move_to_list").to_string().into(),
+                            SidebarAction::MoveToList(p.clone()),
+                        ),
+                    ];
+                    items.extend(group_move_items(settings, &p));
+                    items.push((
+                        t!("sidebar.remove_favorite").to_string().into(),
+                        SidebarAction::TogglePin(p),
+                    ));
+                    this.open_sidebar_menu(e.position, items, cx);
                 }),
             )
             .tooltip(tooltip_text(
@@ -1702,6 +2052,51 @@ impl Workspace {
                         },
                         cx,
                     );
+                });
+            }
+            SidebarAction::OpenFavorite(path) => self.open_favorite(path, window, cx),
+            SidebarAction::MoveToGroup(path, ix) => {
+                let places = self.active_view().read(cx).places.clone();
+                SettingsStore::global(cx).update(cx, |s, cx| {
+                    s.update(|st| st.move_to_group(&path, ix, &places), cx);
+                });
+            }
+            SidebarAction::MoveToUngrouped(path) => {
+                SettingsStore::global(cx).update(cx, |s, cx| {
+                    s.update(|st| st.move_to_ungrouped(&path), cx);
+                });
+            }
+            SidebarAction::NewGroupWith(path) => {
+                let places = self.active_view().read(cx).places.clone();
+                let mut ix = None;
+                SettingsStore::global(cx).update(cx, |s, cx| {
+                    s.update(
+                        |st| {
+                            let at = st.add_group(t!("bookmarks.new_group").into_owned());
+                            st.move_to_group(&path, at, &places);
+                            ix = Some(at);
+                        },
+                        cx,
+                    );
+                });
+                if let Some(ix) = ix {
+                    self.start_group_rename(ix, window, cx);
+                }
+            }
+            SidebarAction::RenameGroup(ix) => self.start_group_rename(ix, window, cx),
+            SidebarAction::DeleteGroup(ix) => {
+                SettingsStore::global(cx).update(cx, |s, cx| {
+                    s.update(|st| st.delete_group(ix), cx);
+                });
+            }
+            SidebarAction::MoveGroupUp(ix) => {
+                SettingsStore::global(cx).update(cx, |s, cx| {
+                    s.update(|st| st.move_group(ix, true), cx);
+                });
+            }
+            SidebarAction::MoveGroupDown(ix) => {
+                SettingsStore::global(cx).update(cx, |s, cx| {
+                    s.update(|st| st.move_group(ix, false), cx);
                 });
             }
             SidebarAction::HistoryJump {

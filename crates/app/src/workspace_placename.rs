@@ -19,6 +19,13 @@ pub(super) struct PlaceRename {
     _subscriptions: [Subscription; 2],
 }
 
+/// The favorite group being renamed and the box it is typed in.
+pub(super) struct GroupRename {
+    pub(super) ix: usize,
+    pub(super) input: Entity<TextInput>,
+    _subscriptions: [Subscription; 2],
+}
+
 impl Workspace {
     /// Starts renaming `path` if it is a place that can be (mapped drive, network place, saved
     /// remote location); anything else is left alone.
@@ -114,5 +121,78 @@ impl Workspace {
     #[cfg(test)]
     pub(crate) fn place_rename_for_test(&self, path: &Path) -> Option<Entity<TextInput>> {
         self.place_rename_input(path)
+    }
+
+    /// Starts renaming favorite group `ix` in its sidebar header.
+    pub(super) fn start_group_rename(
+        &mut self,
+        ix: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let settings = &SettingsStore::global(cx).read(cx).settings;
+        let Some(group) = settings.favorite_groups.get(ix) else {
+            return;
+        };
+        let text = group.name.clone();
+        let input = cx.new(|cx| {
+            let mut input = TextInput::new("", cx);
+            input.set_text(text, cx);
+            input.select_all_text(cx);
+            input
+        });
+        let focus = input.read(cx).focus_handle(cx);
+        let subscriptions =
+            [
+                cx.subscribe_in(&input, window, |this, _, event: &InputEvent, window, cx| {
+                    match event {
+                        InputEvent::Confirm => this.commit_group_rename(window, cx),
+                        InputEvent::Cancel => this.cancel_group_rename(window, cx),
+                        InputEvent::Changed => {}
+                    }
+                }),
+                // Clicking elsewhere keeps what was typed, like renaming a file.
+                cx.on_blur(&focus, window, |this, window, cx| {
+                    this.commit_group_rename(window, cx);
+                }),
+            ];
+        self.sidebar_ui.group_rename = Some(GroupRename {
+            ix,
+            input,
+            _subscriptions: subscriptions,
+        });
+        window.focus(&focus, cx);
+        cx.notify();
+    }
+
+    fn commit_group_rename(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(rename) = self.sidebar_ui.group_rename.take() else {
+            return;
+        };
+        let typed = rename.input.read(cx).committed_text();
+        let typed = typed.trim();
+        if !typed.is_empty() {
+            SettingsStore::global(cx).update(cx, |s, cx| {
+                s.update(|st| st.rename_group(rename.ix, typed.to_owned()), cx);
+            });
+        }
+        self.focus_active(window, cx);
+        cx.notify();
+    }
+
+    fn cancel_group_rename(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.sidebar_ui.group_rename.take().is_some() {
+            self.focus_active(window, cx);
+            cx.notify();
+        }
+    }
+
+    /// The input of the group rename in progress, if it is for group `ix`.
+    pub(super) fn group_rename_input(&self, ix: usize) -> Option<Entity<TextInput>> {
+        self.sidebar_ui
+            .group_rename
+            .as_ref()
+            .filter(|r| r.ix == ix)
+            .map(|r| r.input.clone())
     }
 }

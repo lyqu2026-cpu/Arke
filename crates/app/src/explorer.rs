@@ -3225,7 +3225,7 @@ impl Explorer {
     /// Opens with the default app, in this view's sort order (Photos steps through the folder in
     /// it). ShellExecuteExW loads third-party shell extensions, so it runs on a dedicated STA
     /// thread. Shortcuts (`.lnk`) to folders open in Arke instead of Explorer.
-    fn open_file(&self, path: PathBuf, cx: &mut App) {
+    pub(crate) fn open_file(&self, path: PathBuf, cx: &mut App) {
         // Opened files rank first among same-name results in "This PC" search.
         crate::search_history::SearchHistory::record(&path, false, cx);
         let shell = Arc::clone(&self.services.shell);

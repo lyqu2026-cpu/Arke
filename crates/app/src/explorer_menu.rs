@@ -1128,6 +1128,10 @@ impl Explorer {
             }
             entries.push(item(t!("menu.open_terminal"), None, C::OpenTerminal));
         }
+        if single && !*is_dir {
+            entries.push(MenuEntry::Separator);
+            entries.push(item(pin_label(pinned), None, C::TogglePin));
+        }
         let name = path
             .file_name()
             .map_or_default(|n| n.to_string_lossy().into_owned());
@@ -1675,8 +1679,7 @@ impl Explorer {
             }
             C::TogglePin => {
                 let path = match targets.first() {
-                    Some((path, true)) => Some(path.clone()),
-                    Some(_) => None,
+                    Some((path, _)) => Some(path.clone()),
                     None => self.current_path().map(PathBuf::from),
                 };
                 if let Some(path) = path {

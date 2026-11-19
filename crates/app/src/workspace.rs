@@ -1769,6 +1769,17 @@ impl Workspace {
         cx.stop_propagation();
     }
 
+    /// Opens a favorite from the sidebar or the rail: a file with its default app (through
+    /// the active view, for its sort order), a folder by navigating there.
+    fn open_favorite(&mut self, path: PathBuf, window: &mut Window, cx: &mut Context<Self>) {
+        if sidebar::favorite_is_file(&path) {
+            let view = self.active_view().clone();
+            view.update(cx, |e, cx| e.open_file(path, cx));
+        } else {
+            self.navigate_active(path, window, cx);
+        }
+    }
+
     fn navigate_active(&mut self, path: PathBuf, window: &mut Window, cx: &mut Context<Self>) {
         // A pinned tab keeps what it shows, a page over it included: another folder opens beside it.
         if self.active_pinned_elsewhere(&path, cx) {
