@@ -99,8 +99,20 @@ pub fn route_argument(arg: &str) -> Route {
         arg
     };
     if parsing.starts_with("::") {
-        return classify(parsing, ShellAttrs::default())
-            .map_or_else(|| Route::Explorer(format!("shell:{parsing}")), Route::Arke);
+        return classify(parsing, ShellAttrs::default()).map_or_else(
+            || {
+                // A bare namespace root goes as `shell:::{CLSID}`; a name below one (a phone
+                // under This PC, a Control Panel page) goes as the raw parsing name, which
+                // `explorer.exe` resolves itself: the `shell:` form doesn't resolve device
+                // paths, and Explorer silently falls back to its default folder instead.
+                if parsing.trim_end_matches('\\').contains('\\') {
+                    Route::Explorer(parsing.to_owned())
+                } else {
+                    Route::Explorer(format!("shell:{parsing}"))
+                }
+            },
+            Route::Arke,
+        );
     }
     let bytes = parsing.as_bytes();
     let absolute = (bytes.len() >= 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':')
@@ -438,6 +450,11 @@ mod tests {
             route_argument(r"C:\Temp\a.zip\inner"),
             explorer(r"C:\Temp\a.zip\inner")
         );
+        // A phone under This PC (MTP): the raw parsing name, no `shell:` prefix (Explorer
+        // can't resolve the `shell:` form of a device path and opens its default folder).
+        let phone = r"::{20D04FE0-3AEA-1069-A2D8-08002B30309D}\\\?\usb#vid_04e8&pid_6860#r58m#{6ac27878-a6fa-4155-ba85-f98f491d4f33}";
+        assert_eq!(route_argument(phone), explorer(phone));
+        assert_eq!(route_argument(&format!("shell:{phone}")), explorer(phone));
     }
 
     #[test]
