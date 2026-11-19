@@ -1003,9 +1003,9 @@ pub(crate) fn channel_changed(channel: Channel, cx: &mut App) {
     }
 }
 
-/// Automatic check after startup: when enabled and more than 20 hours since the last check (nightly
-/// ships daily).
 // Fork: automatic update check disabled (manual check in Settings still works).
+// /// Automatic check after startup: when enabled and more than 20 hours since the last check
+// /// (nightly ships daily).
 // pub(crate) fn auto_check(cx: &mut App) {
 //     let settings = crate::settings::SettingsStore::global(cx)
 //         .read(cx)
