@@ -360,6 +360,58 @@ fn group_move_items(
     items
 }
 
+/// A tile's right-click menu: open, move to the list, the group moves, remove.
+fn tile_menu(
+    settings: &crate::settings::Settings,
+    path: &Path,
+) -> Vec<(SharedString, SidebarAction)> {
+    let mut items = vec![
+        if favorite_is_file(path) {
+            (
+                t!("bookmarks.open").to_string().into(),
+                SidebarAction::OpenFavorite(path.to_path_buf()),
+            )
+        } else {
+            (
+                t!("sidebar.open_in_new_tab").to_string().into(),
+                SidebarAction::OpenInNewTab(path.to_path_buf()),
+            )
+        },
+        (
+            t!("sidebar.move_to_list").to_string().into(),
+            SidebarAction::MoveToList(path.to_path_buf()),
+        ),
+    ];
+    items.extend(group_move_items(settings, path));
+    items.push((
+        t!("sidebar.remove_favorite").to_string().into(),
+        SidebarAction::TogglePin(path.to_path_buf()),
+    ));
+    items
+}
+
+/// A favorite group's header menu.
+fn favorite_group_menu(g: usize) -> Vec<(SharedString, SidebarAction)> {
+    vec![
+        (
+            t!("bookmarks.rename_group").to_string().into(),
+            SidebarAction::RenameGroup(g),
+        ),
+        (
+            t!("bookmarks.move_group_up").to_string().into(),
+            SidebarAction::MoveGroupUp(g),
+        ),
+        (
+            t!("bookmarks.move_group_down").to_string().into(),
+            SidebarAction::MoveGroupDown(g),
+        ),
+        (
+            t!("bookmarks.delete_group").to_string().into(),
+            SidebarAction::DeleteGroup(g),
+        ),
+    ]
+}
+
 /// Toggles tabs between the sidebar and the top. `horizontal` is the current layout.
 pub(super) fn tab_layout_button(
     horizontal: bool,
@@ -758,24 +810,7 @@ impl Workspace {
         let open = !group.collapsed;
         let name = group.name.clone();
         let renaming = self.group_rename_input(g);
-        let menu = vec![
-            (
-                t!("bookmarks.rename_group").to_string().into(),
-                SidebarAction::RenameGroup(g),
-            ),
-            (
-                t!("bookmarks.move_group_up").to_string().into(),
-                SidebarAction::MoveGroupUp(g),
-            ),
-            (
-                t!("bookmarks.move_group_down").to_string().into(),
-                SidebarAction::MoveGroupDown(g),
-            ),
-            (
-                t!("bookmarks.delete_group").to_string().into(),
-                SidebarAction::DeleteGroup(g),
-            ),
-        ];
+        let menu = favorite_group_menu(g);
         div()
             .id(SharedString::from(format!("fav-group-{g}")))
             .a11y_lazy(gpui::Role::Button, || name.clone())
@@ -1585,28 +1620,7 @@ impl Workspace {
                 cx.listener(move |this, e: &MouseDownEvent, _, cx| {
                     let p = menu_path.clone();
                     let settings = &SettingsStore::global(cx).read(cx).settings;
-                    let mut items = vec![
-                        if favorite_is_file(&p) {
-                            (
-                                t!("bookmarks.open").to_string().into(),
-                                SidebarAction::OpenFavorite(p.clone()),
-                            )
-                        } else {
-                            (
-                                t!("sidebar.open_in_new_tab").to_string().into(),
-                                SidebarAction::OpenInNewTab(p.clone()),
-                            )
-                        },
-                        (
-                            t!("sidebar.move_to_list").to_string().into(),
-                            SidebarAction::MoveToList(p.clone()),
-                        ),
-                    ];
-                    items.extend(group_move_items(settings, &p));
-                    items.push((
-                        t!("sidebar.remove_favorite").to_string().into(),
-                        SidebarAction::TogglePin(p),
-                    ));
+                    let items = tile_menu(settings, &p);
                     this.open_sidebar_menu(e.position, items, cx);
                 }),
             )

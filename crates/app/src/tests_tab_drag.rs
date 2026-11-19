@@ -492,21 +492,28 @@ fn folders_and_tabs_dragged_onto_the_favorites_are_added_where_the_mark_shows(
     );
     assert_eq!(favorites(cx).map(|f| f.len()), Some(4));
 
-    // A file gets no mark and no slot; dropped beside the tiles it does nothing.
+    // A file gets the mark and the slot too; dropped at the edge it becomes a favorite there.
     start_row_drag(cx, &view, 2);
     let edge = left_edge(cx, "tile-slot-1");
     move_to(cx, edge);
+    move_to(cx, edge + point(px(1.), px(0.)));
     assert!(
-        cx.debug_bounds("pin-insertion-mark").is_none(),
-        "files are not added"
+        cx.debug_bounds("pin-insertion-mark").is_some(),
+        "files are added too"
     );
-    assert!(cx.debug_bounds("tile-add-favorite").is_none());
-    let grid = cx.debug_bounds("pin-tiles").unwrap();
-    let last = cx.debug_bounds("tile-slot-3").unwrap();
-    let beside = point(grid.right() - px(4.), last.center().y);
-    release_at(cx, beside, Modifiers::none());
-    assert_eq!(shell.ops().len(), 1, "the file stayed");
-    assert_eq!(favorites(cx).map(|f| f.len()), Some(4));
+    assert!(cx.debug_bounds("tile-add-favorite").is_some());
+    release_at(cx, edge + point(px(1.), px(0.)), Modifiers::none());
+    assert_eq!(
+        favorites(cx),
+        Some(vec![
+            p(r"C:\a"),
+            p(r"C:\f\x.txt"),
+            p(r"C:\f\one"),
+            p(r"C:\b"),
+            p(r"C:\c")
+        ])
+    );
+    assert_eq!(shell.ops().len(), 1, "the file was not moved anywhere");
 
     // A tab (on C:\t) onto the right half of the first tile: after it.
     let at = ws.update(cx, |ws, _| ws.tab_views().count());
@@ -525,6 +532,7 @@ fn folders_and_tabs_dragged_onto_the_favorites_are_added_where_the_mark_shows(
         Some(vec![
             p(r"C:\a"),
             p(r"C:\t"),
+            p(r"C:\f\x.txt"),
             p(r"C:\f\one"),
             p(r"C:\b"),
             p(r"C:\c")
@@ -537,8 +545,8 @@ fn folders_and_tabs_dragged_onto_the_favorites_are_added_where_the_mark_shows(
     );
 }
 
-/// Paths from Explorer dropped on the "Add to favorites" slot: the folders among them are added,
-/// once checked in the background; files are not.
+/// Paths from Explorer dropped on the "Add to favorites" slot: the folders and files among them
+/// are added, once checked in the background.
 #[gpui::test]
 fn folders_from_explorer_dropped_on_the_favorites_are_added(cx: &mut TestAppContext) {
     let fs = FakeFs::new();
@@ -551,7 +559,7 @@ fn folders_from_explorer_dropped_on_the_favorites_are_added(cx: &mut TestAppCont
     wait_until(cx, &view, "f", loaded(r"C:\f"));
     with_settings(cx, |s| s.favorites = Some(vec![p(r"C:\a")]));
 
-    // From Explorer: a folder and a file onto the "Add to favorites" slot; only the folder is added.
+    // From Explorer: a folder and a file onto the "Add to favorites" slot; both are added.
     let grid = cx.debug_bounds("pin-tiles").unwrap();
     let paths = ExternalPaths(vec![p(r"C:\f\two"), p(r"C:\f\x.txt")].into());
     cx.simulate_event(FileDropEvent::Entered {
@@ -573,16 +581,18 @@ fn folders_from_explorer_dropped_on_the_favorites_are_added(cx: &mut TestAppCont
         position: slot + point(px(1.), px(0.)),
     });
     let deadline = Instant::now() + Duration::from_secs(20);
-    while favorites(cx).map_or(0, |f| f.len()) < 2 {
-        assert!(Instant::now() < deadline, "the folder should be added");
+    while favorites(cx).map_or(0, |f| f.len()) < 3 {
+        assert!(
+            Instant::now() < deadline,
+            "the folder and file should be added"
+        );
         cx.run_until_parked();
         std::thread::sleep(Duration::from_millis(5));
     }
     assert_eq!(
-        favorites(cx).and_then(|f| f.last().cloned()),
-        Some(p(r"C:\f\two"))
+        favorites(cx),
+        Some(vec![p(r"C:\a"), p(r"C:\f\two"), p(r"C:\f\x.txt")])
     );
-    assert_eq!(favorites(cx).map(|f| f.len()), Some(2), "not the file");
 }
 
 /// A folder dragged onto the "Pinned" heading goes first in the list; onto the lower edge of a

@@ -663,6 +663,10 @@ pub(crate) struct Settings {
 }
 
 impl Default for Settings {
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one line per setting; the list only grows"
+    )]
     fn default() -> Self {
         Self {
             pinned: Vec::new(),
@@ -1484,13 +1488,14 @@ impl Settings {
         if self.bookmarks_migrated {
             return;
         }
-        self.bookmarks_migrated = true;
         let Some(dir) = settings_path.parent() else {
             return;
         };
         let Ok(bytes) = std::fs::read(dir.join("bookmarks.json")) else {
             return;
         };
+        // The file is there: import it once, whatever it holds.
+        self.bookmarks_migrated = true;
         let Ok(value) = serde_json::from_slice::<serde_json::Value>(&bytes) else {
             return;
         };
