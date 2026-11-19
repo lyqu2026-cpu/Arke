@@ -530,3 +530,302 @@ fn quick_look_previews_office_files(cx: &mut TestAppContext) {
         )
     });
 }
+
+/// Turns the preview pane on (through settings, like the toolbar button) in a window wide enough
+/// for it.
+fn show_preview_pane(cx: &mut VisualTestContext) {
+    cx.simulate_resize(gpui::size(gpui::px(1500.), gpui::px(800.)));
+    cx.update(|_, cx| {
+        crate::settings::SettingsStore::global(cx)
+            .update(cx, |s, cx| s.update(|st| st.preview_pane = true, cx));
+    });
+    cx.run_until_parked();
+}
+
+/// The preview pane scrolls through every page of a PDF, not just the first: pages render as
+/// they come near the view, at the pane's width, and the ones scrolled away are freed.
+#[gpui::test]
+fn the_pane_scrolls_through_every_pdf_page(cx: &mut TestAppContext) {
+    use gpui::{ScrollDelta, ScrollEvent, point, px};
+    let fs = FakeFs::new();
+    fs.insert_dir(r"C:\p", vec![file("a.pdf", 100)]);
+    let shell = Arc::new(FakeShell::default());
+    let (view, cx) = setup(cx, fs, Arc::clone(&shell), r"C:\p");
+    wait_until(cx, &view, "load", loaded(r"C:\p"));
+    show_preview_pane(cx);
+    cx.simulate_keystrokes("down");
+    wait_page(cx, &view, 0);
+    // The first page and the one after it, for the slot the pane draws them in.
+    wait_until(cx, &view, "first pages", |v| {
+        v.pane_pdf_pages_for_test()
+            .is_some_and(|p| p.contains(&0) && p.contains(&1))
+    });
+    let pane_w = shell.pdf_renders.lock()[0].2.0;
+    let list = cx
+        .debug_bounds("pane-pdf-pages")
+        .expect("the page list is drawn");
+    let wheel = |cx: &mut VisualTestContext, dy: f32| {
+        cx.simulate_event(ScrollEvent {
+            position: list.center(),
+            delta: ScrollDelta::Pixels(point(px(0.), px(dy))),
+            ..ScrollEvent::default()
+        });
+        cx.run_until_parked();
+    };
+
+    // Down to the end: the last page renders, the first ones are freed.
+    wheel(cx, -5000.);
+    wait_until(cx, &view, "last page", |v| {
+        v.pane_pdf_pages_for_test()
+            .is_some_and(|p| p.contains(&4) && p.iter().all(|&page| page >= 2))
+    });
+    assert!(cx.debug_bounds("pane-pdf-page-5").is_some());
+    assert!(cx.debug_bounds("pane-pdf-page-1").is_none());
+    let renders = shell.pdf_renders.lock().clone();
+    assert!(
+        renders.iter().any(|(path, page, (w, _))| {
+            path == Path::new(r"C:\p\a.pdf") && *page == 4 && *w == pane_w
+        }),
+        "{renders:?}"
+    );
+    // Quick Look's page stays where it was.
+    assert_eq!(view.update(cx, |v, _| pdf_page(v)), Some((0, 5)));
+
+    // Back to the top: the first page again, the last ones freed.
+    wheel(cx, 5000.);
+    wait_until(cx, &view, "first page again", |v| {
+        v.pane_pdf_pages_for_test()
+            .is_some_and(|p| p.contains(&0) && p.iter().all(|&page| page <= 2))
+    });
+    assert!(cx.debug_bounds("pane-pdf-page-1").is_some());
+}
+
+/// A presentation in the preview pane lists every slide: the embedded thumbnail as the first, the
+/// others as their text.
+#[gpui::test]
+fn the_pane_lists_every_slide(cx: &mut TestAppContext) {
+    use arke_core::office::fixtures;
+    let thumb = png_bytes(32, 18);
+    let decks = [
+        (
+            "a.pptx",
+            fixtures::pptx(
+                &[("One", &["a"]), ("Two", &["b"]), ("Three", &["c"])],
+                Some(&thumb),
+            ),
+        ),
+        (
+            "b.pptx",
+            fixtures::pptx(&[("Uno", &[]), ("Dos", &["x"])], None),
+        ),
+    ];
+    let fs = FakeFs::new();
+    fs.insert_dir(
+        r"C:\o",
+        decks
+            .iter()
+            .map(|(name, bytes)| file(name, bytes.len() as u64))
+            .collect(),
+    );
+    for (name, bytes) in decks {
+        fs.set_content(Path::new(r"C:\o").join(name), bytes);
+    }
+    let (view, cx) = setup(cx, fs, Arc::new(FakeShell::default()), r"C:\o");
+    wait_until(cx, &view, "load", loaded(r"C:\o"));
+    show_preview_pane(cx);
+    cx.simulate_keystrokes("down");
+    wait_until(cx, &view, "slides", |v| slide(v) == Some((0, 3)));
+    cx.run_until_parked();
+    for selector in ["pane-slide-1", "pane-slide-2", "pane-slide-3"] {
+        assert!(cx.debug_bounds(selector).is_some(), "{selector} is drawn");
+    }
+    // The thumbnail stands for the first slide; the second is a card under it.
+    let first = cx.debug_bounds("pane-slide-1").expect("drawn");
+    let second = cx.debug_bounds("pane-slide-2").expect("drawn");
+    assert!(second.top() >= first.bottom());
+    assert!(view.update(cx, |v, _| matches!(
+        v.preview.as_ref().map(|p| &p.body),
+        Some(PreviewBody::Slides(s)) if s.has_thumb()
+    )));
+
+    // Without a thumbnail every slide is a card.
+    cx.simulate_keystrokes("down");
+    wait_until(cx, &view, "second deck", |v| slide(v) == Some((0, 2)));
+    cx.run_until_parked();
+    assert!(cx.debug_bounds("pane-slide-2").is_some());
+    assert!(cx.debug_bounds("pane-slide-3").is_none());
+}
+
+/// The pane's scroll position (x, y) and how far it can scroll (x, y).
+fn pane_scroll(cx: &mut VisualTestContext, view: &Entity<Explorer>) -> ((f32, f32), (f32, f32)) {
+    view.update(cx, |v, _| {
+        let (at, max) = v.preview_scroll_for_test();
+        (
+            (at.x.as_f32(), at.y.as_f32()),
+            (max.x.as_f32(), max.y.as_f32()),
+        )
+    })
+}
+
+/// A sheet of `rows` rows and `cols` numeric columns, as `<sheetData>` content.
+fn wide_sheet(rows: u32, cols: u32) -> String {
+    use std::fmt::Write as _;
+    let mut data = String::new();
+    for r in 1..=rows {
+        let _ = write!(data, r#"<row r="{r}">"#);
+        for c in 0..cols {
+            let name = arke_core::office::column_name(c);
+            let _ = write!(data, r#"<c r="{name}{r}"><v>{}</v></c>"#, r * 1000 + c);
+        }
+        data.push_str("</row>");
+    }
+    data
+}
+
+/// Shift+wheel (what Windows sends as a horizontal wheel) over `at`.
+fn shift_wheel(cx: &mut VisualTestContext, at: gpui::Point<gpui::Pixels>, dx: f32) {
+    use gpui::{Modifiers, ScrollDelta, ScrollEvent, point, px};
+    cx.simulate_event(ScrollEvent {
+        position: at,
+        delta: ScrollDelta::Pixels(point(px(dx), px(0.))),
+        modifiers: Modifiers::shift(),
+        ..ScrollEvent::default()
+    });
+    cx.run_until_parked();
+}
+
+fn plain_wheel(cx: &mut VisualTestContext, at: gpui::Point<gpui::Pixels>, dy: f32) {
+    use gpui::{ScrollDelta, ScrollEvent, point, px};
+    cx.simulate_event(ScrollEvent {
+        position: at,
+        delta: ScrollDelta::Pixels(point(px(0.), px(dy))),
+        ..ScrollEvent::default()
+    });
+    cx.run_until_parked();
+}
+
+/// A spreadsheet wider than the pane scrolls sideways with Shift+wheel and a sideways swipe,
+/// the plain wheel still scrolls it up and down, and its bottom scrollbar can be dragged.
+#[gpui::test]
+fn a_wide_spreadsheet_scrolls_sideways_in_the_pane(cx: &mut TestAppContext) {
+    use gpui::{Modifiers, MouseButton, ScrollDelta, ScrollEvent, point, px};
+    let fs = FakeFs::new();
+    let book = arke_core::office::fixtures::xlsx(&[("Data", &wide_sheet(80, 30))], &[], "");
+    fs.insert_dir(r"C:\w", vec![file("wide.xlsx", book.len() as u64)]);
+    fs.set_content(Path::new(r"C:\w\wide.xlsx"), book);
+    let (view, cx) = setup(cx, fs, Arc::new(FakeShell::default()), r"C:\w");
+    wait_until(cx, &view, "load", loaded(r"C:\w"));
+    show_preview_pane(cx);
+    cx.simulate_keystrokes("down");
+    wait_until(cx, &view, "sheet", |v| {
+        matches!(
+            v.preview.as_ref().map(|p| &p.body),
+            Some(PreviewBody::Workbook(_))
+        )
+    });
+    cx.run_until_parked();
+    let sheet = cx.debug_bounds("preview-sheet").expect("the grid is drawn");
+    let at = sheet.center();
+    let (start, max) = pane_scroll(cx, &view);
+    assert_eq!(start, (0., 0.));
+    assert!(
+        max.0 > 0. && max.1 > 0.,
+        "wider and taller than the pane: {max:?}"
+    );
+
+    // The plain wheel goes down, not sideways.
+    plain_wheel(cx, at, -100.);
+    let (now, _) = pane_scroll(cx, &view);
+    assert!(now.1 < 0. && now.0 == 0., "{now:?}");
+    // Shift+wheel goes along, not down.
+    let down = now.1;
+    shift_wheel(cx, at, -100.);
+    let (now, _) = pane_scroll(cx, &view);
+    assert!(now.0 < 0. && (now.1 - down).abs() < 0.5, "{now:?}");
+    // A touchpad's sideways swipe (no modifier) does the same, and swiping back returns.
+    let along = now.0;
+    cx.simulate_event(ScrollEvent {
+        position: at,
+        delta: ScrollDelta::Pixels(point(px(-60.), px(0.))),
+        ..ScrollEvent::default()
+    });
+    cx.run_until_parked();
+    let (now, _) = pane_scroll(cx, &view);
+    assert!(now.0 < along && (now.1 - down).abs() < 0.5, "{now:?}");
+    shift_wheel(cx, at, 5000.);
+    assert_eq!(pane_scroll(cx, &view).0.0, 0.);
+
+    // Dragging the thumb of the bottom bar moves the columns.
+    let grab = point(sheet.left() + px(20.), sheet.bottom() - px(4.));
+    cx.simulate_mouse_down(grab, MouseButton::Left, Modifiers::none());
+    cx.simulate_mouse_move(
+        grab + point(px(60.), px(0.)),
+        MouseButton::Left,
+        Modifiers::none(),
+    );
+    cx.simulate_mouse_up(
+        grab + point(px(60.), px(0.)),
+        MouseButton::Left,
+        Modifiers::none(),
+    );
+    cx.run_until_parked();
+    let (now, _) = pane_scroll(cx, &view);
+    assert!(
+        now.0 < -50.,
+        "the thumb dragged right scrolls the columns: {now:?}"
+    );
+}
+
+/// CSV and TSV keep each row on one line and scroll sideways; other text still wraps.
+#[gpui::test]
+fn a_wide_csv_scrolls_sideways_while_code_still_wraps(cx: &mut TestAppContext) {
+    let fs = FakeFs::new();
+    let row = (0..60)
+        .map(|c| format!("column_{c}"))
+        .collect::<Vec<_>>()
+        .join(",");
+    let body = vec![row; 100].join("\n");
+    fs.insert_dir(
+        r"C:\c",
+        vec![
+            file("a.csv", body.len() as u64),
+            file("b.txt", body.len() as u64),
+        ],
+    );
+    fs.set_content(Path::new(r"C:\c\a.csv"), body.clone().into_bytes());
+    fs.set_content(Path::new(r"C:\c\b.txt"), body.into_bytes());
+    let (view, cx) = setup(cx, fs, Arc::new(FakeShell::default()), r"C:\c");
+    wait_until(cx, &view, "load", loaded(r"C:\c"));
+    show_preview_pane(cx);
+    cx.simulate_keystrokes("down");
+    wait_until(cx, &view, "csv", |v| {
+        v.preview.as_ref().is_some_and(|p| {
+            p.entry.name.as_ref() == "a.csv" && matches!(p.body, PreviewBody::Text { .. })
+        })
+    });
+    cx.run_until_parked();
+    let at = cx
+        .debug_bounds("preview-text")
+        .expect("text is drawn")
+        .center();
+    let (_, max) = pane_scroll(cx, &view);
+    assert!(max.0 > 0. && max.1 > 0., "{max:?}");
+    plain_wheel(cx, at, -100.);
+    let (now, _) = pane_scroll(cx, &view);
+    assert!(now.1 < 0. && now.0 == 0., "{now:?}");
+    shift_wheel(cx, at, -100.);
+    let (now, _) = pane_scroll(cx, &view);
+    assert!(now.0 < 0., "{now:?}");
+
+    // The same lines in a .txt wrap: nothing to scroll sideways.
+    cx.simulate_keystrokes("down");
+    wait_until(cx, &view, "txt", |v| {
+        v.preview.as_ref().is_some_and(|p| {
+            p.entry.name.as_ref() == "b.txt" && matches!(p.body, PreviewBody::Text { .. })
+        })
+    });
+    cx.run_until_parked();
+    let (_, max) = pane_scroll(cx, &view);
+    assert_eq!(max.0, 0., "{max:?}");
+    assert!(max.1 > 0.);
+}

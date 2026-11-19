@@ -2,7 +2,8 @@
 //! for an icon, whether a thumbnail is possible.
 //!
 //! Third-party shell extensions are never loaded. Icons come from the built-in theme
-//! (extension only); only `.exe`, `.lnk` and `.ico`, whose icon is their content, ask the system.
+//! (extension only); only `.exe`, `.lnk` and `.ico`, whose icon is their content, ask the system
+//! about the file, and types the theme doesn't know ask it about the type ([`wants_type_icon`]).
 
 use crate::entry::{Entry, EntryKind};
 
@@ -94,9 +95,36 @@ pub fn wants_system_icon(entry: &Entry) -> bool {
         && matches!(entry.extension(), "exe" | "lnk" | "ico")
 }
 
+/// Files of a type the theme has no icon for (CAD drawings, project files, anything not in
+/// [`kind_for_extension`]) get the icon Windows has for the type, from the program registered
+/// for it, as in File Explorer. Looked up by extension only, so it reads nothing (cloud
+/// placeholders and network files included).
+pub fn wants_type_icon(entry: &Entry) -> bool {
+    entry.kind == EntryKind::File
+        && !entry.extension().is_empty()
+        && !wants_system_icon(entry)
+        && kind_for_extension(entry.extension()) == FileKind::Other
+}
+
+/// Whether a type's registered `DefaultIcon` is the file itself (`%1`, possibly quoted): every
+/// file has its own icon, so the one Windows gives for the extension alone is the blank document
+/// and the icon has to be asked for per file, as for `.ico`.
+pub fn default_icon_is_the_file(default_icon: &str) -> bool {
+    default_icon.trim().trim_matches('"') == "%1"
+}
+
 /// Size limit for thumbnail sources. Larger images take too long and too much memory to
 /// decode, so they get the type icon.
 pub const MAX_THUMBNAIL_SOURCE: u64 = 64 * 1024 * 1024;
+
+/// Videos get Windows' thumbnail (a frame), asked for in a separate process. Not cloud
+/// placeholders: making one reads the file, which would download it.
+pub fn can_video_thumbnail(entry: &Entry) -> bool {
+    entry.kind == EntryKind::File
+        && !entry.is_cloud_placeholder()
+        && entry.size > 0
+        && kind_for_extension(entry.extension()) == FileKind::Video
+}
 
 /// Formats we can decode in Rust for thumbnails (`.ico` uses the system icon).
 pub fn can_thumbnail(entry: &Entry) -> bool {
@@ -115,6 +143,17 @@ pub fn can_thumbnail(entry: &Entry) -> bool {
 mod tests {
     use super::*;
 
+    /// A `DefaultIcon` of `%1` (quoted or not) means the file holds its own icon.
+    #[test]
+    fn default_icon_of_the_file_itself() {
+        assert!(default_icon_is_the_file("%1"));
+        assert!(default_icon_is_the_file("\"%1\""));
+        assert!(default_icon_is_the_file(" \"%1\" "));
+        assert!(!default_icon_is_the_file(r"C:\cad\acad.exe,3"));
+        assert!(!default_icon_is_the_file(r#""C:\cad\%1.exe""#));
+        assert!(!default_icon_is_the_file(""));
+    }
+
     fn file(name: &str, size: u64) -> Entry {
         Entry::new(name, EntryKind::File, size, None, 0)
     }
@@ -131,6 +170,24 @@ mod tests {
         // Once downloaded (no recall attribute) it is handled normally.
         let local = Entry::new("a.jpg", EntryKind::File, 1000, None, 0);
         assert!(can_thumbnail(&local));
+    }
+
+    /// Videos with content get a frame; not other files, empty ones or cloud placeholders (the
+    /// frame would download the video).
+    #[test]
+    fn videos_get_a_frame_unless_online_only() {
+        assert!(can_video_thumbnail(&file("Trip.MP4", 1000)));
+        assert!(can_video_thumbnail(&file("clip.mkv", 1000)));
+        assert!(!can_video_thumbnail(&file("clip.mkv", 0)));
+        assert!(!can_video_thumbnail(&file("song.mp3", 1000)));
+        assert!(
+            !can_thumbnail(&file("clip.mp4", 1000)),
+            "not decoded in Rust"
+        );
+        let online_only = Entry::new("clip.mp4", EntryKind::File, 1000, None, 0x40_0000);
+        assert!(!can_video_thumbnail(&online_only));
+        let dir = Entry::new("clips.mp4", EntryKind::Dir, 0, None, 0);
+        assert!(!can_video_thumbnail(&dir));
     }
 
     #[test]

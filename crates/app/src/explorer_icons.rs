@@ -108,11 +108,13 @@ impl IconSize {
             .unwrap_or((ANCHORS[2], ANCHORS[3]));
         let t = (f32::from(self.0.saturating_sub(a.0)) / f32::from(b.0 - a.0)).clamp(0., 1.);
         let mix = |p: Pixels, q: Pixels| px(f32::from(p).mul_add(1. - t, f32::from(q) * t).round());
+        // The tile constants are at 100%; the interface scale multiplies the result.
+        let k = theme::scale_pct() as f32 / 100.;
         theme::Tile {
-            w: mix(ta.w, tb.w),
-            h: mix(ta.h, tb.h),
-            image: px(f32::from(self.0)),
-            icon: mix(ta.icon, tb.icon),
+            w: mix(ta.w, tb.w) * k,
+            h: mix(ta.h, tb.h) * k,
+            image: px(f32::from(self.0)) * k,
+            icon: mix(ta.icon, tb.icon) * k,
         }
     }
 
@@ -290,7 +292,8 @@ impl Explorer {
 
     /// Ctrl+wheel over the list. Returns whether the event was used (so the list doesn't scroll).
     fn on_zoom_wheel(&mut self, event: &ScrollEvent, cx: &mut Context<Self>) -> bool {
-        if self.search_mode || self.view_mode == ViewMode::Columns {
+        // Quick Look covers the list and zooms its own preview.
+        if self.quick_look || self.search_mode || self.view_mode == ViewMode::Columns {
             return false;
         }
         let notches = match event.delta {

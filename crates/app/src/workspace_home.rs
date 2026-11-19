@@ -63,6 +63,14 @@ impl Workspace {
         self.open_home_as(new_tab, new_tab, window, cx);
     }
 
+    /// Ctrl+T (and the New tab buttons) set to Home: always a new tab with Home, even when Home
+    /// is already open somewhere. There is one Home page, so one open elsewhere gives way and
+    /// its tab shows the folder under it (as when Back brings Home to another tab).
+    pub(super) fn open_home_tab(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.home_page = None;
+        self.open_home_as(true, true, window, cx);
+    }
+
     /// [`Self::open_home`]; `start`: Home is where the tab starts (see [`HomeView::start`]).
     pub(super) fn open_home_as(
         &mut self,
@@ -152,9 +160,17 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        // Right click on a drive or network card: its menu, Home stays.
+        if let HomeEvent::PlaceMenu { path, position } = event {
+            self.open_place_menu(*position, path, cx);
+            return;
+        }
         // Middle click: a new tab in the background; Home stays.
         if let HomeEvent::OpenInNewTab(path) = event {
             self.open_in_background(path.clone(), window, cx);
+            return;
+        }
+        if self.home_opens_elsewhere(event, window, cx) {
             return;
         }
         // Home yields and the folder opens in the same tab, even if the tab was created for Home.
@@ -171,7 +187,7 @@ impl Workspace {
                 });
             }
             HomeEvent::OpenRecycle => self.open_recycle(false, window, cx),
-            HomeEvent::OpenInNewTab(_) => {}
+            HomeEvent::OpenInNewTab(_) | HomeEvent::PlaceMenu { .. } => {}
             HomeEvent::Reveal(path) => {
                 let (Some(parent), Some(name)) = (path.parent(), path.file_name()) else {
                     return;
@@ -183,6 +199,54 @@ impl Workspace {
                 });
             }
         }
+    }
+
+    /// A folder picked on Home that doesn't open under it: in a pinned tab, which keeps Home, it
+    /// opens in a new tab; on Home in a tab of its own (Ctrl+T), a tab already showing it comes
+    /// forward and the Home tab closes (one tab per folder). Returns whether it was handled.
+    fn home_opens_elsewhere(
+        &mut self,
+        event: &HomeEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let (folder, select) = match event {
+            HomeEvent::OpenFolder(path) => (path.clone(), Vec::new()),
+            HomeEvent::Reveal(path) => match (path.parent(), path.file_name()) {
+                (Some(parent), Some(name)) => (
+                    parent.to_path_buf(),
+                    vec![std::sync::Arc::from(name.to_string_lossy().as_ref())],
+                ),
+                _ => return false,
+            },
+            HomeEvent::OpenRecycle | HomeEvent::OpenInNewTab(_) | HomeEvent::PlaceMenu { .. } => {
+                return false;
+            }
+        };
+        if self.active_pinned_elsewhere(&folder, cx) {
+            let at = self.active + 1;
+            self.open_folder_tab(folder.clone(), at, true, window, cx);
+        } else {
+            let own_tab = self.home_page.as_ref().is_some_and(|p| p.owner.own_tab());
+            let Some(view) = self
+                .tab_showing(&folder, cx)
+                .filter(|&(tab, _)| own_tab && tab != self.active && Self::one_tab_per_folder(cx))
+                .map(|(tab, pane)| self.tabs[tab].panes[pane].view.clone())
+            else {
+                return false;
+            };
+            if let Some(page) = self.home_page.take() {
+                self.dismiss_page(&page.owner, window, cx);
+            }
+            if let Some((tab, pane)) = self.locate(&view) {
+                self.activate_pane(tab, pane, window, cx);
+            }
+        }
+        if !select.is_empty() {
+            self.active_view()
+                .update(cx, |e, cx| e.select_in_folder(&folder, select, cx));
+        }
+        true
     }
 
     /// Called before paint: closes Home once its tab is gone or has navigated elsewhere.
@@ -201,8 +265,42 @@ impl Workspace {
             .settings
             .net_places
             .clone();
-        page.view
-            .update(cx, |home, _| home.set_locations(places, shares));
+        let names = SettingsStore::global(cx)
+            .read(cx)
+            .settings
+            .place_names
+            .clone();
+        let rename = self
+            .sidebar_ui
+            .place_rename
+            .as_ref()
+            .map(|r| (r.path.clone(), r.input.clone()));
+        page.view.update(cx, |home, _| {
+            home.set_locations(places, shares);
+            home.set_names(names, rename);
+        });
+    }
+
+    /// The menu of a drive or network card on Home: only places that can be renamed have one.
+    fn open_place_menu(
+        &mut self,
+        position: gpui::Point<gpui::Pixels>,
+        path: &std::path::Path,
+        cx: &mut Context<Self>,
+    ) {
+        let places = self.active_view().read(cx).places.clone();
+        let settings = &SettingsStore::global(cx).read(cx).settings;
+        if super::sidebar::place_default_name(settings, &places, path).is_none() {
+            return;
+        }
+        self.open_sidebar_menu(
+            position,
+            vec![(
+                t!("menu.rename").to_string().into(),
+                super::sidebar::SidebarAction::RenamePlace(path.to_path_buf()),
+            )],
+            cx,
+        );
     }
 
     /// Reloads on window activation; recent files may have changed.
@@ -226,21 +324,21 @@ impl Workspace {
             .a11y(gpui::Role::Link, t!("home.title"))
             .relative()
             .flex_none()
-            .h(theme::H_ROW)
-            .mx(theme::S_8)
-            .mb(theme::S_4)
-            .pl(theme::S_8)
+            .h(theme::h_row())
+            .mx(theme::s_8())
+            .mb(theme::s_4())
+            .pl(theme::s_8())
             .flex()
             .items_center()
-            .gap(theme::S_8)
-            .rounded(theme::R_8)
+            .gap(theme::s_8())
+            .rounded(theme::r_8())
             .cursor_pointer()
             .when(open, |d| d.bg(theme::selection()).text_color(theme::text()))
             .when(!open, |d| {
                 d.text_color(theme::text_muted())
                     .hover(|s| s.bg(theme::wash()).text_color(theme::text()))
             })
-            .child(crate::assets::tinted(Icon::KfHome, theme::ICON, theme::text()))
+            .child(crate::assets::tinted(Icon::KfHome, theme::icon(), theme::text()))
             .child(t!("home.title").into_owned())
             .on_click(cx.listener(move |this, e: &ClickEvent, window, cx| {
                 if open {
@@ -265,36 +363,24 @@ impl Workspace {
         cx: &mut Context<Self>,
     ) -> Option<AnyElement> {
         let page = self.home_page.as_ref().filter(|p| self.shows(&p.owner))?;
-        let horizontal = Self::horizontal_tabs(cx);
         let top_bar = div()
-            .h(theme::H_BAR)
+            .h(theme::h_bar())
             .flex_none()
             .flex()
             .items_center()
-            .gap(theme::S_2)
-            .pr(theme::S_8)
-            .when(horizontal, |d| {
-                d.child(crate::explorer::ghost_button(
-                    "home-back",
-                    Icon::ArrowLeft,
-                    true,
-                    t!("nav.back"),
-                    cx.listener(|this, _: &ClickEvent, window, cx| {
-                        this.close_home(window, cx);
-                    }),
-                ))
-            })
+            .gap(theme::s_2())
+            .pr(theme::s_8())
             .child(
                 div()
                     .flex()
                     .flex_none()
                     .items_center()
-                    .gap(theme::S_8)
-                    .px(theme::S_8)
+                    .gap(theme::s_8())
+                    .px(theme::s_8())
                     .child(
                         svg()
                             .path(Icon::KfHome.path())
-                            .size(theme::ICON)
+                            .size(theme::icon())
                             .text_color(theme::text_muted()),
                     )
                     .child(
@@ -304,9 +390,7 @@ impl Workspace {
                     ),
             )
             .child(super::drag_area("home-drag", cx).flex_1().h_full())
-            .when(!horizontal, |d| {
-                d.child(crate::explorer::caption_buttons(window))
-            });
+            .child(crate::explorer::caption_buttons(window));
         Some(
             div()
                 .id("home-page")
@@ -316,6 +400,7 @@ impl Workspace {
                 .flex()
                 .flex_col()
                 .child(top_bar)
+                .children(self.tab_strip_under_bar(window, cx))
                 .child(
                     div()
                         .relative()
@@ -323,9 +408,9 @@ impl Workspace {
                         .flex_col()
                         .flex_1()
                         .min_h_0()
-                        .mr(theme::S_8)
-                        .mb(theme::S_8)
-                        .rounded(theme::R_12)
+                        .mr(theme::s_8())
+                        .mb(theme::s_8())
+                        .rounded(theme::r_12())
                         .bg(theme::paper())
                         .shadow(theme::elev_2())
                         .overflow_hidden()

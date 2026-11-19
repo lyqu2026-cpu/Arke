@@ -14,10 +14,12 @@
 //!   (`Settings::search_network`) and gets its own index and cache file, so a slow or offline share
 //!   never holds up local drives. Unreachable shares use the last cache (no rebuild, results stay)
 //!   and are probed again when Arke regains focus. Full rewalks happen at most daily; otherwise the
-//!   watcher keeps them current.
+//!   watcher keeps them current. A share reached both through a mapped drive and as
+//!   `\\server\share` is indexed once.
 
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use arke_core::Fs;
 use arke_core::index::IndexHit;
@@ -68,6 +70,32 @@ pub(crate) enum Roots {
     Fixed(Vec<PathBuf>),
 }
 
+/// Most items one network location's index holds. A share can be far larger than anyone searches
+/// (a NAS with years of files), and walking all of it keeps the NAS and Arke busy for hours.
+const NET_MAX_ITEMS: usize = 2_000_000;
+/// Folders of one network location listed at once while indexing it. Listing a folder on a share
+/// is a round trip that the server answers from its disks: one at a time, a share of 1.4 million
+/// items took eight minutes; eight at once (with large fetches) take a little over three.
+const NET_THREADS: usize = 8;
+
+/// The network locations' index services, for searches on background threads (see
+/// [`indexed_tree`]).
+static NET_SERVICES: parking_lot::RwLock<Vec<Arc<IndexService>>> =
+    parking_lot::RwLock::new(Vec::new());
+
+/// Everything below `dir` from the index of the network location it is in, so a search there
+/// doesn't walk the share; `None` when no network index covers it. Background threads only.
+pub(crate) fn indexed_tree(
+    dir: &std::path::Path,
+    show_hidden: bool,
+    cancel: &AtomicBool,
+) -> Option<arke_core::index::IndexedTree> {
+    let services = NET_SERVICES.read().clone();
+    services
+        .iter()
+        .find_map(|service| service.items_under(dir, show_hidden, cancel))
+}
+
 /// Index of one network location.
 pub(crate) struct NetIndex {
     pub(crate) root: PathBuf,
@@ -98,6 +126,9 @@ pub(crate) struct GlobalSearch {
     pub(crate) status: IndexStatus,
     /// Whether the background service is installed (`None`: not asked yet)
     pub(crate) service_installed: Option<bool>,
+    /// The installed service's version when it isn't this Arke's (its program was copied at
+    /// install and stays as it was when Arke updates): Settings offers to update it.
+    pub(crate) service_outdated: Option<String>,
     /// Install or remove in progress (waiting for UAC consent)
     pub(crate) service_busy: bool,
     _settings: Subscription,
@@ -147,6 +178,7 @@ impl GlobalSearch {
                 service: None,
                 status: IndexStatus::default(),
                 service_installed: None,
+                service_outdated: None,
                 service_busy: false,
                 _settings: sub,
                 worker: None,
@@ -180,12 +212,18 @@ impl GlobalSearch {
             settings.search_excluded.clone(),
         );
         let want_net = if want {
-            let drives = if matches!(self.roots, Roots::LocalDrives) {
+            let real = matches!(self.roots, Roots::LocalDrives);
+            let drives = if real {
                 crate::win::network_drive_roots()
             } else {
                 Vec::new()
             };
-            settings.searched_network(&drives)
+            // Where a mapped drive points comes from Windows' own record, no network access.
+            one_walk_per_share(settings.searched_network(&drives), |root| {
+                use arke_core::net::NetProbe as _;
+                real.then(|| crate::win_net::WinNetProbe.unc(root))
+                    .flatten()
+            })
         } else {
             Vec::new()
         };
@@ -230,10 +268,14 @@ impl GlobalSearch {
         let excluded = self.excluded.clone();
         let cache = self.cache.clone();
         let (changed_tx, changed_rx) = flume::unbounded::<()>();
-        let (service_tx, service_rx) = flume::bounded::<(Arc<IndexService>, bool)>(1);
+        let (service_tx, service_rx) =
+            flume::bounded::<(Arc<IndexService>, bool, Option<String>)>(1);
         crate::explorer::spawn_thread("index-roots", move || {
             // The background service only applies to real drives, not the fake ones in tests.
             let installed = matches!(roots, Roots::LocalDrives) && arke_indexd::client::installed();
+            let outdated = installed
+                .then(|| service_outdated(arke_indexd::client::installed_version()))
+                .flatten();
             let roots = match roots {
                 Roots::Fixed(roots) => roots,
                 Roots::LocalDrives => local_drives(shell.as_ref()),
@@ -254,15 +296,16 @@ impl GlobalSearch {
                 let _ = changed_tx.send(());
             });
             // Receiver already gone (turned off again): the service drops here and stops.
-            let _ = service_tx.send((Arc::new(service), installed));
+            let _ = service_tx.send((Arc::new(service), installed, outdated));
         });
         self.worker = Some(cx.spawn(async move |this, cx| {
-            let Ok((service, installed)) = service_rx.recv_async().await else {
+            let Ok((service, installed, outdated)) = service_rx.recv_async().await else {
                 return;
             };
             let stored = this.update(cx, |this, cx| {
                 this.service = Some(service);
                 this.service_installed = Some(installed);
+                this.service_outdated = outdated;
                 this.refresh_status(cx);
             });
             if stored.is_err() {
@@ -299,9 +342,16 @@ impl GlobalSearch {
                 changed = true;
             }
         }
+        self.publish_net();
         if changed {
             cx.notify();
         }
+    }
+
+    /// Makes the network locations' indexes available to searches below them
+    /// ([`indexed_tree`]).
+    fn publish_net(&self) {
+        *NET_SERVICES.write() = self.net.iter().filter_map(|n| n.service.clone()).collect();
     }
 
     /// Start indexing a network location. If not opened yet this session (NAS may be asleep), read
@@ -312,11 +362,11 @@ impl GlobalSearch {
         let real = matches!(self.roots, Roots::LocalDrives);
         let awake = self.net.iter().any(|n| n.root == root && n.awake);
         let skip_build_dirs = self.skip_build_dirs;
-        let cache = self
+        let cache_dir = self
             .cache
             .as_ref()
             .and_then(|c| c.parent())
-            .map(|dir| dir.join(format!("index-net-{:016x}.bin", fnv(&root))));
+            .map(std::path::Path::to_path_buf);
         let (changed_tx, changed_rx) = flume::unbounded::<()>();
         let (service_tx, service_rx) = flume::bounded::<(Arc<IndexService>, bool)>(1);
         let key = root.clone();
@@ -331,19 +381,32 @@ impl GlobalSearch {
                     (true, false) => "unreachable, using last cache",
                 }
             );
+            // A drive letter mapped to another share gets another cache.
+            let target = real
+                .then(|| {
+                    use arke_core::net::NetProbe as _;
+                    crate::win_net::WinNetProbe.unc(&root)
+                })
+                .flatten();
+            let cache = cache_dir.map(|dir| dir.join(net_cache_name(&root, target.as_deref())));
             let options = IndexOptions {
                 roots: vec![root],
                 cache,
-                // One connection over the network, walking slowly so the NAS isn't swamped.
-                threads: 1,
+                // Each listing waits on the server: several at once, but few enough that the NAS
+                // still answers everyone else.
+                threads: NET_THREADS,
                 thread_init: Arc::new(crate::win::lower_io_priority),
-                // The watcher keeps it current; full walk only weekly.
-                refresh_after: std::time::Duration::from_hours(24 * 7),
+                // The watcher keeps it current while Arke runs; changes made while it was closed come
+                // in with a daily rewalk, which lists again only folders that may have changed.
+                refresh_after: std::time::Duration::from_hours(24),
                 journal: None,
                 can_build: can_build(real),
                 skip_build_dirs,
                 passive: !online,
                 excluded: Vec::new(),
+                max_items: Some(NET_MAX_ITEMS),
+                // After the first walk, folders whose contents can't have changed aren't listed again.
+                incremental: true,
             };
             let service = IndexService::start(fs, options, move || {
                 let _ = changed_tx.send(());
@@ -406,6 +469,7 @@ impl GlobalSearch {
                     this.start_net(root, cx);
                 }
             }
+            this.publish_net();
             cx.notify();
         });
     }
@@ -439,6 +503,7 @@ impl GlobalSearch {
                         this.start_net(root, cx);
                     }
                 }
+                this.publish_net();
             });
         })
         .detach();
@@ -451,6 +516,7 @@ impl GlobalSearch {
     }
 
     fn refresh_status(&mut self, cx: &mut Context<Self>) {
+        self.publish_net();
         for net in &mut self.net {
             let status = net.service.as_ref().map_or_default(|s| s.status());
             if status != net.status {
@@ -483,15 +549,28 @@ impl GlobalSearch {
             self.net.iter().filter_map(|n| n.service.clone()).collect();
         let history = crate::search_history::SearchHistory::snapshot_for_search(cx);
         let signals = rank_signals(history.clone());
+        // Set when the returned task is dropped: the caller replaced it with a newer query, so
+        // this one stops scanning instead of finishing for nobody.
+        let cancel = Arc::new(AtomicBool::new(false));
         // Its own thread rather than the executor's pool: reading visited items from disk blocks.
         let (tx, rx) = flume::bounded(1);
+        let flag = Arc::clone(&cancel);
         crate::explorer::spawn_thread("global-search", move || {
+            let cancel = flag.as_ref();
             let clock = crate::win::clock();
             // Top hits from each index, merged and ordered by match quality, then by what the
             // user opens and where it is (`arke_core::rank`).
-            let mut hits = service.search(&query, clock, limit, false);
+            let Some(mut hits) = service.search_until(&query, clock, limit, false, cancel) else {
+                return;
+            };
             for service in &net {
-                hits.extend(service.search(&query, clock, limit, false));
+                let Some(more) = service.search_until(&query, clock, limit, false, cancel) else {
+                    return;
+                };
+                hits.extend(more);
+            }
+            if cancel.load(Ordering::Relaxed) {
+                return;
             }
             // Visited items the local index matched but didn't rank high enough to return. Not
             // for network locations: reading an item there can hang on a sleeping NAS.
@@ -503,10 +582,10 @@ impl GlobalSearch {
                 hits, extra, &parsed, &signals, limit,
             ));
         });
-        Some(
-            cx.background_executor()
-                .spawn(async move { rx.recv_async().await.unwrap_or_default() }),
-        )
+        Some(cx.background_executor().spawn(async move {
+            let _cancel_on_drop = CancelOnDrop(cancel);
+            rx.recv_async().await.unwrap_or_default()
+        }))
     }
 
     /// Install or remove the background service (UAC prompt). Restarts indexing afterwards to use
@@ -577,6 +656,36 @@ impl GlobalSearch {
     }
 }
 
+/// The installed service's version if it isn't this Arke's (`installed`: what its program says;
+/// `None` when that can't be read, e.g. the file is gone, which an update repairs too).
+fn service_outdated(installed: Option<String>) -> Option<String> {
+    match installed {
+        Some(v) if v == crate::build_info::VERSION => None,
+        Some(v) => {
+            log::info!(
+                "search service is version {v}, Arke is {}: Settings › Search offers to update it",
+                crate::build_info::VERSION
+            );
+            Some(v)
+        }
+        None => {
+            log::info!(
+                "search service program has no readable version; Settings offers to update it"
+            );
+            Some(String::from("?"))
+        }
+    }
+}
+
+/// Sets the flag when dropped (a search task dropped before its result arrived).
+struct CancelOnDrop(Arc<AtomicBool>);
+
+impl Drop for CancelOnDrop {
+    fn drop(&mut self) {
+        self.0.store(true, Ordering::Relaxed);
+    }
+}
+
 /// Options for the local drives index. Shared with `--bench index` (see `bench_index.rs`) so the
 /// benchmark builds exactly what the app builds.
 pub(crate) fn local_index_options(
@@ -603,6 +712,8 @@ pub(crate) fn local_index_options(
         skip_build_dirs,
         passive: false,
         excluded,
+        max_items: None,
+        incremental: false,
     }
 }
 
@@ -638,6 +749,21 @@ fn reachable(root: &std::path::Path) -> bool {
     !matches!(probe.reach(&server), Reach::Down | Reach::NoSuchHost)
 }
 
+/// Cache file name of a network location's index. A mapped drive's name also covers the share it
+/// points to (`target`), so remapping the letter to another share starts a new index instead of
+/// using the old share's; a `\\server\share` location keeps the name it always had.
+fn net_cache_name(root: &std::path::Path, target: Option<&std::path::Path>) -> String {
+    let hash = match target.filter(|t| !same_path(t, root)) {
+        Some(target) => fnv(&PathBuf::from(format!(
+            "{}|{}",
+            root.display(),
+            target.display()
+        ))),
+        None => fnv(root),
+    };
+    format!("index-net-{hash:016x}.bin")
+}
+
 /// Hash for network cache file names (FNV-1a, case-insensitive, stable across versions).
 fn fnv(path: &std::path::Path) -> u64 {
     path.to_string_lossy()
@@ -646,6 +772,50 @@ fn fnv(path: &std::path::Path) -> u64 {
         .fold(0xcbf2_9ce4_8422_2325, |h, b| {
             (h ^ u64::from(b)).wrapping_mul(0x0100_0000_01b3)
         })
+}
+
+/// Network locations to index, each part of a share once: a mapped drive and the same
+/// `\\server\share` (both added automatically when the share was opened both ways), or a folder
+/// inside another location, would walk the same files twice and list them twice. The first of two
+/// equal ones stays. `unc` gives where a mapped drive points.
+fn one_walk_per_share(
+    roots: Vec<PathBuf>,
+    unc: impl Fn(&std::path::Path) -> Option<PathBuf>,
+) -> Vec<PathBuf> {
+    let keys: Vec<String> = roots
+        .iter()
+        .map(|root| {
+            unc(root)
+                .unwrap_or_else(|| root.clone())
+                .to_string_lossy()
+                .trim_end_matches(['\\', '/'])
+                .to_lowercase()
+        })
+        .collect();
+    let covered = |i: usize| {
+        keys.iter().enumerate().any(|(j, other)| {
+            j != i
+                && ((other == &keys[i] && j < i)
+                    || keys[i]
+                        .strip_prefix(other.as_str())
+                        .is_some_and(|rest| rest.starts_with('\\')))
+        })
+    };
+    roots
+        .into_iter()
+        .enumerate()
+        .filter(|&(i, ref root)| {
+            let keep = !covered(i);
+            if !keep {
+                log::info!(
+                    "global search: {} is already indexed through another location",
+                    root.display()
+                );
+            }
+            keep
+        })
+        .map(|(_, root)| root)
+        .collect()
 }
 
 /// Same path, ignoring case and trailing `\`
@@ -704,15 +874,127 @@ pub(crate) fn toggle_local_exclusion(path: PathBuf, cx: &mut App) {
     });
 }
 
-/// Roots of local fixed drives (no network or removable drives). Call from a background thread.
+/// Roots of local fixed drives (no network or removable drives), each volume once: `subst`
+/// drives and extra letters for an already listed volume are left out. Call from a background
+/// thread.
 pub(crate) fn local_drives(shell: &dyn Shell) -> Vec<PathBuf> {
-    shell
+    let roots = shell
         .load_places()
         .into_iter()
         .filter(|p| matches!(p.kind, PlaceKind::Drive { remote: false, .. }))
         .map(|p| p.path)
         .filter(|p| shell.is_local_disk(p))
-        .collect()
+        .collect();
+    distinct_volumes(roots, |root| {
+        drive_of(root)
+            .and_then(crate::win::dos_device)
+            .map(|device| DriveTarget::parse(&device))
+    })
+}
+
+/// What a drive letter points at, from the DOS device table.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum DriveTarget {
+    /// A volume (`\Device\HarddiskVolume3`).
+    Volume(String),
+    /// A folder on another drive (`subst S: C:\Users\me\Demo` maps S: to `\??\C:\Users\me\Demo`).
+    Folder(PathBuf),
+}
+
+impl DriveTarget {
+    pub(crate) fn parse(device: &str) -> Self {
+        match device.strip_prefix(r"\??\") {
+            Some(folder) => Self::Folder(PathBuf::from(folder)),
+            None => Self::Volume(device.to_ascii_lowercase()),
+        }
+    }
+}
+
+/// Drive letter of a path (`C:\Users` to `C`).
+fn drive_of(path: &std::path::Path) -> Option<char> {
+    use std::path::{Component, Prefix};
+    let Some(Component::Prefix(prefix)) = path.components().next() else {
+        return None;
+    };
+    match prefix.kind() {
+        Prefix::Disk(l) | Prefix::VerbatimDisk(l) => Some(char::from(l).to_ascii_uppercase()),
+        _ => None,
+    }
+}
+
+/// Drops roots that would index a volume a second time: a `subst` drive whose folder lies on
+/// another root (followed through chained `subst`s), and a second letter for a volume already
+/// listed. Roots whose target is unknown are kept.
+pub(crate) fn distinct_volumes(
+    roots: Vec<PathBuf>,
+    target: impl Fn(&std::path::Path) -> Option<DriveTarget>,
+) -> Vec<PathBuf> {
+    let targets: Vec<Option<DriveTarget>> = roots.iter().map(|r| target(r)).collect();
+    let folder_of = |letter: char| {
+        roots.iter().zip(&targets).find_map(|(r, t)| match t {
+            Some(DriveTarget::Folder(f)) if drive_of(r) == Some(letter) => Some(f.clone()),
+            _ => None,
+        })
+    };
+    // Where a subst folder really is: rewrite the drive while it is itself a subst drive.
+    let resolve = |folder: &std::path::Path| {
+        let mut folder = folder.to_path_buf();
+        for _ in 0..8 {
+            let Some(base) = drive_of(&folder).and_then(folder_of) else {
+                break;
+            };
+            // Past `C:` and `\`.
+            let rest: PathBuf = folder.components().skip(2).collect();
+            folder = base.join(rest);
+        }
+        folder
+    };
+    let mut volumes: Vec<&str> = Vec::new();
+    let mut kept = Vec::with_capacity(roots.len());
+    for (root, t) in roots.iter().zip(&targets) {
+        match t {
+            Some(DriveTarget::Folder(folder)) => {
+                let real = resolve(folder);
+                let covered = roots.iter().zip(&targets).find(|(r, t)| {
+                    !matches!(t, Some(DriveTarget::Folder(_))) && is_within(&real, r.as_path())
+                });
+                if let Some((other, _)) = covered {
+                    log::info!(
+                        "global search: {} is {} on {}, not indexed twice",
+                        root.display(),
+                        real.display(),
+                        other.display()
+                    );
+                    continue;
+                }
+            }
+            Some(DriveTarget::Volume(volume)) => {
+                if volumes.contains(&volume.as_str()) {
+                    log::info!(
+                        "global search: {} is a volume already indexed, skipped",
+                        root.display()
+                    );
+                    continue;
+                }
+                volumes.push(volume);
+            }
+            None => {}
+        }
+        kept.push(root.clone());
+    }
+    kept
+}
+
+/// Whether `path` is `root` or inside it (any letter case).
+fn is_within(path: &std::path::Path, root: &std::path::Path) -> bool {
+    let p = path.to_string_lossy().to_lowercase();
+    let r = root
+        .to_string_lossy()
+        .trim_end_matches(['\\', '/'])
+        .to_lowercase();
+    p == r
+        || p.strip_prefix(&r)
+            .is_some_and(|rest| rest.starts_with('\\'))
 }
 
 /// `<exe dir>\data\index.bin` (string handling only).
@@ -771,89 +1053,69 @@ pub(crate) fn toggle_network(path: PathBuf, cx: &mut App) {
     });
 }
 
-/// Per-drive change journal sizes (shown and adjusted on the settings page). Queried from the
-/// drive; Arke keeps no record.
-#[derive(Clone, Default)]
-pub(crate) struct JournalSizes {
-    /// (drive, max size, current size) in bytes; only drives with a journal
-    pub(crate) drives: Vec<(PathBuf, u64, u64)>,
-    /// Already queried (otherwise queried when the settings page opens)
-    pub(crate) loaded: bool,
-    /// Drive being resized (waiting for UAC consent)
-    pub(crate) busy: Option<PathBuf>,
-    /// Result of the last resize (failed or canceled)
-    pub(crate) error: Option<String>,
-}
-
-impl Global for JournalSizes {}
-
-/// Requery journal sizes for these drives (background, query only, no elevation needed).
-pub(crate) fn refresh_journal_sizes(roots: Vec<PathBuf>, cx: &mut App) {
-    let mut state = cx.try_global::<JournalSizes>().cloned().unwrap_or_default();
-    state.loaded = true;
-    cx.set_global(state);
-    let (tx, rx) = flume::bounded::<Vec<(PathBuf, u64, u64)>>(1);
-    crate::explorer::spawn_thread("journal-size", move || {
-        let found = roots
-            .into_iter()
-            .filter_map(|root| {
-                arke_indexd::journal_size(&root).map(|(max, used)| (root, max, used))
-            })
-            .collect();
-        let _ = tx.send(found);
-    });
-    cx.spawn(async move |cx| {
-        if let Ok(drives) = rx.recv_async().await {
-            cx.update(|cx| {
-                let mut state = cx.try_global::<JournalSizes>().cloned().unwrap_or_default();
-                state.drives = drives;
-                cx.set_global(state);
-                cx.refresh_windows();
-            });
-        }
-    })
-    .detach();
-}
-
-/// Resize `root`'s change journal to at most `mb` MB via UAC and `arke.exe --indexd journal-size`
-/// (no records deleted, no registry changes). Requeries sizes afterwards.
-pub(crate) fn set_journal_size(root: PathBuf, mb: u64, roots: Vec<PathBuf>, cx: &mut App) {
-    let Ok(exe) = std::env::current_exe() else {
-        return;
-    };
-    let mut state = cx.try_global::<JournalSizes>().cloned().unwrap_or_default();
-    state.busy = Some(root.clone());
-    state.error = None;
-    cx.set_global(state);
-    cx.refresh_windows();
-    let (tx, rx) = flume::bounded(1);
-    crate::explorer::spawn_thread("journal-resize", move || {
-        let root = crate::win::quote_arg(&root.to_string_lossy());
-        let args = format!("--indexd journal-size {root} {mb}");
-        let _ = tx.send(crate::win::run_elevated(&exe, &args));
-    });
-    cx.spawn(async move |cx| {
-        // Shown under the drive as is; no reply (thread gone) shows nothing.
-        let error = match rx.recv_async().await {
-            Ok(Ok(0)) | Err(_) => None,
-            Ok(Ok(code)) => Some(format!("exit {code}")),
-            Ok(Err(err)) => Some(err.to_string()),
-        };
-        cx.update(|cx| {
-            let mut state = cx.try_global::<JournalSizes>().cloned().unwrap_or_default();
-            state.busy = None;
-            state.error = error.filter(|e| !e.is_empty());
-            cx.set_global(state);
-            refresh_journal_sizes(roots, cx);
-        });
-    })
-    .detach();
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The service is outdated when its program reports another version, or none at all.
+    #[test]
+    fn a_service_from_another_version_is_outdated() {
+        assert_eq!(
+            service_outdated(Some(crate::build_info::VERSION.to_owned())),
+            None
+        );
+        assert_eq!(
+            service_outdated(Some("0.0.1-test".to_owned())),
+            Some("0.0.1-test".to_owned())
+        );
+        assert_eq!(service_outdated(None), Some("?".to_owned()));
+    }
     use std::path::Path;
+
+    /// A drive letter mapped to another share gets another cache (its old index is another
+    /// share's); a `\\server\share` location keeps the name it always had.
+    #[test]
+    fn a_remapped_drive_letter_gets_its_own_cache() {
+        let p = PathBuf::from;
+        let x = p(r"X:\");
+        let first = net_cache_name(&x, Some(&p(r"\\10.0.0.1\dad")));
+        assert_ne!(first, net_cache_name(&x, Some(&p(r"\\10.0.0.2\other"))));
+        assert_eq!(first, net_cache_name(&x, Some(&p(r"\\10.0.0.1\DAD"))));
+        let share = p(r"\\nas\share");
+        assert_eq!(
+            net_cache_name(&share, Some(&share)),
+            format!("index-net-{:016x}.bin", fnv(&share))
+        );
+    }
+
+    /// A share opened both through its mapped drive and as `\\server\share` (both added
+    /// automatically) is walked once; so is a folder inside another location.
+    #[test]
+    fn each_share_is_indexed_once() {
+        let p = PathBuf::from;
+        let unc = |root: &Path| {
+            root.to_string_lossy()
+                .starts_with("X:")
+                .then(|| p(r"\\10.0.0.1\dad"))
+        };
+        let roots = vec![
+            p(r"X:\"),
+            p(r"\\10.0.0.1\DAD"),
+            p(r"\\10.0.0.1\dad\Projects"),
+            p(r"\\nas\other"),
+            p(r"\\nas\other\"),
+            p(r"\\nas\other2"),
+        ];
+        assert_eq!(
+            one_walk_per_share(roots, unc),
+            [p(r"X:\"), p(r"\\nas\other"), p(r"\\nas\other2")]
+        );
+        // A folder listed before its share still goes: the share covers it.
+        assert_eq!(
+            one_walk_per_share(vec![p(r"\\nas\s\sub"), p(r"\\nas\s")], |_| None),
+            [p(r"\\nas\s")]
+        );
+    }
 
     #[test]
     fn local_folders_can_be_excluded_only_where_they_were_excluded() {
@@ -876,5 +1138,52 @@ mod tests {
         st.global_search = false;
         assert_eq!(local_search_state(&st, Path::new(r"C:\Work")), None);
         assert!(same_path(Path::new(r"C:\Games\"), Path::new(r"c:\GAMES")));
+    }
+
+    /// A `subst` drive is a folder of another drive, and a volume can have more than one letter:
+    /// each volume is indexed once (a `subst` drive used to be walked a second time).
+    #[test]
+    fn each_volume_is_indexed_once() {
+        let p = PathBuf::from;
+        let table = |root: &Path| {
+            let device = match root.to_str()? {
+                r"C:\" => r"\Device\HarddiskVolume3",
+                r"D:\" => r"\Device\HarddiskVolume5",
+                // Same volume as D: under a second letter.
+                r"E:\" => r"\Device\HARDDISKVOLUME5",
+                r"S:\" => r"\??\C:\Users\me\AppData\Local\Temp\Arke Demo",
+                // subst of a subst: still on C:.
+                r"T:\" => r"\??\S:\nested",
+                // subst of a folder on a drive that isn't indexed (skipped in settings).
+                r"U:\" => r"\??\F:\Media",
+                _ => return None,
+            };
+            Some(DriveTarget::parse(device))
+        };
+        let roots = ["C:\\", "D:\\", "E:\\", "S:\\", "T:\\", "U:\\", "V:\\"].map(p);
+        assert_eq!(
+            distinct_volumes(roots.to_vec(), table),
+            ["C:\\", "D:\\", "U:\\", "V:\\"].map(p),
+            "S: and T: are folders on C:, E: is D: again; U: and the unknown V: stay"
+        );
+        // Order doesn't matter: a subst drive listed before its drive is still dropped.
+        assert_eq!(
+            distinct_volumes(["S:\\", "C:\\"].map(p).to_vec(), table),
+            [p("C:\\")]
+        );
+        assert_eq!(
+            DriveTarget::parse(r"\??\C:\Users"),
+            DriveTarget::Folder(p(r"C:\Users"))
+        );
+    }
+
+    /// The real DOS device table: a fixed drive maps to a volume device, never to a folder.
+    #[test]
+    fn the_system_drive_is_a_volume() {
+        let device = crate::win::dos_device('C').expect("C: exists");
+        assert!(
+            matches!(DriveTarget::parse(&device), DriveTarget::Volume(v) if v.starts_with(r"\device\")),
+            "{device}"
+        );
     }
 }

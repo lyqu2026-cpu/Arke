@@ -33,9 +33,13 @@ use gpui::{
 use rust_i18n::t;
 
 use super::{Explorer, kind_icon, spawn_thread};
+
+#[path = "explorer_dnd_hold.rs"]
+mod hold;
 use crate::media::MediaKey;
 use crate::shell::{DragImage, DragImageRequest};
 use crate::theme::{self, UiFont as _};
+pub(crate) use hold::{hold_temp_drop, new_drop_folder};
 
 /// Longest edge when decoding the drag image ourselves.
 const DRAG_THUMBNAIL: u32 = 96;
@@ -77,6 +81,14 @@ impl DraggedFiles {
         self.source
             .upgrade()
             .map_or_default(|e| e.read(cx).drag_paths(self.ix))
+    }
+
+    /// The dragged paths if they are all folders (they can go on the sidebar), else `None`.
+    pub(crate) fn folders(&self, cx: &App) -> Option<Vec<PathBuf>> {
+        if self.shelf.is_some() {
+            return None;
+        }
+        self.source.upgrade()?.read(cx).drag_folders(self.ix)
     }
 
     /// Whether a drop moves: shelf items copy unless Shift is held; list items follow
@@ -326,7 +338,15 @@ impl DragPreview {
             .and_then(|h| h.dest.as_ref().map(|(p, _)| p.clone()))
             .filter(|d| useful_drop(&self.paths, d));
         let modifiers = window.modifiers();
+        // Over the sidebar's favorites or pinned list, where folders are added rather than dropped
+        // into one (only reported for folders).
+        let pin = crate::workspace::pindrop::current(window, cx);
         let (icon, text, strong) = match dest {
+            _ if pin.is_some() => (
+                Icon::Pin,
+                crate::workspace::pindrop::action_label().to_string(),
+                true,
+            ),
             None => (Icon::Folder, t!("dnd.no_target").into_owned(), false),
             Some(_) if modifiers.alt || cx.has_global::<RightDrag>() => {
                 (Icon::Menu, t!("dnd.will_ask").into_owned(), true)
@@ -364,13 +384,13 @@ impl DragPreview {
         div()
             .flex()
             .items_center()
-            .gap(theme::S_6)
-            .text_size(theme::FS_12)
+            .gap(theme::s_6())
+            .text_size(theme::fs_12())
             .text_color(color)
             .child(
                 gpui::svg()
                     .path(icon.path())
-                    .size(theme::ICON_SM)
+                    .size(theme::icon_sm())
                     .text_color(color),
             )
             .child(text)
@@ -419,40 +439,40 @@ impl Render for DragPreview {
         let card = div()
             .flex()
             .flex_col()
-            .gap(theme::S_2)
-            .px(theme::S_12)
-            .py(theme::S_6)
-            .rounded(theme::R_8)
+            .gap(theme::s_2())
+            .px(theme::s_12())
+            .py(theme::s_6())
+            .rounded(theme::r_8())
             .bg(theme::overlay())
             .shadow(theme::elev_float())
             .ui_font()
-            .text_size(theme::FS_14)
+            .text_size(theme::fs_14())
             .text_color(theme::text())
             .child(
                 div()
                     .flex()
                     .items_center()
-                    .gap(theme::S_8)
+                    .gap(theme::s_8())
                     .child(kind_icon(
                         if self.count > 1 {
                             FileKind::Other
                         } else {
                             self.kind
                         },
-                        theme::ICON,
+                        theme::icon(),
                     ))
                     .child(self.label.clone()),
             )
             .child(self.action_line(window, cx))
             .child(
                 div()
-                    .text_size(theme::FS_12)
+                    .text_size(theme::fs_12())
                     .text_color(theme::text_subtle())
                     .child(t!("dnd.keys").to_string()),
             );
         div()
-            .pl(self.grab.x + theme::S_12)
-            .pt(self.grab.y + theme::S_12)
+            .pl(self.grab.x + theme::s_12())
+            .pt(self.grab.y + theme::s_12())
             .child(card)
     }
 }
@@ -547,6 +567,15 @@ fn end_right_drag(window: &mut Window, cx: &mut App) {
     }
 }
 
+/// Ends the drag without a drop (Esc, or Windows' drag ended it), with what a right drag left:
+/// a [`RightDrag`] left behind would make the next left drag ask instead of moving.
+pub(crate) fn stop_drag(window: &mut Window, cx: &mut App) {
+    if cx.has_global::<RightDrag>() {
+        cx.remove_global::<RightDrag>();
+    }
+    cx.stop_active_drag(window);
+}
+
 impl Explorer {
     /// Right button pressed on an item: remember it; the menu opens on release, or it becomes a
     /// drag once the mouse moves.
@@ -610,9 +639,19 @@ impl Explorer {
                 }),
                 cx,
             );
-            // The item didn't start a drag (it is being renamed, say): nothing to drop.
+            // The item didn't start a drag (it is being renamed, say): nothing to drop, and the
+            // replayed left press must not stay armed for a later click or drag.
             if !cx.has_active_drag() && cx.has_global::<RightDrag>() {
                 cx.remove_global::<RightDrag>();
+                crate::press_guard::cancel_press(MouseButton::Left, window, cx);
+                let _ = window.dispatch_event(
+                    PlatformInput::MouseMove(MouseMoveEvent {
+                        position: to,
+                        pressed_button: Some(MouseButton::Right),
+                        modifiers,
+                    }),
+                    cx,
+                );
             }
             window.refresh();
         });
@@ -657,6 +696,14 @@ impl Explorer {
                             window.defer(cx, end_right_drag);
                             return;
                         }
+                        if crate::press_guard::is_cancel(e) {
+                            // The real release went elsewhere: no menu.
+                            let _ = on_up.update(cx, |this, cx| {
+                                this.right_press = None;
+                                cx.notify();
+                            });
+                            return;
+                        }
                         let _ = on_up.update(cx, |this, cx| {
                             this.right_press_released(e.position, window, cx);
                         });
@@ -678,14 +725,35 @@ pub(crate) fn drop_external_into(
     window: &mut Window,
     cx: &mut App,
 ) {
-    let paths: Vec<PathBuf> = paths.paths().to_vec();
+    if crate::win_virtual_drop::is_virtual(paths.paths()) {
+        drop_virtual_into(dest, target, cx);
+        return;
+    }
+    // Files a source extracted to the temp folder for this drop are gone once it returns.
+    let (paths, held) = hold_temp_drop(paths.paths().to_vec());
     if window.modifiers().alt {
         let at = window.mouse_position();
         target.update(cx, |e, cx| e.open_drop_menu(paths, dest, at, window, cx));
         return;
     }
-    let is_move = drop_is_move(window.modifiers(), &paths, &dest);
+    // Held files are Arke's own copies: moved from where they are held.
+    let is_move = held || drop_is_move(window.modifiers(), &paths, &dest);
     target.update(cx, |e, cx| e.transfer_paths(paths, dest, is_move, cx));
+}
+
+/// Virtual files (#206): read from the source now, while the drop is handled, then copied in
+/// the background. Always a copy; Alt's menu offers nothing else for them.
+fn drop_virtual_into(dest: PathBuf, target: &gpui::Entity<Explorer>, cx: &mut App) {
+    let Some(data) = crate::win_virtual_drop::dropped_data() else {
+        return;
+    };
+    match crate::win_virtual_drop::VirtualDrop::take(&data) {
+        Ok(drop) => target.update(cx, |e, cx| e.drop_virtual_files(drop, dest, cx)),
+        Err(error) => target.update(cx, |e, cx| {
+            e.error = Some(error.to_string());
+            cx.notify();
+        }),
+    }
 }
 
 impl Explorer {
@@ -707,6 +775,29 @@ impl Explorer {
         } else {
             self.path_at(ix).map(|(p, _)| p).into_iter().collect()
         }
+    }
+
+    /// [`Self::drag_paths`] if every one is a folder.
+    pub(crate) fn drag_folders(&self, ix: usize) -> Option<Vec<PathBuf>> {
+        if self.search_mode {
+            return self
+                .path_at(ix)
+                .filter(|(_, is_dir)| *is_dir)
+                .map(|(p, _)| vec![p]);
+        }
+        let (model, view) = (self.model.as_ref()?, self.view()?);
+        let at = view.get(ix)?;
+        let dragged: Vec<&arke_core::Entry> = if self.selection.contains(&at.name) {
+            view.iter()
+                .filter(|e| self.selection.contains(&e.name))
+                .collect()
+        } else {
+            vec![at]
+        };
+        dragged
+            .iter()
+            .all(|e| e.is_dir_like())
+            .then(|| dragged.iter().map(|e| model.path.join(&*e.name)).collect())
     }
 
     /// What to build the drag image from for item `ix`, the one under the cursor.

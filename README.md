@@ -28,7 +28,7 @@ files in seconds, and follows the change journal so the index is current the mom
 
 **It's built for working in many folders at once.** Tabs live in a vertical sidebar, can be
 pinned and saved as named workspaces. Any tab splits into two panes that browse in sync or compare
-their contents, and dragging a file onto a tab, a pinned folder or a path segment drops it right
+their contents, and dragging a file onto a tab, a favorite or a path segment drops it right
 there.
 
 **It's safe with your system.** Arke has no telemetry. Apart from the optional search service, which
@@ -36,6 +36,8 @@ Windows registers when you install it, Arke writes to the registry only if you t
 "Open folders in Arke": then it registers itself as the folder handler for your Windows account
 (under `HKEY_CURRENT_USER\Software\Classes` only), and turning the setting off puts everything back.
 Shell extensions from other programs run in a separate process, so a buggy one can't take Arke down.
+
+If Arke is useful to you, a ⭐ on GitHub helps other people find it.
 
 ## Features
 
@@ -45,8 +47,16 @@ Shell extensions from other programs run in a separate process, so a buggy one c
     <td width="50%"><img src=".github/assets/context-menu.png" alt="Arke's context menu"></td>
   </tr>
   <tr>
-    <td>Details, icons and columns views, light and dark themes, accent colors and backdrops.</td>
+    <td>Details, icons and columns views, with a preview pane for most kinds of files.</td>
     <td>A fast context menu of its own, with the full Windows menu one click away.</td>
+  </tr>
+  <tr>
+    <td width="50%"><img src=".github/assets/quick-look.png" alt="Quick Look showing a Markdown file"></td>
+    <td width="50%"><img src=".github/assets/themes.png" alt="Theme and accent color settings"></td>
+  </tr>
+  <tr>
+    <td>Quick Look (Space) shows Markdown the way GitHub does, and images, PDF, Office files and code.</td>
+    <td>Light, dark and dark gray themes, accent colors, and a background tint or image.</td>
   </tr>
 </table>
 
@@ -56,12 +66,30 @@ Shell extensions from other programs run in a separate process, so a buggy one c
 - Each folder remembers its view and sort.
 - Tabs you can pin or save as workspaces. Split a tab into two panes with one shared preview,
   synchronized browsing and folder compare.
-- Spring-loaded folders, a shelf for collecting files from different folders, bookmarks with
-  groups for folders and files, and a Home page with recent files, drives and network locations.
+- The search box sits in the middle of the title bar and searches the active pane. Each pane has
+  its own row with Up, its path and its view buttons, so in split view each side keeps its own
+  filter.
+- Drag a tab out to give it a window of its own, or drop files on a tab to copy or move them into
+  its folder.
+- Favorites at the top of the sidebar, as tiles and a list: add a folder, a file or a tab from its menu, or drag it there. Favorites can be named and put in groups.
+- One window by default (since 0.7): folders from other apps, Win+E and starting Arke again add a
+  tab to the window you used last. Turn off "Single window" in settings for a window each.
+- With "New windows open to: Last tabs", the windows open when you quit Arke (or Windows shuts
+  down) come back with their tabs. A window you close while others stay open isn't kept.
+- Spring-loaded folders, a shelf for collecting files from different folders, and a Home page
+  with recent files, drives and network locations.
+- Swipe with two fingers on a touchpad to go back and forward, like in a browser.
+- The sidebar can be made wider by dragging its edge, collapses to a column of icons (Ctrl+B) and
+  opens over the content when you rest the pointer on it. Columns in the columns view can be
+  resized.
+- Interface scale from 80% to 150%, on top of Windows' own scale.
+- Command palette (Ctrl+Shift+P) for every command, and shortcuts you can change.
 
 **Preview**
 - A resizable preview pane and Quick Look (Space) for images, PDF, Word, Excel and PowerPoint,
   text and code with syntax highlighting, Markdown, archives and folders.
+- Videos show a frame as their thumbnail. Quick Look zooms text, documents and PDF pages
+  (Ctrl+wheel), and with QuickLook installed, Space can open that instead.
 
 **Search**
 - As you type, in this folder, its subfolders or the whole computer, with fuzzy matching and
@@ -75,10 +103,13 @@ Shell extensions from other programs run in a separate process, so a buggy one c
   (experimental).
 - Batch rename, "Move to new folder", and a move/copy/shortcut menu when you drag with the right
   mouse button or drop with Alt held.
+- A Properties window of its own (Alt+Enter): sizes, where a folder's space goes, attributes, the
+  app a file opens with, SHA-256 and unblocking downloaded files. Windows' own is one click away.
 
 **Places**
 - Network shares that fail fast when a server is offline and show the last known contents;
-  `\\server` lists its shares. SFTP and WebDAV locations (experimental).
+  `\\server` lists its shares. SFTP and WebDAV locations (experimental). Mapped drives and
+  network places can get names of their own, kept in Arke only.
 - OneDrive and other cloud folders with sync status. Previews never download online-only files.
 - Archives: preview and extract zip, 7z, tar (.gz, .xz, .bz2, .zst) and RAR, compress to zip.
   RAR and the xz / bzip2 / zstd tars use the libarchive built into Windows (best on Windows 11
@@ -88,7 +119,15 @@ Shell extensions from other programs run in a separate process, so a buggy one c
 - Big folders go to the Recycle Bin at once on local drives: 20,000 files in about a quarter of a
   second instead of 40 s, since Windows doesn't check every file first. Restore works as usual, and
   anything it can't vouch for (network drives, OneDrive, files in use, policies) is left to Windows.
-  It can be turned off in settings.
+  It can be turned off in settings. Loose files take a few milliseconds each, still two to six times
+  faster than Windows.
+- Updates download quietly in the background and install the next time Arke restarts, never while
+  files are being copied and never over a metered connection.
+- Menus open in windows of their own, like Windows menus, so near the edge they reach past Arke's
+  window instead of being squeezed.
+- Quiet when idle: nothing on screen changing means nothing redrawn, minimized included. Folder
+  sizes, indexing and the search service run at low priority in Windows' efficiency mode, and with
+  only the tray icon left Arke frees its caches.
 - Optionally (experimental) open folders in Arke instead of File Explorer (folders opened from other
   apps included), also "Show in folder" from browsers and "Open file location" from other apps.
   It registers Arke as the folder handler for your account and is undone when you turn it off.
@@ -138,7 +177,7 @@ real-time antivirus scanning on, which slows every program down. File system cac
   fast Recycle Bin (on by default for local drives); both restore from the Windows Recycle Bin as
   usual.
 
-Your numbers will differ. Arke logs its own timings in `<exe dir>\data\arke.log`.
+Your numbers will differ. Arke logs its own timings in `%LOCALAPPDATA%\Arke\arke.log`.
 
 Run `arke --bench index` to measure the index on your machine.
 
@@ -146,14 +185,18 @@ Run `arke --bench index` to measure the index on your machine.
 
 ## Install
 
-Download `arke-<version>.exe` (or `arke-<version>-arm64.exe` for ARM64 PCs) from
-[Releases](https://github.com/Koimsurai/Arke/releases) and run it. It's a single executable: no installer and no runtime. Settings are stored in
-a `data` folder next to the exe, so a copy of Arke is self-contained.
+Download from [Releases](https://github.com/Koimsurai/Arke/releases). Both downloads are the same
+Arke, with the same features and updates, and both keep settings in a `data` folder next to the exe, so a copy of Arke is self-contained:
 
-Prefer an installer? `arke-<version>-setup.exe` (or `arke-<version>-arm64-setup.exe`) installs Arke
-for your account without administrator approval, or for all users in Program Files, and adds it to
-the Start menu and to Settings › Apps, where you can uninstall it. Arke's updates keep working the
-same way.
+- **Portable**, `arke-<version>.exe`: a single exe with no runtime that runs from any folder. Nothing
+  is installed, so it isn't in the Start menu or in Settings › Apps; Settings › About › **Remove Arke
+  from this PC** removes it.
+- **Installer**, `arke-<version>-setup.exe`: installs Arke for your account without administrator
+  approval, or for all users in Program Files, and adds it to the Start menu and to Settings › Apps,
+  where you can uninstall it.
+
+On ARM64 PCs, use the `-arm64` files (`arke-<version>-arm64.exe`,
+`arke-<version>-arm64-setup.exe`).
 
 With [Scoop](https://scoop.sh):
 
@@ -206,6 +249,7 @@ ranks higher; turn it off or clear it in Settings › Search.
 | Keys | Action |
 | --- | --- |
 | Ctrl+T | Go to a folder (recent places, open tabs and paths) |
+| Ctrl+Shift+P | Command palette: search any command and run it; every shortcut can be changed in Settings › Keyboard shortcuts |
 | Ctrl+W · Ctrl+Shift+T | Close tab (in split view, the active side) · reopen closed tab |
 | Ctrl+Tab · Ctrl+Shift+Tab · Ctrl+1…9 | Switch tabs |
 | Ctrl+Shift+S · Ctrl+Shift+D | Dual pane: synchronized browsing · compare folders |
@@ -250,13 +294,13 @@ change is the optional "Open folders in Arke" setting, which registers Arke as t
 the shell opens, "Show in folder" of browsers and editors included, starts Arke instead of File
 Explorer; whatever Arke can't show, such as Control Panel, is handed straight to Explorer) and, only
 with "Win+E and the File Explorer icon open Arke too", the Win+E handler. Whatever was there before
-is saved to `<exe dir>\data\folder-handler-backup.json` and put back exactly when you turn the
+is saved to `%APPDATA%\Arke\folder-handler-backup.json` and put back exactly when you turn the
 setting off or run `arke --restore-explorer`. Arke also keeps watching for new Explorer windows for
 the cases the registration can't reach, such as `explorer.exe /select,...`. On PCs where Windows
 sends Win+E straight to File Explorer without asking the registration (a change Windows has been
 rolling out since late 2026), Arke takes Win+E with a keyboard hook while it runs in the background:
-it only reacts to E while a Windows key is held and records nothing. Settings, the search index, log and
-downloaded updates live in a `data` folder next to the exe. "Start when I sign in to Windows" is a shortcut in your Startup
+it only reacts to E while a Windows key is held and records nothing. Settings live in `%APPDATA%\Arke`, the search index, log and
+downloaded updates in `%LOCALAPPDATA%\Arke`. "Start when I sign in to Windows" is a shortcut in your Startup
 folder, and "Show Arke in the Start menu" one in your Start menu folder. Passwords for SFTP and WebDAV locations go to Windows Credential Manager, and only when
 you tick "Remember". The optional search service is the only part that needs administrator
 approval. The installer, if you use it, adds the uninstall entry Windows lists in Settings › Apps
@@ -270,7 +314,7 @@ all-users install.
 
 Settings › About › **Remove Arke from this PC**. It removes the search service if you installed it
 (Windows asks for administrator approval for that part), the Start menu and "Start when I sign in to
-Windows" shortcuts, saved SFTP and WebDAV passwords, the jump list, the `data` folder next to the exe
+Windows" shortcuts, saved SFTP and WebDAV passwords, the jump list, `%LOCALAPPDATA%\Arke`, `%APPDATA%\Arke`
 (unless you tick "Keep my settings") and finally the exe itself, then shows what it removed.
 
 From a terminal or a script: `arke --uninstall`, with `--keep-settings`, `--quiet` (no dialogs,
@@ -304,6 +348,15 @@ Windows (the MFT index, shell integration) are Windows-specific. Tell us in an i
 need.
 
 </details>
+
+## Reporting a problem
+
+The easiest way is from Arke: **Settings › About › Report a problem › Open an issue on GitHub**.
+It fills in your Arke and Windows versions, the main settings and the latest log lines, with your
+account, computer, server and file names taken out. You can also copy the report or save it as a
+file and send it another way, and **Show log file** opens the log itself.
+
+If Arke won't start, the log is `%LOCALAPPDATA%\Arke\arke.log`.
 
 ## Building from source
 

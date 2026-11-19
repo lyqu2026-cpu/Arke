@@ -16,7 +16,7 @@ use arke_core::NavKind;
 use arke_core::path::{PathMove, apply_move, path_move};
 use gpui::{
     AnimationExt, App, ClickEvent, Context, Entity, EventEmitter, Focusable, SharedString,
-    Subscription, Task, Window, div, prelude::*, px, svg,
+    Subscription, Task, Window, div, prelude::*, svg,
 };
 use rust_i18n::t;
 
@@ -41,8 +41,14 @@ pub(super) struct CompareState {
 impl Workspace {
     // --- Synchronized browsing ---
 
+    /// Turns synchronized browsing on or off. Not in a pinned tab: its panes keep their folders,
+    /// so there would be nothing to repeat.
     pub(super) fn toggle_sync(&mut self, tab_ix: usize, cx: &mut Context<Self>) {
-        if let Some(tab) = self.tabs.get_mut(tab_ix).filter(|t| t.is_split()) {
+        if let Some(tab) = self
+            .tabs
+            .get_mut(tab_ix)
+            .filter(|t| t.is_split() && !t.pinned)
+        {
             tab.synced = !tab.synced;
             // Start from where both panes are now.
             for pane in &mut tab.panes {
@@ -79,7 +85,7 @@ impl Workspace {
             }
             cx.notify();
         }
-        if !tab.synced || !tab.is_split() || pane_ix != tab.active_pane {
+        if !tab.synced || tab.pinned || !tab.is_split() || pane_ix != tab.active_pane {
             return;
         }
         let Some(step) = old.and_then(|old| path_move(&old, path)) else {
@@ -250,9 +256,17 @@ impl Workspace {
         let mut active = None;
         let mut first = None;
         for (ix, tab) in saved.tabs.iter().enumerate() {
+            // The same folders in another spelling (`C:\Work` and `c:\work\`) are the same tab.
             let already = tab
                 .pinned
-                .then(|| pinned.iter().find(|(_, p)| *p == tab.panes))
+                .then(|| {
+                    pinned.iter().find(|(_, p)| {
+                        p.len() == tab.panes.len()
+                            && p.iter()
+                                .zip(&tab.panes)
+                                .all(|(a, b)| crate::explorer::same_folder(a, b))
+                    })
+                })
                 .flatten();
             let id = match already {
                 Some((id, _)) => *id,
@@ -342,18 +356,18 @@ impl Workspace {
         div()
             .id("open-workspaces")
             .a11y_button(t!("workspaces.title"))
-            .size(theme::S_24)
+            .size(theme::s_24())
             .flex()
             .flex_none()
             .items_center()
             .justify_center()
-            .rounded(theme::R_4)
+            .rounded(theme::r_4())
             .cursor_pointer()
             .hover(|s| s.bg(theme::wash_strong()))
             .child(
                 svg()
                     .path(Icon::Workspaces.path())
-                    .size(theme::ICON)
+                    .size(theme::icon())
                     .text_color(theme::text_subtle()),
             )
             .on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
@@ -525,7 +539,7 @@ impl WorkspacesPanel {
             return div()
                 .flex()
                 .flex_col()
-                .gap(theme::S_4)
+                .gap(theme::s_4())
                 .child(field(&input, window, cx))
                 .children(self.rename_error.clone().map(error_text))
                 .into_any_element();
@@ -547,18 +561,18 @@ impl WorkspacesPanel {
                 crate::a11y::item_label(&spoken.0, &[&spoken.1])
             })
             .group(group.clone())
-            .h(theme::H_ROW)
-            .px(theme::S_8)
+            .h(theme::h_row())
+            .px(theme::s_8())
             .flex()
             .items_center()
-            .gap(theme::S_8)
-            .rounded(theme::R_8)
+            .gap(theme::s_8())
+            .rounded(theme::r_8())
             .cursor_pointer()
             .hover(|s| s.bg(theme::wash()))
             .child(
                 svg()
                     .path(Icon::Workspaces.path())
-                    .size(theme::ICON)
+                    .size(theme::icon())
                     .flex_none()
                     .text_color(theme::text_muted()),
             )
@@ -572,7 +586,7 @@ impl WorkspacesPanel {
             .child(
                 div()
                     .flex_none()
-                    .text_size(theme::FS_12)
+                    .text_size(theme::fs_12())
                     .text_color(theme::text_subtle())
                     .child(detail),
             )
@@ -580,7 +594,7 @@ impl WorkspacesPanel {
                 div()
                     .flex()
                     .flex_none()
-                    .gap(theme::S_2)
+                    .gap(theme::s_2())
                     .invisible()
                     .group_hover(group, gpui::Styled::visible)
                     .child(
@@ -612,11 +626,11 @@ pub(super) fn field(input: &Entity<TextInput>, window: &Window, cx: &App) -> imp
     div()
         .flex_1()
         .min_w_0()
-        .h(theme::H_CTL)
-        .px(theme::S_8)
+        .h(theme::h_ctl())
+        .px(theme::s_8())
         .flex()
         .items_center()
-        .rounded(theme::R_8)
+        .rounded(theme::r_8())
         .border_1()
         .when(focused, |d| {
             d.bg(theme::surface()).border_color(theme::signal_line())
@@ -629,7 +643,7 @@ pub(super) fn field(input: &Entity<TextInput>, window: &Window, cx: &App) -> imp
 
 pub(super) fn error_text(error: SharedString) -> impl IntoElement {
     div()
-        .text_size(theme::FS_12)
+        .text_size(theme::fs_12())
         .text_color(theme::danger())
         .child(error)
 }
@@ -643,16 +657,16 @@ fn row_button(
     div()
         .id(id)
         .a11y_button(tip.clone())
-        .size(theme::S_24)
+        .size(theme::s_24())
         .flex()
         .items_center()
         .justify_center()
-        .rounded(theme::R_4)
+        .rounded(theme::r_4())
         .hover(|s| s.bg(theme::wash_strong()))
         .child(
             svg()
                 .path(icon.path())
-                .size(theme::ICON)
+                .size(theme::icon())
                 .text_color(theme::text_subtle()),
         )
         .tooltip(crate::workspace::tooltip(tip))
@@ -683,20 +697,20 @@ impl Render for WorkspacesPanel {
             .id("workspaces-panel")
             .a11y(gpui::Role::Dialog, t!("workspaces.title"))
             .on_mouse_down(gpui::MouseButton::Left, |_, _, cx| cx.stop_propagation())
-            .w(px(440.))
-            .p(theme::S_20)
+            .w(crate::theme::scaled_px(440.))
+            .p(theme::s_20())
             .flex()
             .flex_col()
-            .gap(theme::S_12)
-            .rounded(theme::R_12)
+            .gap(theme::s_12())
+            .rounded(theme::r_12())
             .bg(theme::overlay())
             .shadow(theme::elev_3())
             .ui_font()
-            .text_size(theme::FS_14)
+            .text_size(theme::fs_14())
             .text_color(theme::text())
             .child(
                 div()
-                    .text_size(theme::FS_15)
+                    .text_size(theme::fs_15())
                     .font_weight(theme::FW_STRONG)
                     .child(t!("workspaces.title").into_owned()),
             )
@@ -709,7 +723,7 @@ impl Render for WorkspacesPanel {
                 div()
                     .flex()
                     .items_center()
-                    .gap(theme::S_8)
+                    .gap(theme::s_8())
                     .child(field(&self.name, window, cx))
                     .child(
                         div()
@@ -719,12 +733,12 @@ impl Render for WorkspacesPanel {
                             } else {
                                 t!("workspaces.save")
                             })
-                            .h(theme::H_CTL)
-                            .px(theme::S_16)
+                            .h(theme::h_ctl())
+                            .px(theme::s_16())
                             .flex()
                             .flex_none()
                             .items_center()
-                            .rounded(theme::R_8)
+                            .rounded(theme::r_8())
                             .cursor_pointer()
                             .bg(theme::signal())
                             .text_color(theme::on_signal())
@@ -739,8 +753,8 @@ impl Render for WorkspacesPanel {
             .children(self.error.clone().map(error_text))
             .child(
                 div()
-                    .pt(theme::S_4)
-                    .text_size(theme::FS_12)
+                    .pt(theme::s_4())
+                    .text_size(theme::fs_12())
                     .font_weight(theme::FW_STRONG)
                     .text_color(theme::text_muted())
                     .child(t!("workspaces.saved").into_owned()),
@@ -748,16 +762,16 @@ impl Render for WorkspacesPanel {
             .child(
                 div()
                     .id("workspaces-list")
-                    .max_h(px(320.))
+                    .max_h(crate::theme::scaled_px(320.))
                     .overflow_y_scroll()
                     .flex()
                     .flex_col()
-                    .gap(theme::S_2)
+                    .gap(theme::s_2())
                     .when(empty, |d| {
                         d.child(
                             div()
-                                .h(theme::H_ROW)
-                                .px(theme::S_8)
+                                .h(theme::h_row())
+                                .px(theme::s_8())
                                 .flex()
                                 .items_center()
                                 .text_color(theme::text_subtle())

@@ -116,6 +116,11 @@ impl Workspace {
         self.open_recycle(false, window, cx);
     }
 
+    #[cfg(test)]
+    pub(crate) fn close_recycle_for_test(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.close_recycle(window, cx);
+    }
+
     /// Pinned-list row for the Recycle Bin. Click opens it here (Ctrl or middle click: new tab).
     pub(super) fn render_recycle_row(&self, cx: &mut Context<Self>) -> AnyElement {
         let open = self.recycle_open();
@@ -125,7 +130,7 @@ impl Workspace {
                 SidebarAction::OpenRecycleInNewTab,
             ),
             (
-                t!("sidebar.unpin").to_string().into(),
+                t!("sidebar.remove_favorite").to_string().into(),
                 SidebarAction::SetRecyclePinned(false),
             ),
         ];
@@ -133,25 +138,25 @@ impl Workspace {
             .id("open-recycle")
             .a11y(gpui::Role::TreeItem, t!("recycle.title"))
             .aria_selected(open)
-            .h(theme::H_ROW)
+            .h(theme::h_row())
             .flex()
             .flex_none()
             .items_center()
-            .gap(theme::S_4)
-            .pl(theme::S_4)
-            .pr(theme::S_8)
-            .rounded(theme::R_8)
+            .gap(theme::s_4())
+            .pl(theme::s_4())
+            .pr(theme::s_8())
+            .rounded(theme::r_8())
             .cursor_pointer()
             // Shown in the active tab: marked like the current folder in the tree above.
             .relative()
             .when(open, |d| d.bg(theme::selection()))
             .when(!open, |d| d.hover(|s| s.bg(theme::wash())))
             // Same width as a tree chevron, so the icon lines up with the folders above.
-            .child(div().size(theme::S_20).flex_none())
+            .child(div().size(theme::s_20()).flex_none())
             .child(
                 svg()
                     .path(Icon::Trash.path())
-                    .size(theme::ICON)
+                    .size(theme::icon())
                     .flex_none()
                     .text_color(theme::text_muted()),
             )
@@ -160,7 +165,7 @@ impl Workspace {
                     .flex_1()
                     .min_w_0()
                     .truncate()
-                    .pl(theme::S_4)
+                    .pl(theme::s_4())
                     .child(t!("recycle.title").into_owned()),
             )
             .on_click(cx.listener(move |this, e: &ClickEvent, window, cx| {
@@ -196,38 +201,25 @@ impl Workspace {
             .recycle_page
             .as_ref()
             .filter(|p| self.shows(&p.owner))?;
-        let horizontal = Self::horizontal_tabs(cx);
         let pinned = SettingsStore::global(cx).read(cx).settings.recycle_pinned;
         let top_bar = div()
-            .h(theme::H_BAR)
+            .h(theme::h_bar())
             .flex_none()
             .flex()
             .items_center()
-            .gap(theme::S_2)
-            .pr(theme::S_8)
-            // With horizontal tabs the sidebar has no back button, so add one here.
-            .when(horizontal, |d| {
-                d.child(crate::explorer::ghost_button(
-                    "recycle-back",
-                    Icon::ArrowLeft,
-                    true,
-                    t!("nav.back"),
-                    cx.listener(|this, _: &ClickEvent, window, cx| {
-                        this.close_recycle(window, cx);
-                    }),
-                ))
-            })
+            .gap(theme::s_2())
+            .pr(theme::s_8())
             .child(
                 div()
                     .flex()
                     .flex_none()
                     .items_center()
-                    .gap(theme::S_8)
-                    .px(theme::S_8)
+                    .gap(theme::s_8())
+                    .px(theme::s_8())
                     .child(
                         svg()
                             .path(Icon::Trash.path())
-                            .size(theme::ICON)
+                            .size(theme::icon())
                             .text_color(theme::text_muted()),
                     )
                     .child(
@@ -243,13 +235,11 @@ impl Workspace {
                     "recycle-pin",
                     Icon::Pin,
                     true,
-                    t!("sidebar.pin"),
+                    t!("sidebar.add_favorite"),
                     |_: &ClickEvent, _: &mut Window, cx: &mut App| Self::set_recycle_pinned(true, cx),
                 ))
             })
-            .when(!horizontal, |d| {
-                d.child(crate::explorer::caption_buttons(window))
-            });
+            .child(crate::explorer::caption_buttons(window));
         Some(
             div()
                 .id("recycle-page")
@@ -259,6 +249,7 @@ impl Workspace {
                 .flex()
                 .flex_col()
                 .child(top_bar)
+                .children(self.tab_strip_under_bar(window, cx))
                 .child(
                     // Same paper surface as the file list.
                     div()
@@ -267,9 +258,9 @@ impl Workspace {
                         .flex_col()
                         .flex_1()
                         .min_h_0()
-                        .mr(theme::S_8)
-                        .mb(theme::S_8)
-                        .rounded(theme::R_12)
+                        .mr(theme::s_8())
+                        .mb(theme::s_8())
+                        .rounded(theme::r_12())
                         .bg(theme::paper())
                         .shadow(theme::elev_2())
                         .overflow_hidden()

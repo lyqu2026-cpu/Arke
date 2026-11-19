@@ -19,7 +19,7 @@ use std::sync::Arc;
 use gpui::{
     Animation, AnimationExt, AnyElement, App, ClickEvent, Context, Entity, FocusHandle, Focusable,
     KeyBinding, ScrollHandle, SharedString, Subscription, UniformListScrollHandle, WeakEntity,
-    Window, actions, anchored, deferred, div, point, prelude::*, px, svg, uniform_list,
+    Window, actions, anchored, canvas, deferred, div, point, prelude::*, px, svg, uniform_list,
 };
 use rust_i18n::t;
 
@@ -29,11 +29,11 @@ use crate::assets::Icon;
 use crate::explorer::ViewMode;
 use crate::scrollbar::ScrollbarDrag;
 use crate::settings::{
-    Accent, Density, FolderOrder, Language, Material, NavScope, Settings, SettingsStore, SortBy,
-    StartLocation, TabLayout, ThemeMode, Tint,
+    Accent, DarkShade, Density, FolderOrder, Language, Material, NavScope, NewTabAction, Settings,
+    SettingsStore, SortBy, StartLocation, TabLayout, ThemeMode, Tint,
 };
 use crate::text_input::{InputEvent, TextInput};
-use crate::theme;
+use crate::theme::{self, UiFont as _};
 
 actions!(
     workspace,
@@ -48,12 +48,18 @@ actions!(
 
 /// Max width of the card column, centered in the content area so wide windows don't leave one
 /// side empty.
-const PAGE_MAX_W: gpui::Pixels = px(1000.);
+fn page_max_w() -> gpui::Pixels {
+    crate::theme::scaled_px(1000.)
+}
 /// Minimum row height on every settings page (one or two lines of text), matching Windows 11
 /// Settings.
-pub(super) const CARD_MIN_H: gpui::Pixels = px(64.);
+pub(super) fn card_min_h() -> gpui::Pixels {
+    crate::theme::scaled_px(64.)
+}
 /// Width of the icon column at the start of each row, so titles line up whatever the icon.
-pub(super) const ICON_COL: gpui::Pixels = px(20.);
+pub(super) fn icon_col() -> gpui::Pixels {
+    crate::theme::scaled_px(20.)
+}
 
 pub(super) fn bind_keys(cx: &mut App) {
     cx.bind_keys([
@@ -72,6 +78,9 @@ pub(super) struct SettingsPage {
     pub(super) owner: super::pages::Owner,
     scroll: ScrollHandle,
     scrollbar_drag: ScrollbarDrag,
+    /// The report text box in About › Report a problem, which scrolls inside the page.
+    pub(super) report_scroll: ScrollHandle,
+    pub(super) report_scrollbar: ScrollbarDrag,
     /// Accent hex input (`#RRGGBB`).
     accent_input: Entity<TextInput>,
     _accent_input: Subscription,
@@ -90,11 +99,20 @@ pub(super) struct SettingsPage {
     /// Path input for adding an "Open with" app.
     pub(super) app_input: Entity<TextInput>,
     _app_input: Subscription,
+    /// Keyboard shortcuts: search and the key being recorded.
+    pub(super) shortcuts: super::shortcuts::Page,
     pub(super) backup: Option<super::backup::BackupNote>,
     /// Open dropdown.
     dropdown: Option<Dropdown>,
     /// Scroll position of a long dropdown list (fonts), so the open list can show the selection.
     list_scroll: UniformListScrollHandle,
+    /// The open dropdown's list, as last drawn, for the window it is shown in.
+    dropdown_panel: Rc<std::cell::RefCell<Option<PanelBuilder>>>,
+    /// Which dropdown it is (`Single::serial`), 0 while none is open.
+    dropdown_shown: Rc<std::cell::Cell<u64>>,
+    /// Where each dropdown's button is in the window.
+    dropdown_buttons:
+        Rc<std::cell::RefCell<std::collections::HashMap<&'static str, gpui::Bounds<gpui::Pixels>>>>,
     /// Thumbnail of the background image, decoded in the background when it changes.
     backdrop: Option<BackdropThumb>,
     /// Whether the opacity slider is being dragged.
@@ -116,7 +134,9 @@ struct BackdropThumb {
 const BACKDROP_THUMB: (f32, f32) = (160., 100.);
 /// Decoded size: twice the thumbnail, for high-DPI screens.
 const BACKDROP_THUMB_PX: u32 = 320;
-const SLIDER_W: gpui::Pixels = px(240.);
+fn slider_w() -> gpui::Pixels {
+    crate::theme::scaled_px(240.)
+}
 
 /// What a Browse button picks.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -171,8 +191,17 @@ type OptionFont = std::rc::Rc<dyn Fn(usize) -> Option<SharedString>>;
 struct Dropdown {
     id: &'static str,
     cursor: usize,
+    /// Whether the cursor is shown: only once an arrow key moved it. Opened with the mouse, the
+    /// row under the pointer is the only one lit, as in a Windows combo box; the current row lit
+    /// next to the hovered one read as two selections.
+    keyboard: bool,
     options: Vec<Applier>,
+    /// The window its list is drawn in (`popup.rs`).
+    popup: crate::popup::Single,
 }
+
+/// Draws an open dropdown's list.
+type PanelBuilder = Rc<dyn Fn(&mut Window, &mut App) -> AnyElement>;
 
 /// Slide distance for the page's small animations (dropdowns, expanders, category changes). See
 /// `motion.rs`.
@@ -189,25 +218,42 @@ thread_local! {
 }
 
 /// Below this window width the category list shows icons only.
-const NAV_COMPACT_BELOW: gpui::Pixels = px(1040.);
-const NAV_W: gpui::Pixels = px(208.);
-const NAV_W_COMPACT: gpui::Pixels = px(56.);
+fn nav_compact_below() -> gpui::Pixels {
+    crate::theme::scaled_px(1040.)
+}
+fn nav_w() -> gpui::Pixels {
+    crate::theme::scaled_px(208.)
+}
+fn nav_w_compact() -> gpui::Pixels {
+    crate::theme::scaled_px(56.)
+}
 /// Minimum width of dropdown buttons and lists.
-const DROPDOWN_MIN_W: gpui::Pixels = px(148.);
-const DROPDOWN_MAX_H: gpui::Pixels = px(340.);
+fn dropdown_min_w() -> gpui::Pixels {
+    crate::theme::scaled_px(148.)
+}
+fn dropdown_max_h() -> gpui::Pixels {
+    crate::theme::scaled_px(340.)
+}
 /// Lists longer than this only build the rows in view (hundreds of fonts, each in its own font).
 const LONG_LIST: usize = 12;
 /// Width of the font list, which shows a sample next to each name.
-const FONT_LIST_W: gpui::Pixels = px(380.);
+fn font_list_w() -> gpui::Pixels {
+    crate::theme::scaled_px(380.)
+}
 
 /// Context for drawing controls: the open dropdown, who to update, and the viewport size
 /// (the outside layer has to cover it).
 pub(super) struct Ui {
-    /// Open dropdown and the keyboard cursor in it.
-    open: Option<(&'static str, usize)>,
+    /// Open dropdown and the keyboard cursor in it, while shown.
+    open: Option<(&'static str, Option<usize>)>,
     workspace: WeakEntity<Workspace>,
     viewport: gpui::Size<gpui::Pixels>,
     list_scroll: UniformListScrollHandle,
+    /// The open dropdown puts its list here.
+    panel: Rc<std::cell::RefCell<Option<PanelBuilder>>>,
+    /// Every dropdown records where its button is.
+    buttons:
+        Rc<std::cell::RefCell<std::collections::HashMap<&'static str, gpui::Bounds<gpui::Pixels>>>>,
 }
 
 /// Opens (`Some`) or closes the dropdown.
@@ -230,7 +276,7 @@ fn accent_color(accent: Accent) -> u32 {
 }
 
 /// Index of the About category; the "Import Arke settings" context menu opens it directly.
-pub(super) const ABOUT: usize = 6;
+pub(super) const ABOUT: usize = 7;
 
 /// Changes a setting: applies now, saves in the background shortly after.
 pub(super) fn set(cx: &mut App, f: impl FnOnce(&mut Settings)) {
@@ -244,6 +290,8 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        // QuickLook may have been started (or quit) since the last check.
+        Self::recheck_quicklook(cx);
         // Already open: switch to that tab.
         let existing = self.settings_panel.as_ref().map(|p| p.owner.clone());
         if self.go_to_page(existing.as_ref(), window, cx) {
@@ -278,6 +326,7 @@ impl Workspace {
         let import_sub = cx.subscribe_in(&import_input, window, Self::on_import_input);
         let app_input = cx.new(|cx| TextInput::new(t!("openwith.placeholder").to_string(), cx));
         let app_sub = cx.subscribe_in(&app_input, window, Self::on_app_input);
+        let shortcuts = super::shortcuts::Page::new(window, cx);
         // List fonts in the background; there can be hundreds.
         let text_system = Arc::clone(cx.text_system());
         cx.spawn(async move |this, cx| {
@@ -304,6 +353,8 @@ impl Workspace {
             owner,
             scroll: ScrollHandle::new(),
             scrollbar_drag: ScrollbarDrag::default(),
+            report_scroll: ScrollHandle::new(),
+            report_scrollbar: ScrollbarDrag::default(),
             accent_input,
             _accent_input: accent_sub,
             image_input,
@@ -317,9 +368,13 @@ impl Workspace {
             _import_input: import_sub,
             app_input,
             _app_input: app_sub,
+            shortcuts,
             backup: None,
             dropdown: None,
             list_scroll: UniformListScrollHandle::new(),
+            dropdown_panel: Rc::default(),
+            dropdown_shown: Rc::default(),
+            dropdown_buttons: Rc::default(),
             backdrop: None,
             slider_drag: std::rc::Rc::default(),
             uninstall: None,
@@ -484,6 +539,7 @@ impl Workspace {
             t!("settings.startup"),
             t!("settings.search"),
             t!("settings.context_menu"),
+            t!("settings.shortcuts"),
             t!("settings.about"),
         ];
         let ix = titles
@@ -494,6 +550,56 @@ impl Workspace {
             page.category = ix;
         }
         cx.notify();
+    }
+
+    /// Opens a card that expands, by its id.
+    #[cfg(test)]
+    pub(crate) fn expand_settings_card_for_test(
+        &mut self,
+        id: &'static str,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(page) = &mut self.settings_panel {
+            page.expanded.insert(id);
+        }
+        cx.notify();
+    }
+
+    /// Vertical scroll offsets of the settings page and of the report text box.
+    #[cfg(test)]
+    pub(crate) fn settings_scroll_for_test(&self) -> Option<(gpui::Pixels, gpui::Pixels)> {
+        self.settings_panel
+            .as_ref()
+            .map(|p| (p.scroll.offset().y, p.report_scroll.offset().y))
+    }
+
+    /// The open dropdown's list as placed on the screen (physical pixels), once placed.
+    #[cfg(test)]
+    pub(crate) fn settings_dropdown_placed_for_test(&self) -> Option<crate::popup::ScreenRect> {
+        self.settings_panel
+            .as_ref()?
+            .dropdown
+            .as_ref()?
+            .popup
+            .placed()
+    }
+
+    /// The open dropdown's list as last drawn on the screen (physical pixels).
+    #[cfg(test)]
+    pub(crate) fn settings_dropdown_drawn_for_test(&self) -> Option<crate::popup::ScreenRect> {
+        self.settings_panel
+            .as_ref()?
+            .dropdown
+            .as_ref()?
+            .popup
+            .drawn_on_screen()
+    }
+
+    /// The open dropdown's keyboard cursor and whether it is shown.
+    #[cfg(test)]
+    pub(crate) fn settings_dropdown_cursor_for_test(&self) -> Option<(usize, bool)> {
+        let dropdown = self.settings_panel.as_ref()?.dropdown.as_ref()?;
+        Some((dropdown.cursor, dropdown.keyboard))
     }
 
     /// Presses Browse on the background image card (`image`) or the Open-with card.
@@ -590,6 +696,65 @@ impl Workspace {
         }
     }
 
+    /// After the page drew: the open dropdown's list is shown in a window of its own under its
+    /// button (`popup.rs`), redrawn with what the page just drew.
+    pub(super) fn sync_dropdown_popup(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        // The list shown last frame draws again after this one: with the rows the page draws
+        // now, or not at all once its dropdown (or the page) closed, and its window goes.
+        if let Some(popup) = self.dropdown_window.take() {
+            App::defer(cx, move |cx| {
+                let _ = popup.update(cx, |_, window, _| window.refresh());
+            });
+        }
+        let Some(page) = self.settings_panel.as_mut() else {
+            return;
+        };
+        page.dropdown_shown
+            .set(page.dropdown.as_ref().map_or(0, |d| d.popup.serial()));
+        let Some(dropdown) = page.dropdown.as_mut() else {
+            return;
+        };
+        let Some(button) = page.dropdown_buttons.borrow().get(dropdown.id).copied() else {
+            return;
+        };
+        let control = crate::popup::rect_to_screen(window, button);
+        let content: crate::popup::Content = {
+            let panel = Rc::downgrade(&page.dropdown_panel);
+            let shown = Rc::downgrade(&page.dropdown_shown);
+            let serial = dropdown.popup.serial();
+            Rc::new(move |_, window, cx| {
+                if shown.upgrade()?.get() != serial {
+                    return None;
+                }
+                let build = panel.upgrade()?.borrow().clone()?;
+                Some(build(window, cx))
+            })
+        };
+        dropdown.popup.ensure_handed(
+            || crate::popup::Anchor::Below {
+                control,
+                align_right: true,
+            },
+            |this: &mut Self| {
+                this.settings_panel
+                    .as_mut()?
+                    .dropdown
+                    .as_mut()
+                    .map(|d| &mut d.popup)
+            },
+            content,
+            |this, _, cx| {
+                if let Some(page) = this.settings_panel.as_mut() {
+                    page.dropdown = None;
+                }
+                cx.notify();
+            },
+            window,
+            cx,
+        );
+        self.dropdown_window = page.dropdown.as_ref().and_then(|d| d.popup.window());
+    }
+
     /// Arrow keys move and Enter selects while a dropdown is open.
     fn dropdown_move(&mut self, down: bool, cx: &mut Context<Self>) {
         let Some(dropdown) = self
@@ -600,6 +765,7 @@ impl Workspace {
             return;
         };
         let last = dropdown.options.len().saturating_sub(1);
+        dropdown.keyboard = true;
         dropdown.cursor = if down {
             (dropdown.cursor + 1).min(last)
         } else {
@@ -662,14 +828,14 @@ impl Workspace {
             .a11y(gpui::Role::Link, t!("settings.title"))
             .relative()
             .flex_none()
-            .h(theme::H_ROW)
-            .mx(theme::S_8)
-            .mb(theme::S_8)
-            .pl(theme::S_8)
+            .h(theme::h_row())
+            .mx(theme::s_8())
+            .mb(theme::s_8())
+            .pl(theme::s_8())
             .flex()
             .items_center()
-            .gap(theme::S_8)
-            .rounded(theme::R_8)
+            .gap(theme::s_8())
+            .rounded(theme::r_8())
             .cursor_pointer()
             .when(open, |d| {
                 d.text_color(theme::text())
@@ -682,7 +848,7 @@ impl Workspace {
             .child(
                 svg()
                     .path(Icon::Settings.path())
-                    .size(theme::ICON)
+                    .size(theme::icon())
                     .text_color(if open {
                         theme::text()
                     } else {
@@ -717,19 +883,19 @@ impl Workspace {
             .filter(|p| self.shows(&p.owner))?;
         let s = SettingsStore::global(cx).read(cx).settings.clone();
         let top_bar = Self::render_settings_top_bar(window, cx);
-        let compact = self.last_viewport_width < NAV_COMPACT_BELOW;
+        let compact = self.last_viewport_width < nav_compact_below();
         let mut categories = Self::settings_sections(&s, page, window, cx);
         let selected = page.category.min(categories.len().saturating_sub(1));
         let nav = div()
             .id("settings-nav")
             .a11y(gpui::Role::TabList, t!("settings.title"))
             .flex_none()
-            .w(if compact { NAV_W_COMPACT } else { NAV_W })
+            .w(if compact { nav_w_compact() } else { nav_w() })
             .h_full()
-            .p(theme::S_8)
+            .p(theme::s_8())
             .flex()
             .flex_col()
-            .gap(theme::S_2)
+            .gap(theme::s_2())
             .border_r_1()
             .border_color(theme::line())
             .children(
@@ -743,12 +909,12 @@ impl Workspace {
                             .a11y_lazy(gpui::Role::Tab, || title.to_string())
                             .aria_selected(on)
                             .relative()
-                            .h(theme::H_ROW + theme::S_4)
-                            .px(theme::S_12)
+                            .h(theme::h_row() + theme::s_4())
+                            .px(theme::s_12())
                             .flex()
                             .items_center()
-                            .gap(theme::S_12)
-                            .rounded(theme::R_8)
+                            .gap(theme::s_12())
+                            .rounded(theme::r_8())
                             .cursor_pointer()
                             .when(on, |d| d.bg(theme::selection()))
                             .when(!on, |d| {
@@ -760,7 +926,7 @@ impl Workspace {
                                 svg()
                                     .path(icon.path())
                                     .flex_none()
-                                    .size(theme::ICON)
+                                    .size(theme::icon())
                                     .text_color(if on {
                                         theme::text()
                                     } else {
@@ -805,22 +971,22 @@ impl Workspace {
                 // Centered column with symmetric padding.
                 div()
                     .w_full()
-                    .px(theme::S_32)
-                    .pt(theme::S_24)
-                    .pb(theme::S_32)
+                    .px(theme::s_32())
+                    .pt(theme::s_24())
+                    .pb(theme::s_32())
                     .flex()
                     .justify_center()
                     .child(
                         div()
                             .w_full()
-                            .max_w(PAGE_MAX_W)
+                            .max_w(page_max_w())
                             .flex()
                             .flex_col()
-                            .gap(theme::S_4)
+                            .gap(theme::s_4())
                             .child(
                                 div()
-                                    .pb(theme::S_4)
-                                    .text_size(theme::FS_24)
+                                    .pb(theme::s_4())
+                                    .text_size(theme::fs_24())
                                     .font_weight(theme::FW_STRONG)
                                     .child(title.into_owned()),
                             )
@@ -828,7 +994,7 @@ impl Workspace {
                                 div()
                                     .flex()
                                     .flex_col()
-                                    .gap(theme::S_8)
+                                    .gap(theme::s_8())
                                     .children(cards)
                                     .with_animation(
                                         ("settings-category-body", selected),
@@ -854,6 +1020,7 @@ impl Workspace {
                 .flex()
                 .flex_col()
                 .child(top_bar)
+                .children(self.tab_strip_under_bar(window, cx))
                 .child(
                     // Same paper surface as the file list.
                     div()
@@ -862,9 +1029,9 @@ impl Workspace {
                         .flex_col()
                         .flex_1()
                         .min_h_0()
-                        .mr(theme::S_8)
-                        .mb(theme::S_8)
-                        .rounded(theme::R_12)
+                        .mr(theme::s_8())
+                        .mb(theme::s_8())
+                        .rounded(theme::r_12())
                         .bg(theme::paper())
                         .shadow(theme::elev_2())
                         .overflow_hidden()
@@ -885,42 +1052,29 @@ impl Workspace {
         )
     }
 
-    /// Settings top bar: back button (horizontal tabs only), title, drag area, caption buttons.
+    /// Settings top bar: title, drag area, caption buttons.
     fn render_settings_top_bar(
         window: &Window,
         cx: &mut Context<Self>,
     ) -> impl IntoElement + use<> {
-        let horizontal = Self::horizontal_tabs(cx);
         div()
-            .h(theme::H_BAR)
+            .h(theme::h_bar())
             .flex_none()
             .flex()
             .items_center()
-            .gap(theme::S_2)
-            .pr(theme::S_8)
-            // With horizontal tabs the sidebar has no back button, so add one here.
-            .when(horizontal, |d| {
-                d.child(crate::explorer::ghost_button(
-                    "settings-back",
-                    Icon::ArrowLeft,
-                    true,
-                    t!("nav.back"),
-                    cx.listener(|this, _: &ClickEvent, window, cx| {
-                        this.close_settings(&CloseSettings, window, cx);
-                    }),
-                ))
-            })
+            .gap(theme::s_2())
+            .pr(theme::s_8())
             .child(
                 div()
                     .flex()
                     .flex_none()
                     .items_center()
-                    .gap(theme::S_8)
-                    .px(theme::S_8)
+                    .gap(theme::s_8())
+                    .px(theme::s_8())
                     .child(
                         svg()
                             .path(Icon::Settings.path())
-                            .size(theme::ICON)
+                            .size(theme::icon())
                             .text_color(theme::text_muted()),
                     )
                     .child(
@@ -930,9 +1084,7 @@ impl Workspace {
                     ),
             )
             .child(super::drag_area("settings-drag", cx).flex_1().h_full())
-            .when(!horizontal, |d| {
-                d.child(crate::explorer::caption_buttons(window))
-            })
+            .child(crate::explorer::caption_buttons(window))
     }
 
     /// Each category (name, icon) and its cards.
@@ -947,10 +1099,15 @@ impl Workspace {
         cx: &mut Context<Self>,
     ) -> Vec<(Cow<'static, str>, Icon, Vec<AnyElement>)> {
         let ui = Ui {
-            open: page.dropdown.as_ref().map(|d| (d.id, d.cursor)),
+            open: page
+                .dropdown
+                .as_ref()
+                .map(|d| (d.id, d.keyboard.then_some(d.cursor))),
             workspace: cx.entity().downgrade(),
             viewport: window.viewport_size(),
             list_scroll: page.list_scroll.clone(),
+            panel: Rc::clone(&page.dropdown_panel),
+            buttons: Rc::clone(&page.dropdown_buttons),
         };
         let ui = &ui;
         let material = theme::mica_available().then(|| {
@@ -976,7 +1133,7 @@ impl Workspace {
             Icon::Theme,
             t!("settings.theme"),
             t!("settings.theme_desc"),
-            text_summary(theme_label(s.theme)),
+            text_summary(theme_label(s.theme, s.dark_shade)),
             page.expanded.contains("theme"),
             theme_body(s),
             cx,
@@ -1014,37 +1171,38 @@ impl Workspace {
                 cx,
             ),
             font_card(s, &page.fonts, ui),
-            card(
-                Icon::Density,
-                t!("settings.density"),
-                None,
-                choice(
-                    "density",
-                    &[
-                        (Density::Compact, t!("density.compact")),
-                        (Density::Standard, t!("density.standard")),
-                        (Density::Comfortable, t!("density.comfortable")),
-                    ],
-                    s.density,
-                    |st, v| st.density = v,
-                    ui,
-                ),
-            ),
-            card(
-                Icon::TabsSide,
-                t!("settings.tabs"),
-                None,
-                choice(
-                    "tabs",
-                    &[
-                        (TabLayout::Vertical, t!("settings.tabs_side")),
-                        (TabLayout::Horizontal, t!("settings.tabs_top")),
-                    ],
-                    s.tab_layout,
-                    |st, v| st.tab_layout = v,
-                    ui,
-                ),
-            ),
+            // One card, each choice on a row of its own with its name (#230).
+            div()
+                .flex()
+                .flex_col()
+                .child(card(
+                    Icon::Density,
+                    t!("settings.ui_scale"),
+                    None,
+                    choice(
+                        "ui-scale",
+                        &theme::SCALES.map(|pct| (pct, Cow::Owned(format!("{pct}%")))),
+                        s.ui_scale,
+                        |st, v: u32| st.ui_scale = v,
+                        ui,
+                    ),
+                ))
+                .child(sub_row(
+                    t!("settings.list_density"),
+                    choice(
+                        "density",
+                        &[
+                            (Density::Compact, t!("density.compact")),
+                            (Density::Standard, t!("density.standard")),
+                            (Density::Comfortable, t!("density.comfortable")),
+                        ],
+                        s.density,
+                        |st, v| st.density = v,
+                        ui,
+                    ),
+                ))
+                .into_any_element(),
+            tabs_card(s, ui),
             card(
                 Icon::Globe,
                 t!("settings.language"),
@@ -1117,9 +1275,7 @@ impl Workspace {
                 Icon::Image,
                 t!("settings.show_thumbnails"),
                 Some(t!("settings.show_thumbnails_desc")),
-                switch("show-thumbnails", s.show_thumbnails, |st| {
-                    st.show_thumbnails = !st.show_thumbnails;
-                }),
+                thumbnail_controls(s, cx),
             ),
             card(
                 Icon::NetDrive,
@@ -1165,9 +1321,7 @@ impl Workspace {
                 Icon::Preview,
                 t!("settings.preview"),
                 Some(t!("settings.preview_desc")),
-                switch("preview", s.preview_pane, |st| {
-                    st.preview_pane = !st.preview_pane;
-                }),
+                preview_controls(s),
             ),
             card(
                 Icon::ArrowLeft,
@@ -1406,10 +1560,10 @@ impl Workspace {
             ),
             card(
                 Icon::TabOpen,
-                t!("settings.external_tab"),
-                Some(t!("settings.external_tab_desc")),
-                switch("external-tab", s.open_external_in_tab, |st| {
-                    st.open_external_in_tab = !st.open_external_in_tab;
+                t!("settings.single_window"),
+                Some(t!("settings.single_window_desc")),
+                switch("single-window", s.single_window, |st| {
+                    st.single_window = !st.single_window;
                 }),
             ),
         ];
@@ -1417,9 +1571,14 @@ impl Workspace {
         if crate::update::installed_by_setup() {
             startup.remove(0);
         }
-        let search = search_page(s, page, ui, cx);
+        let search = search_page(s, cx);
         let update = super::update_page::update_card(s, page.expanded.contains("update"), ui, cx);
-        let report = super::report_page::report_card(page.expanded.contains("report"), cx);
+        let report = super::report_page::report_card(
+            page.expanded.contains("report"),
+            &page.report_scroll,
+            &page.report_scrollbar,
+            cx,
+        );
         let backup_open = page.expanded.contains("backup");
         let backup =
             super::backup::backup_body(page.backup.as_ref(), &page.import_input, window, cx);
@@ -1507,11 +1666,47 @@ impl Workspace {
                 Icon::Menu,
                 super::menuprefs::menu_section(s, &page.app_input, window, cx),
             ),
+            (
+                t!("settings.shortcuts"),
+                Icon::Bolt,
+                super::shortcuts::section(&s.shortcuts, &page.shortcuts, window, cx),
+            ),
             (t!("settings.about"), Icon::Info, about),
         ]
     }
 
+    /// Checks again whether QuickLook is running or installed, in the background, and redraws if
+    /// that changes what Settings offers. Cheap (see `quicklook.rs`), so it runs on every window
+    /// activation.
+    pub(super) fn recheck_quicklook(cx: &mut Context<Self>) {
+        // A thread of its own: the search may set up COM to read shortcuts.
+        let (tx, rx) = flume::bounded(1);
+        crate::explorer::spawn_thread("quicklook-recheck", move || {
+            let _ = tx.send(crate::quicklook::recheck());
+        });
+        cx.spawn(async move |this, cx| {
+            if rx.recv_async().await.unwrap_or(false) {
+                let _ = this.update(cx, |_, cx| cx.notify());
+            }
+        })
+        .detach();
+    }
+
     /// "Open folder": selects the settings file in Windows Explorer, on a background thread.
+    /// Deletes the thumbnail cache in the background, then redraws (the button goes away).
+    fn clear_thumbnail_cache(cx: &mut Context<Self>) {
+        cx.spawn(async move |this, cx| {
+            let cleared = cx
+                .background_spawn(async { crate::media::thumb_cache().clear() })
+                .await;
+            if let Err(err) = cleared {
+                log::warn!("clearing the thumbnail cache: {err}");
+            }
+            let _ = this.update(cx, |_, cx| cx.notify());
+        })
+        .detach();
+    }
+
     fn reveal_settings_file(&self, cx: &mut Context<Self>) {
         let Some(path) = crate::settings::default_path() else {
             return;
@@ -1523,35 +1718,170 @@ impl Workspace {
     }
 }
 
+/// "Show thumbnails": the switch, with "Clear cache (size)" beside it while the cache holds
+/// anything (the size is counted at startup, off the UI thread).
+fn thumbnail_controls(s: &crate::settings::Settings, cx: &mut Context<Workspace>) -> AnyElement {
+    let toggle = switch("show-thumbnails", s.show_thumbnails, |st| {
+        st.show_thumbnails = !st.show_thumbnails;
+    });
+    let Some(bytes) = crate::media::thumb_cache()
+        .counted_disk_bytes()
+        .filter(|&b| b > 0)
+    else {
+        return toggle;
+    };
+    let size = arke_core::format::format_size_base(bytes, s.decimal_sizes);
+    div()
+        .flex()
+        .items_center()
+        .gap(theme::s_12())
+        .child(text_button(
+            "clear-thumbnail-cache",
+            t!("settings.clear_thumbnail_cache", size = size),
+            cx.listener(|_, _: &ClickEvent, _, cx| Workspace::clear_thumbnail_cache(cx)),
+        ))
+        .child(toggle)
+        .into_any_element()
+}
+
+/// A line under a card's title row for one more of its choices: lined up with the title, without
+/// an icon of its own.
+fn sub_row(title: Cow<'static, str>, control: AnyElement) -> gpui::Div {
+    let a11y = crate::a11y::active();
+    let title = SharedString::from(title.into_owned());
+    div()
+        .pl(theme::s_16() + icon_col() + theme::s_16())
+        .pr(theme::s_16())
+        .pb(theme::s_12())
+        .flex()
+        .items_center()
+        .gap(theme::s_16())
+        .when(a11y, |d| d.child(crate::a11y::label_scope(title.clone())))
+        .child(row_text(title, None))
+        .child(div().flex_none().child(control))
+        .when(a11y, |d| d.child(crate::a11y::end_label_scope()))
+}
+
+/// Tabs: where they go, then two lines under it for one tab per folder and what Ctrl+T does
+/// (#90), all in one card.
+fn tabs_card(s: &Settings, ui: &Ui) -> AnyElement {
+    div()
+        .flex()
+        .flex_col()
+        .child(card(
+            Icon::TabsSide,
+            t!("settings.tabs"),
+            None,
+            choice(
+                "tabs",
+                &[
+                    (TabLayout::Vertical, t!("settings.tabs_side")),
+                    (TabLayout::Horizontal, t!("settings.tabs_top")),
+                ],
+                s.tab_layout,
+                |st, v| st.tab_layout = v,
+                ui,
+            ),
+        ))
+        .child(sub_row(
+            t!("settings.one_tab_per_folder"),
+            switch("one-tab-per-folder", s.one_tab_per_folder, |st| {
+                st.one_tab_per_folder = !st.one_tab_per_folder;
+            }),
+        ))
+        .child(sub_row(
+            t!("settings.new_tab"),
+            choice(
+                "new-tab",
+                &[
+                    (NewTabAction::GoToFolder, t!("settings.new_tab_box")),
+                    (NewTabAction::Home, t!("settings.new_tab_home")),
+                    (NewTabAction::CurrentFolder, t!("settings.new_tab_here")),
+                ],
+                s.new_tab,
+                |st, v| st.new_tab = v,
+                ui,
+            ),
+        ))
+        .into_any_element()
+}
+
+/// The preview pane switch, and when QuickLook (QL-Win) is running or installed, a chip beside it
+/// that hands Space to QuickLook (kept in this row rather than a row of its own).
+fn preview_controls(s: &crate::settings::Settings) -> AnyElement {
+    let toggle = switch("preview", s.preview_pane, |st| {
+        st.preview_pane = !st.preview_pane;
+    });
+    if !crate::quicklook::available() {
+        return toggle;
+    }
+    let on = s.space_quicklook;
+    let tip = SharedString::from(match crate::quicklook::exe() {
+        Some(exe) => t!("settings.space_quicklook_tip", path = exe.display()).into_owned(),
+        None => t!("settings.space_quicklook_tip_running").into_owned(),
+    });
+    let chip = div()
+        .id("space-quicklook")
+        .a11y_toggle(tip.clone(), on)
+        .h(theme::s_24())
+        .px(theme::s_12())
+        .flex()
+        .items_center()
+        .rounded(theme::R_FULL)
+        .border_1()
+        .cursor_pointer()
+        .text_size(theme::fs_12())
+        .tooltip(super::tooltip(tip))
+        .when(on, |d| {
+            d.bg(theme::signal_wash())
+                .border_color(theme::signal_line())
+                .text_color(theme::text())
+        })
+        .when(!on, |d| {
+            d.border_color(theme::line_strong())
+                .text_color(theme::text_subtle())
+                .hover(|s| s.bg(theme::wash()))
+        })
+        .child(t!("settings.space_quicklook").into_owned())
+        .on_click(|_, _, cx| set(cx, |st| st.space_quicklook = !st.space_quicklook));
+    div()
+        .flex()
+        .items_center()
+        .gap(theme::s_12())
+        .child(chip)
+        .child(toggle)
+        .into_any_element()
+}
+
 /// About header: the app mark, the name and the version. The only place the version is shown.
 fn about_header() -> AnyElement {
     div()
-        .pt(theme::S_8)
-        .pb(theme::S_16)
-        .px(theme::S_4)
+        .pt(theme::s_8())
+        .pb(theme::s_16())
+        .px(theme::s_4())
         .flex()
         .items_center()
-        .gap(theme::S_16)
+        .gap(theme::s_16())
         .child(crate::brand::about_mark())
         .child(
             div()
                 .flex()
                 .flex_col()
-                .gap(theme::S_2)
+                .gap(theme::s_2())
                 .child(
                     div()
-                        .text_size(theme::FS_20)
+                        .text_size(theme::fs_20())
                         .font_weight(theme::FW_STRONG)
                         .child("Arke"),
                 )
                 .child(
                     div()
-                        .text_size(theme::FS_13)
+                        .text_size(theme::fs_13())
                         .child(t!("settings.about_tagline").into_owned()),
                 )
                 .child(
                     div()
-                        .text_size(theme::FS_13)
+                        .text_size(theme::fs_13())
                         .text_color(theme::text_muted())
                         .child(
                             t!(
@@ -1569,12 +1899,12 @@ fn about_header() -> AnyElement {
 /// The license line under the version, with links to the source code and the license texts.
 fn about_legal() -> AnyElement {
     div()
-        .pt(theme::S_4)
+        .pt(theme::s_4())
         .flex()
         .flex_wrap()
         .items_center()
-        .gap_x(theme::S_12)
-        .text_size(theme::FS_12)
+        .gap_x(theme::s_12())
+        .text_size(theme::fs_12())
         .text_color(theme::text_muted())
         .child(t!("settings.about_legal").into_owned())
         .child(about_link(
@@ -1707,22 +2037,22 @@ pub(super) fn group_with(
     });
     let heading = (title.is_some() || note.is_some()).then(|| {
         div()
-            .pt(theme::S_16)
-            .pb(theme::S_8)
-            .px(theme::S_4)
+            .pt(theme::s_16())
+            .pb(theme::s_8())
+            .px(theme::s_4())
             .flex()
             .flex_col()
-            .gap(theme::S_2)
+            .gap(theme::s_2())
             .children(title.map(|t| {
                 div()
-                    .text_size(theme::FS_13)
+                    .text_size(theme::fs_13())
                     .font_weight(theme::FW_STRONG)
                     .text_color(theme::text_muted())
                     .child(SharedString::from(t.into_owned()))
             }))
             .children(note.map(|n| {
                 div()
-                    .text_size(theme::FS_12)
+                    .text_size(theme::fs_12())
                     .text_color(theme::text_subtle())
                     .child(SharedString::from(n.into_owned()))
             }))
@@ -1735,7 +2065,7 @@ pub(super) fn group_with(
             div()
                 .flex()
                 .flex_col()
-                .rounded(theme::R_8)
+                .rounded(theme::r_8())
                 .bg(theme::card())
                 .border_1()
                 .border_color(theme::line())
@@ -1756,7 +2086,7 @@ pub(super) fn card(
 }
 
 /// The one row layout every settings page uses: icon column, title over an optional second line,
-/// control on the right; at least [`CARD_MIN_H`] tall and vertically centered.
+/// control on the right; at least [`card_min_h()`] tall and vertically centered.
 pub(super) fn row(
     icon: Icon,
     title: SharedString,
@@ -1766,12 +2096,12 @@ pub(super) fn row(
     // The switch or dropdown on the right is named after the row for screen readers.
     let a11y = crate::a11y::active();
     div()
-        .min_h(CARD_MIN_H)
-        .px(theme::S_16)
-        .py(theme::S_12)
+        .min_h(card_min_h())
+        .px(theme::s_16())
+        .py(theme::s_12())
         .flex()
         .items_center()
-        .gap(theme::S_16)
+        .gap(theme::s_16())
         .when(a11y, |d| d.child(crate::a11y::label_scope(title.clone())))
         .child(row_icon(icon, theme::text_muted()))
         .child(row_text(title, desc))
@@ -1782,13 +2112,18 @@ pub(super) fn row(
 
 /// Icon centered in the fixed icon column.
 pub(super) fn row_icon(icon: Icon, color: gpui::Rgba) -> gpui::Div {
-    div().w(ICON_COL).flex_none().flex().justify_center().child(
-        svg()
-            .path(icon.path())
-            .flex_none()
-            .size(theme::ICON)
-            .text_color(color),
-    )
+    div()
+        .w(icon_col())
+        .flex_none()
+        .flex()
+        .justify_center()
+        .child(
+            svg()
+                .path(icon.path())
+                .flex_none()
+                .size(theme::icon())
+                .text_color(color),
+        )
 }
 
 /// Title and an optional second line.
@@ -1798,7 +2133,7 @@ pub(super) fn row_text(title: SharedString, desc: Option<AnyElement>) -> gpui::D
         .min_w_0()
         .flex()
         .flex_col()
-        .gap(theme::S_2)
+        .gap(theme::s_2())
         .child(title)
         .children(desc)
 }
@@ -1806,7 +2141,7 @@ pub(super) fn row_text(title: SharedString, desc: Option<AnyElement>) -> gpui::D
 /// Second line of a row: a short description or status.
 pub(super) fn row_desc(text: Cow<'static, str>) -> AnyElement {
     div()
-        .text_size(theme::FS_12)
+        .text_size(theme::fs_12())
         .text_color(theme::text_subtle())
         .child(SharedString::from(text.into_owned()))
         .into_any_element()
@@ -1848,11 +2183,10 @@ pub(super) fn choice_with<T: Copy + PartialEq + 'static>(
     fonts: Option<OptionFont>,
     ui: &Ui,
 ) -> AnyElement {
-    let cursor = ui
-        .open
-        .filter(|(open, _)| *open == id)
-        .map(|(_, cursor)| cursor);
-    let open = cursor.is_some();
+    let (open, cursor) = match ui.open {
+        Some((open, cursor)) if open == id => (true, cursor),
+        _ => (false, None),
+    };
     let at = options
         .iter()
         .position(|(value, _)| *value == current)
@@ -1868,15 +2202,15 @@ pub(super) fn choice_with<T: Copy + PartialEq + 'static>(
         .id(id)
         .debug_selector(move || id.to_owned())
         .a11y_combo(label.clone(), open)
-        .h(theme::H_CTL)
-        .min_w(DROPDOWN_MIN_W)
-        .pl(theme::S_12)
-        .pr(theme::S_8)
+        .h(theme::h_ctl())
+        .min_w(dropdown_min_w())
+        .pl(theme::s_12())
+        .pr(theme::s_8())
         .flex()
         .items_center()
         .justify_between()
-        .gap(theme::S_12)
-        .rounded(theme::R_8)
+        .gap(theme::s_12())
+        .rounded(theme::r_8())
         .border_1()
         .border_color(theme::line_strong())
         .cursor_pointer()
@@ -1893,7 +2227,7 @@ pub(super) fn choice_with<T: Copy + PartialEq + 'static>(
             svg()
                 .path(Icon::ChevronRight.path())
                 .flex_none()
-                .size(theme::ICON_SM)
+                .size(theme::icon_sm())
                 .text_color(theme::text_subtle())
                 .with_transformation(gpui::Transformation::rotate(gpui::radians(
                     std::f32::consts::FRAC_PI_2,
@@ -1921,12 +2255,30 @@ pub(super) fn choice_with<T: Copy + PartialEq + 'static>(
                     Some(Dropdown {
                         id,
                         cursor: at,
+                        keyboard: false,
                         options: appliers.clone(),
+                        popup: crate::popup::Single::new(),
                     }),
                     cx,
                 );
             }
         });
+    // Where each button is, for its list to open under it.
+    let buttons = std::rc::Rc::clone(&ui.buttons);
+    let button = div().relative().child(button).child(
+        canvas(
+            move |bounds, _, _| {
+                buttons.borrow_mut().insert(id, bounds);
+            },
+            |_, (), _, _| {},
+        )
+        // Pinned to the corner: without insets an absolute child sits where it would flow, here
+        // below the button, and the list opened a button's height too low.
+        .absolute()
+        .top_0()
+        .left_0()
+        .size_full(),
+    );
     if !open {
         return div().child(button).into_any_element();
     }
@@ -1952,13 +2304,13 @@ pub(super) fn choice_with<T: Copy + PartialEq + 'static>(
                 .aria_position_in_set(ix)
                 // Keep row height fixed when the list scrolls.
                 .flex_none()
-                .h(theme::H_CTL)
-                .pl(theme::S_8)
-                .pr(theme::S_16)
+                .h(theme::h_ctl())
+                .pl(theme::s_8())
+                .pr(theme::s_16())
                 .flex()
                 .items_center()
-                .gap(theme::S_8)
-                .rounded(theme::R_4)
+                .gap(theme::s_8())
+                .rounded(theme::r_4())
                 .cursor_pointer()
                 .hover(|s| s.bg(theme::wash()))
                 // Keyboard cursor.
@@ -1968,7 +2320,7 @@ pub(super) fn choice_with<T: Copy + PartialEq + 'static>(
                     svg()
                         .path(Icon::Check.path())
                         .flex_none()
-                        .size(theme::ICON)
+                        .size(theme::icon())
                         .text_color(if on { theme::signal() } else { theme::clear() }),
                 )
                 .child(match font {
@@ -1979,7 +2331,7 @@ pub(super) fn choice_with<T: Copy + PartialEq + 'static>(
                         .flex()
                         .items_center()
                         .justify_between()
-                        .gap(theme::S_16)
+                        .gap(theme::s_16())
                         .font_family(font)
                         .child(div().min_w_0().truncate().child(label))
                         .child(
@@ -1997,27 +2349,61 @@ pub(super) fn choice_with<T: Copy + PartialEq + 'static>(
         }
     };
     let count = options.len();
-    let list = if long {
-        // Only the rows in view are built, each in its own font.
-        let height = (theme::H_CTL * count as f32).min(DROPDOWN_MAX_H - theme::S_8);
+    let row = std::rc::Rc::new(row);
+    let list_scroll = ui.list_scroll.clone();
+    // At least as wide as its button, like a Windows combo box, so the edges it is lined up with
+    // match.
+    let min_w = ui
+        .buttons
+        .borrow()
+        .get(id)
+        .map_or_else(dropdown_min_w, |b| b.size.width.max(dropdown_min_w()));
+    // The list is drawn in a window of its own (`popup.rs`), under the button and past the
+    // window's edge when it has to be; `Workspace::sync_dropdown_popup` opens it.
+    *ui.panel.borrow_mut() = Some(std::rc::Rc::new(move |_: &mut Window, _: &mut App| {
+        let row = std::rc::Rc::clone(&row);
+        let list = if long {
+            // Only the rows in view are built, each in its own font.
+            let height = (theme::h_ctl() * count as f32).min(dropdown_max_h() - theme::s_8());
+            div()
+                .w(font_list_w())
+                .child(
+                    uniform_list((id, usize::MAX - 3), count, move |range, _, _| {
+                        range.map(|ix| row(ix)).collect::<Vec<_>>()
+                    })
+                    .track_scroll(&list_scroll)
+                    .h(height),
+                )
+                .into_any_element()
+        } else {
+            div()
+                .flex()
+                .flex_col()
+                .gap(theme::s_2())
+                .children((0..count).map(|ix| row(ix)))
+                .into_any_element()
+        };
         div()
-            .w(FONT_LIST_W)
-            .child(
-                uniform_list((id, usize::MAX - 3), count, move |range, _, _| {
-                    range.map(&row).collect::<Vec<_>>()
-                })
-                .track_scroll(&ui.list_scroll)
-                .h(height),
-            )
+            .id((id, usize::MAX - 1))
+            .role(gpui::Role::ListBox)
+            .aria_size_of_set(count)
+            .occlude()
+            .max_h(dropdown_max_h())
+            .when(!long, gpui::StatefulInteractiveElement::overflow_y_scroll)
+            .min_w(min_w)
+            .p(theme::s_4())
+            .rounded(theme::r_8())
+            .bg(theme::overlay())
+            .shadow(theme::elev_2())
+            .ui_font()
+            .text_size(theme::fs_14())
+            .text_color(theme::text())
+            .child(list)
+            .with_animation((id, usize::MAX - 2), anim(), |el, t| {
+                crate::motion::slide_in(el, t, 0., -ANIM_SLIDE)
+            })
             .into_any_element()
-    } else {
-        div()
-            .flex()
-            .flex_col()
-            .gap(theme::S_2)
-            .children((0..count).map(row))
-            .into_any_element()
-    };
+    }));
     let scrim = deferred(
         anchored().position(point(px(0.), px(0.))).child(
             div()
@@ -2032,42 +2418,7 @@ pub(super) fn choice_with<T: Copy + PartialEq + 'static>(
         ),
     )
     .with_priority(1);
-    let menu = deferred(
-        anchored()
-            .anchor(gpui::Anchor::TopRight)
-            .snap_to_window_with_margin(theme::S_8)
-            .child(
-                div()
-                    .id((id, usize::MAX - 1))
-                    .role(gpui::Role::ListBox)
-                    .aria_size_of_set(count)
-                    .occlude()
-                    .max_h(DROPDOWN_MAX_H)
-                    .when(!long, gpui::StatefulInteractiveElement::overflow_y_scroll)
-                    .min_w(DROPDOWN_MIN_W)
-                    .p(theme::S_4)
-                    .rounded(theme::R_8)
-                    .bg(theme::overlay())
-                    .shadow(theme::elev_2())
-                    .child(list)
-                    .with_animation((id, usize::MAX - 2), anim(), |el, t| {
-                        crate::motion::slide_in(el, t, 0., -ANIM_SLIDE)
-                    }),
-            ),
-    )
-    .with_priority(2);
-    div()
-        .relative()
-        .child(button)
-        .child(scrim)
-        .child(
-            div()
-                .absolute()
-                .top(theme::H_CTL + theme::S_4)
-                .right_0()
-                .child(menu),
-        )
-        .into_any_element()
+    div().child(button).child(scrim).into_any_element()
 }
 
 /// Expandable card. The whole header (icon, name, description, current value, chevron) is clickable;
@@ -2096,12 +2447,12 @@ pub(super) fn expander(
                 .debug_selector(move || id.to_owned())
                 .a11y_lazy(gpui::Role::Button, || title.to_string())
                 .aria_expanded(open)
-                .min_h(CARD_MIN_H)
-                .px(theme::S_16)
-                .py(theme::S_12)
+                .min_h(card_min_h())
+                .px(theme::s_16())
+                .py(theme::s_12())
                 .flex()
                 .items_center()
-                .gap(theme::S_16)
+                .gap(theme::s_16())
                 .cursor_pointer()
                 .hover(|s| s.bg(theme::wash()))
                 .child(row_icon(icon, theme::text_muted()))
@@ -2111,7 +2462,7 @@ pub(super) fn expander(
                     svg()
                         .path(Icon::ChevronRight.path())
                         .flex_none()
-                        .size(theme::ICON_SM)
+                        .size(theme::icon_sm())
                         .text_color(theme::text_subtle())
                         .with_transformation(gpui::Transformation::rotate(gpui::radians(
                             if open {
@@ -2135,7 +2486,7 @@ pub(super) fn expander(
                 div()
                     .border_t_1()
                     .border_color(theme::line())
-                    .p(theme::S_16)
+                    .p(theme::s_16())
                     .child(body)
                     .with_animation((id, 0usize), anim(), |el, t| {
                         crate::motion::slide_in(el, t, 0., -ANIM_SLIDE)
@@ -2148,7 +2499,7 @@ pub(super) fn expander(
 /// Right side of an expander header: the current value as text.
 fn text_summary(label: String) -> AnyElement {
     div()
-        .text_size(theme::FS_12)
+        .text_size(theme::fs_12())
         .text_color(theme::text_muted())
         .child(label)
         .into_any_element()
@@ -2159,12 +2510,12 @@ fn look_summary(color: gpui::Rgba, label: String) -> AnyElement {
     div()
         .flex()
         .items_center()
-        .gap(theme::S_8)
-        .text_size(theme::FS_12)
+        .gap(theme::s_8())
+        .text_size(theme::fs_12())
         .text_color(theme::text_muted())
         .child(
             div()
-                .size(theme::ICON)
+                .size(theme::icon())
                 .rounded(theme::R_FULL)
                 .border_1()
                 .border_color(theme::line_strong())
@@ -2199,8 +2550,8 @@ impl TileLook {
     }
 
     /// The light or dark theme, whatever the current one is.
-    fn mode(dark: bool) -> Self {
-        let look = theme::mode_preview(dark);
+    fn mode(dark: bool, gray: bool) -> Self {
+        let look = theme::mode_preview(dark, gray);
         Self {
             frame: look.frame,
             paper: look.paper,
@@ -2221,7 +2572,7 @@ const THEME_TILE: (f32, f32) = (120., 80.);
 fn mini_window(look: TileLook, width: f32) -> gpui::Div {
     let bar = |width: f32, color: gpui::Rgba| {
         div()
-            .h(px(3.))
+            .h(crate::theme::scaled_px(3.))
             .w(px(width))
             .rounded(theme::R_FULL)
             .bg(color)
@@ -2230,18 +2581,18 @@ fn mini_window(look: TileLook, width: f32) -> gpui::Div {
         .w(px(width))
         .h_full()
         .flex_none()
-        .p(theme::S_6)
+        .p(theme::s_6())
         .flex()
-        .gap(theme::S_6)
+        .gap(theme::s_6())
         .bg(look.frame)
         // Sidebar.
         .child(
             div()
-                .w(px(20.))
-                .pt(theme::S_4)
+                .w(crate::theme::scaled_px(20.))
+                .pt(theme::s_4())
                 .flex()
                 .flex_col()
-                .gap(theme::S_4)
+                .gap(theme::s_4())
                 .child(bar(18., look.faint))
                 .child(bar(13., look.faint))
                 .child(bar(16., look.faint)),
@@ -2250,19 +2601,19 @@ fn mini_window(look: TileLook, width: f32) -> gpui::Div {
         .child(
             div()
                 .flex_1()
-                .p(theme::S_6)
+                .p(theme::s_6())
                 .flex()
                 .flex_col()
-                .gap(theme::S_4)
-                .rounded(theme::R_4)
+                .gap(theme::s_4())
+                .rounded(theme::r_4())
                 .bg(look.paper)
                 // Selected row: the accent wash, as in the file list.
                 .child(
                     div()
                         .flex()
-                        .px(theme::S_4)
-                        .py(theme::S_2)
-                        .rounded(theme::R_4)
+                        .px(theme::s_4())
+                        .py(theme::s_2())
+                        .rounded(theme::r_4())
                         .bg(gpui::Rgba {
                             a: 0.2,
                             ..look.accent
@@ -2274,8 +2625,8 @@ fn mini_window(look: TileLook, width: f32) -> gpui::Div {
                 .child(
                     div().flex().justify_end().child(
                         div()
-                            .w(px(16.))
-                            .h(px(8.))
+                            .w(crate::theme::scaled_px(16.))
+                            .h(crate::theme::scaled_px(8.))
                             .rounded(theme::R_FULL)
                             .bg(look.accent),
                     ),
@@ -2322,7 +2673,7 @@ fn tile(
         .w(px(width))
         .flex()
         .flex_col()
-        .rounded(theme::R_8)
+        .rounded(theme::r_8())
         .border_2()
         .overflow_hidden()
         .cursor_pointer()
@@ -2334,12 +2685,12 @@ fn tile(
         .child(div().h(px(height)).flex().overflow_hidden().child(preview))
         .child(
             div()
-                .h(px(26.))
-                .px(theme::S_6)
+                .h(crate::theme::scaled_px(26.))
+                .px(theme::s_6())
                 .flex()
                 .items_center()
                 .justify_center()
-                .text_size(theme::FS_12)
+                .text_size(theme::fs_12())
                 .when(selected, |d| d.font_weight(theme::FW_STRONG))
                 .when(!selected, |d| d.text_color(theme::text_muted()))
                 .child(
@@ -2357,7 +2708,7 @@ fn tile(
 /// Theme options: light, dark, and follow Windows (half light, half dark).
 fn theme_body(s: &Settings) -> AnyElement {
     let (width, height) = THEME_TILE;
-    let window = |dark: bool| mini_window(TileLook::mode(dark), width);
+    let window = |dark: bool, gray: bool| mini_window(TileLook::mode(dark, gray), width);
     // The dark half shows the right side of the same window, so the two halves line up.
     let half = width / 2.;
     let system = div()
@@ -2367,7 +2718,7 @@ fn theme_body(s: &Settings) -> AnyElement {
                 .w(px(half))
                 .h_full()
                 .overflow_hidden()
-                .child(window(false)),
+                .child(window(false, false)),
         )
         .child(
             div()
@@ -2381,39 +2732,55 @@ fn theme_body(s: &Settings) -> AnyElement {
                         .top_0()
                         .bottom_0()
                         .left(px(-half))
-                        .child(window(true)),
+                        .child(window(true, s.dark_shade == DarkShade::Gray)),
                 ),
         )
         .into_any_element();
+    // Dark gray is the dark theme with Arke 0.4's gray; System uses whichever dark was picked last.
     let options = [
         (
             ThemeMode::Light,
+            None,
             t!("settings.theme_light"),
-            window(false).into_any_element(),
+            window(false, false).into_any_element(),
         ),
         (
             ThemeMode::Dark,
+            Some(DarkShade::Black),
             t!("settings.theme_dark"),
-            window(true).into_any_element(),
+            window(true, false).into_any_element(),
         ),
-        (ThemeMode::System, t!("settings.theme_system"), system),
+        (
+            ThemeMode::Dark,
+            Some(DarkShade::Gray),
+            t!("settings.theme_gray"),
+            window(true, true).into_any_element(),
+        ),
+        (ThemeMode::System, None, t!("settings.theme_system"), system),
     ];
     div()
         .flex()
         .flex_wrap()
-        .gap(theme::S_8)
+        .gap(theme::s_8())
         .children(
             options
                 .into_iter()
                 .enumerate()
-                .map(|(ix, (mode, label, preview))| {
+                .map(|(ix, (mode, shade, label, preview))| {
+                    let selected =
+                        s.theme == mode && shade.is_none_or(|shade| s.dark_shade == shade);
                     tile(
                         ("theme", ix),
                         label.into_owned(),
-                        s.theme == mode,
+                        selected,
                         (width, height),
                         preview,
-                        move |st| st.theme = mode,
+                        move |st| {
+                            st.theme = mode;
+                            if let Some(shade) = shade {
+                                st.dark_shade = shade;
+                            }
+                        },
                     )
                 }),
         )
@@ -2421,11 +2788,12 @@ fn theme_body(s: &Settings) -> AnyElement {
 }
 
 /// Right side of the Theme header: the current choice.
-fn theme_label(mode: ThemeMode) -> String {
-    match mode {
-        ThemeMode::System => t!("settings.theme_system"),
-        ThemeMode::Light => t!("settings.theme_light"),
-        ThemeMode::Dark => t!("settings.theme_dark"),
+fn theme_label(mode: ThemeMode, shade: DarkShade) -> String {
+    match (mode, shade) {
+        (ThemeMode::System, _) => t!("settings.theme_system"),
+        (ThemeMode::Light, _) => t!("settings.theme_light"),
+        (ThemeMode::Dark, DarkShade::Black) => t!("settings.theme_dark"),
+        (ThemeMode::Dark, DarkShade::Gray) => t!("settings.theme_gray"),
     }
     .into_owned()
 }
@@ -2508,14 +2876,14 @@ fn accent_body(s: &Settings, input: &Entity<TextInput>, window: &Window, cx: &Ap
     }
     let focused = input.focus_handle(cx).is_focused(window);
     let code = div()
-        .w(px(96.))
-        .h(theme::H_CTL_SM)
-        .px(theme::S_8)
+        .w(crate::theme::scaled_px(96.))
+        .h(theme::h_ctl_sm())
+        .px(theme::s_8())
         .flex()
         .items_center()
-        .rounded(theme::R_8)
+        .rounded(theme::r_8())
         .border_1()
-        .text_size(theme::FS_12)
+        .text_size(theme::fs_12())
         .when(focused, |d| {
             d.bg(theme::surface()).border_color(theme::signal_line())
         })
@@ -2526,17 +2894,17 @@ fn accent_body(s: &Settings, input: &Entity<TextInput>, window: &Window, cx: &Ap
     div()
         .flex()
         .flex_col()
-        .gap(theme::S_16)
-        .child(div().flex().flex_wrap().gap(theme::S_8).children(tiles))
+        .gap(theme::s_16())
+        .child(div().flex().flex_wrap().gap(theme::s_8()).children(tiles))
         .child(
             div()
                 .flex()
                 .flex_wrap()
                 .items_center()
-                .gap(theme::S_12)
+                .gap(theme::s_12())
                 .child(
                     div()
-                        .text_size(theme::FS_12)
+                        .text_size(theme::fs_12())
                         .text_color(theme::text_muted())
                         .child(t!("settings.custom").into_owned()),
                 )
@@ -2592,7 +2960,7 @@ fn tint_body(s: &Settings) -> AnyElement {
     div()
         .flex()
         .flex_wrap()
-        .gap(theme::S_8)
+        .gap(theme::s_8())
         .children(tiles)
         .into_any_element()
 }
@@ -2635,7 +3003,7 @@ fn font_card(s: &Settings, fonts: &std::rc::Rc<Vec<SharedString>>, ui: &Ui) -> A
     };
     // Live sample under the name, in the chosen font.
     let sample = div()
-        .text_size(theme::FS_13)
+        .text_size(theme::fs_13())
         .text_color(theme::text_muted())
         .when_some(names.get(current).cloned(), gpui::Styled::font_family)
         .child(t!("settings.font_sample").into_owned())
@@ -2679,13 +3047,13 @@ fn background_summary(s: &Settings, page: &SettingsPage) -> AnyElement {
     div()
         .flex()
         .items_center()
-        .gap(theme::S_8)
+        .gap(theme::s_8())
         .children(image.map(|image| {
             div()
-                .w(px(32.))
-                .h(px(20.))
+                .w(crate::theme::scaled_px(32.))
+                .h(crate::theme::scaled_px(20.))
                 .flex_none()
-                .rounded(theme::R_4)
+                .rounded(theme::r_4())
                 .overflow_hidden()
                 .border_1()
                 .border_color(theme::line())
@@ -2697,11 +3065,11 @@ fn background_summary(s: &Settings, page: &SettingsPage) -> AnyElement {
         }))
         .child(
             div()
-                .max_w(px(220.))
+                .max_w(crate::theme::scaled_px(220.))
                 .overflow_hidden()
                 .whitespace_nowrap()
                 .text_ellipsis()
-                .text_size(theme::FS_12)
+                .text_size(theme::fs_12())
                 .text_color(theme::text_muted())
                 .child(name),
         )
@@ -2726,11 +3094,11 @@ fn background_body(
     let focused = input.focus_handle(cx).is_focused(window);
     let field = div()
         .w_full()
-        .h(theme::H_CTL)
-        .px(theme::S_8)
+        .h(theme::h_ctl())
+        .px(theme::s_8())
         .flex()
         .items_center()
-        .rounded(theme::R_8)
+        .rounded(theme::r_8())
         .border_1()
         .when(focused, |d| {
             d.bg(theme::surface()).border_color(theme::signal_line())
@@ -2749,14 +3117,14 @@ fn background_body(
             .flex_col()
             .items_center()
             .justify_center()
-            .gap(theme::S_4)
+            .gap(theme::s_4())
             .bg(theme::wash())
-            .text_size(theme::FS_12)
+            .text_size(theme::fs_12())
             .text_color(theme::text_subtle())
             .child(
                 svg()
                     .path(icon.path())
-                    .size(theme::S_20)
+                    .size(theme::s_20())
                     .text_color(theme::text_disabled()),
             )
             .children(text)
@@ -2782,7 +3150,7 @@ fn background_body(
             .w(px(thumb_w))
             .h(px(thumb_h))
             .flex_none()
-            .rounded(theme::R_8)
+            .rounded(theme::r_8())
             .overflow_hidden()
             .border_1()
             .border_color(theme::line_strong())
@@ -2798,7 +3166,7 @@ fn background_body(
     let chooser = div()
         .flex()
         .items_center()
-        .gap(theme::S_16)
+        .gap(theme::s_16())
         .child(frame(thumbnail))
         .child(
             div()
@@ -2806,13 +3174,13 @@ fn background_body(
                 .min_w_0()
                 .flex()
                 .flex_col()
-                .gap(theme::S_8)
+                .gap(theme::s_8())
                 .child(field)
                 .child(
                     div()
                         .flex()
                         .items_center()
-                        .gap(theme::S_8)
+                        .gap(theme::s_8())
                         .child(browse)
                         .when(s.background_image.is_some(), |d| {
                             d.child(text_button(
@@ -2824,7 +3192,7 @@ fn background_body(
                 )
                 .child(
                     div()
-                        .text_size(theme::FS_12)
+                        .text_size(theme::fs_12())
                         .text_color(theme::text_subtle())
                         .child(t!("settings.background_hint").into_owned()),
                 ),
@@ -2834,24 +3202,24 @@ fn background_body(
     let preview = {
         let line = |width: f32, color: gpui::Rgba| {
             div()
-                .h(px(4.))
+                .h(crate::theme::scaled_px(4.))
                 .w(px(width))
                 .rounded(theme::R_FULL)
                 .bg(color)
         };
         let row = |selected: bool, width: f32| {
             div()
-                .h(px(16.))
-                .px(theme::S_6)
+                .h(crate::theme::scaled_px(16.))
+                .px(theme::s_6())
                 .flex()
                 .items_center()
-                .gap(theme::S_6)
-                .rounded(theme::R_4)
+                .gap(theme::s_6())
+                .rounded(theme::r_4())
                 .when(selected, |d| d.bg(theme::selection()))
                 .child(
                     div()
-                        .size(px(8.))
-                        .rounded(theme::R_4)
+                        .size(crate::theme::scaled_px(8.))
+                        .rounded(theme::r_4())
                         .bg(theme::text_disabled()),
                 )
                 .child(line(
@@ -2886,10 +3254,10 @@ fn background_body(
                     .top_0()
                     .left_0()
                     .size_full()
-                    .p(theme::S_8)
+                    .p(theme::s_8())
                     .flex()
                     .flex_col()
-                    .gap(theme::S_4)
+                    .gap(theme::s_4())
                     .child(row(false, 70.))
                     .child(row(true, 52.))
                     .child(row(false, 84.))
@@ -2901,7 +3269,7 @@ fn background_body(
     let strength = div()
         .flex()
         .items_center()
-        .gap(theme::S_16)
+        .gap(theme::s_16())
         .child(frame(preview))
         .child(
             div()
@@ -2909,24 +3277,24 @@ fn background_body(
                 .min_w_0()
                 .flex()
                 .flex_col()
-                .gap(theme::S_8)
+                .gap(theme::s_8())
                 .child(t!("settings.background_opacity").into_owned())
                 .child(
                     div()
                         .flex()
                         .items_center()
-                        .gap(theme::S_12)
+                        .gap(theme::s_12())
                         .child(opacity_slider(opacity, Rc::clone(&page.slider_drag)))
                         .child(
                             div()
-                                .w(px(40.))
+                                .w(crate::theme::scaled_px(40.))
                                 .text_color(theme::text_muted())
                                 .child(format!("{opacity}%")),
                         ),
                 )
                 .child(
                     div()
-                        .text_size(theme::FS_12)
+                        .text_size(theme::fs_12())
                         .text_color(theme::text_subtle())
                         .child(t!("settings.background_preview").into_owned()),
                 ),
@@ -2934,7 +3302,7 @@ fn background_body(
     div()
         .flex()
         .flex_col()
-        .gap(theme::S_16)
+        .gap(theme::s_16())
         .child(chooser)
         .child(div().h(px(1.)).bg(theme::line()))
         .child(strength)
@@ -2952,7 +3320,7 @@ fn opacity_slider(value: u8, dragging: std::rc::Rc<std::cell::Cell<bool>>) -> An
             set_backdrop_opacity((fraction * 100.).round() as u8, cx);
         }),
     )
-    .w(SLIDER_W)
+    .w(slider_w())
     .into_any_element()
 }
 
@@ -2976,14 +3344,14 @@ fn column_toggles(s: &Settings) -> AnyElement {
         div()
             .id(("col-chip", col as usize))
             .a11y_toggle(col.label().into_owned(), on)
-            .h(theme::S_24)
-            .px(theme::S_12)
+            .h(theme::s_24())
+            .px(theme::s_12())
             .flex()
             .items_center()
             .rounded(theme::R_FULL)
             .border_1()
             .cursor_pointer()
-            .text_size(theme::FS_12)
+            .text_size(theme::fs_12())
             .when(on, |d| {
                 d.bg(theme::signal_wash())
                     .border_color(theme::signal_line())
@@ -3007,7 +3375,7 @@ fn column_toggles(s: &Settings) -> AnyElement {
         .flex()
         .flex_wrap()
         .justify_end()
-        .gap(theme::S_6)
+        .gap(theme::s_6())
         .children(Col::ALL.into_iter().filter(|&c| c != Col::Name).map(chip))
         .into_any_element()
 }
@@ -3037,8 +3405,8 @@ fn hue_strip() -> impl IntoElement {
             let color = theme::accent_from_hue(ix as f32 * HUE_STEP);
             div()
                 .id(("accent-hue", ix))
-                .w(px(8.))
-                .h(px(16.))
+                .w(crate::theme::scaled_px(8.))
+                .h(crate::theme::scaled_px(16.))
                 .bg(theme::accent_preview(color))
                 .cursor_pointer()
                 .on_click(move |_, _, cx| set(cx, |s| s.accent = Accent::Color(color)))
@@ -3073,7 +3441,9 @@ pub(crate) fn switch(
         .map(|(_, serial)| serial);
     // Animation progress 0 to 1; on moves right (0 to 1), off moves left (1 to 0).
     let place = move |t: f32| if on { t } else { 1. - t };
-    let thumb = div().size(px(14.)).rounded(theme::R_FULL);
+    let thumb = div()
+        .size(crate::theme::scaled_px(14.))
+        .rounded(theme::R_FULL);
     let thumb = match playing {
         Some(serial) => thumb
             .with_animation(
@@ -3098,11 +3468,11 @@ pub(crate) fn switch(
         .id(id)
         .a11y_switch(on)
         .debug_selector(|| id.to_owned())
-        .w(px(40.))
-        .h(px(20.))
+        .w(crate::theme::scaled_px(40.))
+        .h(crate::theme::scaled_px(20.))
         .flex()
         .items_center()
-        .px(px(3.))
+        .px(crate::theme::scaled_px(3.))
         .rounded(theme::R_FULL)
         .cursor_pointer()
         .border_1()
@@ -3154,7 +3524,7 @@ fn folder_views_card(s: &Settings, cx: &mut App) -> AnyElement {
         )
     } else {
         div()
-            .text_size(theme::FS_12)
+            .text_size(theme::fs_12())
             .text_color(theme::text_subtle())
             .child(t!("settings.folder_views_none").to_string())
             .into_any_element()
@@ -3166,7 +3536,7 @@ fn folder_views_card(s: &Settings, cx: &mut App) -> AnyElement {
         div()
             .flex()
             .items_center()
-            .gap(theme::S_12)
+            .gap(theme::s_12())
             .child(reset)
             .child(switch("folder-views", s.remember_folder_views, |st| {
                 st.remember_folder_views = !st.remember_folder_views;
@@ -3194,7 +3564,7 @@ fn search_history_card(s: &Settings, cx: &mut App) -> AnyElement {
         )
     } else {
         div()
-            .text_size(theme::FS_12)
+            .text_size(theme::fs_12())
             .text_color(theme::text_subtle())
             .child(t!("settings.search_history_none").to_string())
             .into_any_element()
@@ -3206,7 +3576,7 @@ fn search_history_card(s: &Settings, cx: &mut App) -> AnyElement {
         div()
             .flex()
             .items_center()
-            .gap(theme::S_12)
+            .gap(theme::s_12())
             .child(clear)
             .child(switch("search-history", s.search_history, |st| {
                 st.search_history = !st.search_history;
@@ -3225,15 +3595,15 @@ pub(super) fn text_button(
         .id(id)
         .debug_selector(move || id.to_owned())
         .a11y_button(label.clone())
-        .h(theme::H_CTL_SM)
-        .px(theme::S_12)
+        .h(theme::h_ctl_sm())
+        .px(theme::s_12())
         .flex()
         .items_center()
-        .rounded(theme::R_8)
+        .rounded(theme::r_8())
         .border_1()
         .border_color(theme::line_strong())
         .cursor_pointer()
-        .text_size(theme::FS_12)
+        .text_size(theme::fs_12())
         .hover(|s| s.bg(theme::wash()))
         .child(label)
         .on_click(on_click)
@@ -3243,18 +3613,23 @@ pub(super) fn text_button(
 /// "Live updates" button: installs or removes the background service (UAC prompt); shows text only while waiting.
 /// Same action as the lightning button in the search scope bar, placed here so it is easier to find.
 fn service_control(cx: &App) -> AnyElement {
-    let (installed, busy) = crate::global_search::GlobalSearch::global(cx).map_or_default(|g| {
-        let g = g.read(cx);
-        (g.service_installed == Some(true), g.service_busy)
-    });
+    let (installed, outdated, busy) = crate::global_search::GlobalSearch::global(cx)
+        .map_or_default(|g| {
+            let g = g.read(cx);
+            (
+                g.service_installed == Some(true),
+                g.service_outdated.is_some(),
+                g.service_busy,
+            )
+        });
     if busy {
         return div()
-            .text_size(theme::FS_12)
+            .text_size(theme::fs_12())
             .text_color(theme::text_muted())
             .child(t!("search.service_busy").to_string())
             .into_any_element();
     }
-    text_button(
+    let toggle = text_button(
         "search-service",
         if installed {
             t!("settings.service_remove")
@@ -3267,21 +3642,50 @@ fn service_control(cx: &App) -> AnyElement {
                 cx.refresh_windows();
             }
         },
-    )
+    );
+    if !(installed && outdated) {
+        return toggle;
+    }
+    // Installing again copies this Arke's program over the service's and keeps its settings.
+    let update = text_button(
+        "search-service-update",
+        t!("settings.service_update"),
+        |_: &ClickEvent, _, cx: &mut App| {
+            if let Some(global) = crate::global_search::GlobalSearch::global(cx) {
+                global.update(cx, |g, cx| g.set_service(true, cx));
+                cx.refresh_windows();
+            }
+        },
+    );
+    div()
+        .flex()
+        .gap(theme::s_8())
+        .child(update)
+        .child(toggle)
+        .into_any_element()
+}
+
+/// The service row's description: what it does, or that it's from another version of Arke.
+fn service_desc(cx: &App) -> Cow<'static, str> {
+    let outdated = crate::global_search::GlobalSearch::global(cx).and_then(|g| {
+        let g = g.read(cx);
+        (g.service_installed == Some(true))
+            .then(|| g.service_outdated.clone())
+            .flatten()
+    });
+    if outdated.is_some() {
+        t!("settings.service_outdated")
+    } else {
+        t!("settings.service_desc")
+    }
 }
 
 /// Above this many indexed items, suggest adding only frequently used subfolders.
 const LARGE_NETWORK_INDEX: usize = 1_000_000;
 
 /// Settings › Search. The whole-PC switch comes first; everything else only matters while it is
-/// on, so it is dimmed and can't be clicked otherwise. The change journal is an advanced detail,
-/// collapsed by default.
-fn search_page(
-    s: &Settings,
-    page: &SettingsPage,
-    ui: &Ui,
-    cx: &mut Context<Workspace>,
-) -> Vec<AnyElement> {
+/// on, so it is dimmed and can't be clicked otherwise.
+fn search_page(s: &Settings, cx: &mut Context<Workspace>) -> Vec<AnyElement> {
     let on = s.global_search;
     let main = group(
         None,
@@ -3308,7 +3712,7 @@ fn search_page(
             card(
                 Icon::Bolt,
                 t!("settings.service"),
-                Some(t!("settings.service_desc")),
+                Some(service_desc(cx)),
                 service_control(cx),
             ),
         ],
@@ -3317,36 +3721,27 @@ fn search_page(
         Some(t!("settings.search_ranking")),
         vec![search_history_card(s, cx)],
     );
-    let drives = crate::win::fixed_drive_roots();
     let scope = group_with(
         Some(t!("settings.search_scope")),
         Some(t!("settings.search_scope_desc")),
-        search_scope_rows(s, drives.clone()),
+        search_scope_rows(s, crate::win::fixed_drive_roots()),
     );
     let network = group_with(
         Some(t!("settings.search_network")),
         Some(t!("settings.search_network_desc")),
         network_search_rows(s, cx),
     );
-    let advanced = group(
-        Some(t!("settings.advanced")),
-        vec![journal_card(
-            drives,
-            page.expanded.contains("search-advanced"),
-            ui,
-            cx,
-        )],
-    );
     let mut out = vec![main];
     out.extend(
-        [index, ranking, scope, network, advanced]
+        [index, ranking, scope, network]
             .into_iter()
             .map(|section| needs(on, section)),
     );
     out
 }
 
-/// A section that only matters while `on`: otherwise dimmed, and a cover takes the clicks.
+/// A section that only matters while `on`: otherwise dimmed, and a cover takes the clicks. The
+/// wheel still goes through, so the page scrolls with the pointer over it.
 fn needs(on: bool, section: AnyElement) -> AnyElement {
     if on {
         return section;
@@ -3360,7 +3755,7 @@ fn needs(on: bool, section: AnyElement) -> AnyElement {
                 .top_0()
                 .left_0()
                 .size_full()
-                .occlude()
+                .block_mouse_except_scroll()
                 .cursor_default(),
         )
         .into_any_element()
@@ -3497,8 +3892,6 @@ macro_rules! drive_ids {
 
 /// Search scope switches, one per drive letter.
 const DRIVE_SWITCH_IDS: [&str; 26] = drive_ids!("search-drive-");
-/// Change journal size dropdowns, one per drive letter.
-const JOURNAL_IDS: [&str; 26] = drive_ids!("journal-size-");
 
 /// The `'static` id for `root`'s drive letter from `ids`.
 fn drive_id(ids: &[&'static str; 26], root: &std::path::Path) -> Option<&'static str> {
@@ -3560,15 +3953,15 @@ fn network_row(
     let apply = std::rc::Rc::new(apply);
     let button = div()
         .id(id)
-        .h(theme::H_CTL_SM)
-        .px(theme::S_12)
+        .h(theme::h_ctl_sm())
+        .px(theme::s_12())
         .flex()
         .items_center()
-        .rounded(theme::R_8)
+        .rounded(theme::r_8())
         .border_1()
         .border_color(theme::line_strong())
         .cursor_pointer()
-        .text_size(theme::FS_12)
+        .text_size(theme::fs_12())
         .hover(|s| s.bg(theme::wash()))
         .child(action)
         .on_click(move |_: &ClickEvent, _, cx: &mut App| {
@@ -3576,12 +3969,12 @@ fn network_row(
             set(cx, move |st| apply(st));
         });
     div()
-        .min_h(CARD_MIN_H)
-        .px(theme::S_16)
-        .py(theme::S_12)
+        .min_h(card_min_h())
+        .px(theme::s_16())
+        .py(theme::s_12())
         .flex()
         .items_center()
-        .gap(theme::S_16)
+        .gap(theme::s_16())
         .child(row_icon(
             icon,
             if dimmed {
@@ -3599,146 +3992,4 @@ fn network_row(
         )
         .child(div().flex_none().child(button))
         .into_any_element()
-}
-
-/// Change journal sizes offered in Settings, in MB. The first is the Windows default.
-const JOURNAL_CHOICES: [u64; 4] = [32, 128, 512, 1024];
-
-fn journal_label(mb: u64) -> String {
-    if mb >= 1024 && mb.is_multiple_of(1024) {
-        format!("{} GB", mb / 1024)
-    } else {
-        format!("{mb} MB")
-    }
-}
-
-/// The offered size `current_mb` counts as (within an eighth, since Windows rounds), or itself.
-fn journal_choice(current_mb: u64) -> u64 {
-    JOURNAL_CHOICES
-        .iter()
-        .copied()
-        .find(|&choice| current_mb.abs_diff(choice) <= choice / 8)
-        .unwrap_or(current_mb)
-}
-
-/// Advanced: the change journal's max size per local disk (queried from the disk), which can be
-/// raised (UAC prompt). A larger journal lets Arke catch up after being closed longer without a
-/// full reindex, at the cost of disk space. Collapsed by default.
-#[allow(
-    clippy::too_many_lines,
-    reason = "One card: a row per disk with its size dropdown, kept together for easier comparison"
-)]
-fn journal_card(
-    roots: Vec<PathBuf>,
-    open: bool,
-    ui: &Ui,
-    cx: &mut Context<Workspace>,
-) -> AnyElement {
-    let state = cx
-        .try_global::<crate::global_search::JournalSizes>()
-        .cloned()
-        .unwrap_or_default();
-    // Loaded even while collapsed: the header shows the current sizes.
-    if !state.loaded {
-        let roots = roots.clone();
-        cx.defer(move |cx| crate::global_search::refresh_journal_sizes(roots, cx));
-    }
-    let mb = |bytes: u64| bytes >> 20;
-    let rows: Vec<AnyElement> = state
-        .drives
-        .iter()
-        .filter_map(|(root, max, used)| {
-            let id = drive_id(&JOURNAL_IDS, root)?;
-            let current = journal_choice(mb(*max));
-            let busy = state.busy.as_ref() == Some(root);
-            let mut options: Vec<(u64, Cow<'static, str>)> = JOURNAL_CHOICES
-                .iter()
-                .map(|&choice| (choice, Cow::Owned(journal_label(choice))))
-                .collect();
-            if !JOURNAL_CHOICES.contains(&current) {
-                options.insert(0, (current, Cow::Owned(journal_label(current))));
-            }
-            let control = if busy {
-                row_desc(t!("settings.journal_busy"))
-            } else {
-                let (root, roots) = (root.clone(), roots.clone());
-                choice_with(
-                    id,
-                    &options,
-                    current,
-                    move |size, cx| {
-                        if size != current {
-                            crate::global_search::set_journal_size(
-                                root.clone(),
-                                size,
-                                roots.clone(),
-                                cx,
-                            );
-                        }
-                    },
-                    None,
-                    ui,
-                )
-            };
-            Some(
-                div()
-                    .min_h(px(48.))
-                    .flex()
-                    .items_center()
-                    .gap(theme::S_16)
-                    .child(row_icon(Icon::Drive, theme::text_muted()))
-                    .child(row_text(
-                        SharedString::from(root.display().to_string()),
-                        Some(row_desc(t!(
-                            "settings.journal_now",
-                            max = mb(*max),
-                            used = mb(*used)
-                        ))),
-                    ))
-                    .child(div().flex_none().child(control))
-                    .into_any_element(),
-            )
-        })
-        .collect();
-    let summary = state
-        .drives
-        .iter()
-        .map(|(root, max, _)| {
-            format!(
-                "{} {}",
-                root.display().to_string().trim_end_matches('\\'),
-                journal_label(journal_choice(mb(*max)))
-            )
-        })
-        .collect::<Vec<_>>()
-        .join(" · ");
-    let error = state.error.map(|e| {
-        div()
-            .text_size(theme::FS_12)
-            .text_color(theme::danger())
-            .child(t!("settings.journal_failed", error = e).into_owned())
-    });
-    let body = div()
-        .flex()
-        .flex_col()
-        .gap(theme::S_8)
-        .child(
-            div()
-                .text_size(theme::FS_12)
-                .text_color(theme::text_subtle())
-                .child(t!("settings.journal_desc").to_string()),
-        )
-        .children(rows)
-        .children(error)
-        .into_any_element();
-    expander(
-        "search-advanced",
-        Icon::Settings,
-        t!("settings.journal_title"),
-        t!("settings.journal_short"),
-        text_summary(summary),
-        open,
-        body,
-        cx,
-    )
 }

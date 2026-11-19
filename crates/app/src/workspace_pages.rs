@@ -15,17 +15,83 @@ pub(super) struct Owner {
     path: Option<PathBuf>,
     /// The tab was opened just for this page, so closing the page closes the tab too.
     own_tab: bool,
+    /// For an own tab: the tab it was opened from, shown again when the page closes (like a
+    /// browser), instead of whichever tab happens to be next to it.
+    opener: Option<EntityId>,
+}
+
+impl Owner {
+    /// The tab was opened just for this page.
+    pub(super) const fn own_tab(&self) -> bool {
+        self.own_tab
+    }
 }
 
 impl Workspace {
     /// Makes the active tab the owner.
-    pub(super) fn owner_here(&self, own_tab: bool, cx: &App) -> Owner {
+    pub(super) fn owner_here(&mut self, own_tab: bool, cx: &App) -> Owner {
+        let opener = self.page_opener.take().filter(|_| own_tab);
         let view = self.active_view();
         Owner {
             view: view.entity_id(),
             path: view.read(cx).display_path().map(PathBuf::from),
             own_tab,
+            opener,
         }
+    }
+
+    /// A folder key pressed on a page that covers the active tab (Ctrl+K, Ctrl+F, Ctrl+L,
+    /// Alt+Up...): the page steps aside, the tab stays, and the key acts on the folder under it
+    /// (#77).
+    pub(super) fn page_key(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+        act: impl FnOnce(
+            &mut crate::explorer::Explorer,
+            &mut Window,
+            &mut Context<crate::explorer::Explorer>,
+        ),
+    ) {
+        // A tab opened just for the page closes with it (unless it's the last), so the key acts
+        // on the tab that was there before instead of leaving a stray one. That tab may show a
+        // page too (What's new opened from Settings): step aside until a folder shows.
+        let mut stepped = false;
+        while let Some(owner) = self.take_shown_page() {
+            self.dismiss_page(&owner, window, cx);
+            stepped = true;
+        }
+        if !stepped {
+            return;
+        }
+        let view = self.active_view().clone();
+        view.update(cx, |e, cx| act(e, window, cx));
+        cx.notify();
+    }
+
+    /// Closes the page the active tab shows, keeping the tab.
+    pub(super) fn drop_shown_page(&mut self) {
+        let _ = self.take_shown_page();
+    }
+
+    /// Removes the page the active tab shows and returns its owner (`None` when a folder shows).
+    fn take_shown_page(&mut self) -> Option<Owner> {
+        if self.home_open() {
+            self.home_page.take().map(|p| p.owner)
+        } else if self.settings_open() {
+            self.settings_panel.take().map(|p| p.owner)
+        } else if self.recycle_open() {
+            self.recycle_page.take().map(|p| p.owner)
+        } else if self.whats_new_open() {
+            self.whats_new.take().map(|p| p.owner)
+        } else {
+            None
+        }
+    }
+
+    /// Whether a page covers the active tab.
+    pub(super) fn page_shown(&self) -> bool {
+        self.home_open() || self.settings_open() || self.recycle_open() || self.whats_new_open()
     }
 
     /// Whether the page is visible, i.e. the active tab owns it.
@@ -137,6 +203,7 @@ impl Workspace {
     pub(super) fn open_page_tab(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let path = self.current_dir(cx);
         let at = self.active + 1;
+        self.page_opener = Some(self.active_view().entity_id());
         self.open_tab(path, at, true, window, cx);
     }
 
@@ -151,11 +218,52 @@ impl Workspace {
             && let Some(ix) = self.tab_of(owner)
             && self.tabs.len() > 1
         {
+            let opener = owner.opener.and_then(|view| {
+                self.tabs
+                    .iter()
+                    .position(|t| t.panes.iter().any(|p| p.view.entity_id() == view))
+            });
             self.close_tab(ix, window, cx);
+            if let Some(opener) = opener.map(|o| if o > ix { o - 1 } else { o })
+                && opener != self.active
+            {
+                self.activate(opener, window, cx);
+            }
         } else {
             self.focus_active(window, cx);
         }
         cx.notify();
+    }
+
+    /// The window's title: the active tab's folder or page, as the taskbar and tools that read
+    /// window titles (Listary, AutoHotkey) see it.
+    pub(crate) fn window_title(&self, cx: &App) -> String {
+        let view = self.active_view();
+        let page = self
+            .page_title(view.entity_id())
+            .filter(|_| {
+                self.home_open()
+                    || self.settings_open()
+                    || self.recycle_open()
+                    || self.whats_new_open()
+            })
+            .map(|(title, _)| title);
+        if let Some(page) = page {
+            return format!("{page} - Arke");
+        }
+        let explorer = view.read(cx);
+        match explorer.display_path() {
+            Some(_) => format!("{} - Arke", explorer.tab_title()),
+            None => "Arke".into(),
+        }
+    }
+
+    pub(super) fn sync_window_title(&mut self, window: &mut Window, cx: &App) {
+        let title = self.window_title(cx);
+        if title != self.window_title {
+            window.set_window_title(&title);
+            self.window_title = title;
+        }
     }
 }
 
@@ -195,6 +303,10 @@ impl Workspace {
         cx: &mut Context<Self>,
     ) {
         self.home_opens_folder(path, window, cx);
+    }
+
+    pub(crate) fn close_home_for_test(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.close_home(window, cx);
     }
 
     pub(crate) fn open_settings_for_test(&mut self, window: &mut Window, cx: &mut Context<Self>) {

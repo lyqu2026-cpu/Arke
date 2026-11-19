@@ -62,7 +62,7 @@ mod marquee;
 #[path = "explorer_opcenter.rs"]
 mod op_view;
 #[path = "explorer_ops.rs"]
-mod ops;
+pub(crate) mod ops;
 #[path = "explorer_path.rs"]
 mod path_bar;
 #[path = "explorer_preview.rs"]
@@ -73,6 +73,8 @@ pub(crate) mod scope;
 mod shelf_ops;
 #[path = "explorer_sizes.rs"]
 mod sizes;
+#[path = "explorer_topbar.rs"]
+mod top_bar;
 #[path = "explorer_tree.rs"]
 mod tree;
 #[cfg(test)]
@@ -84,21 +86,23 @@ mod viewopts;
 
 pub(crate) use dnd::{
     DragPreview, DraggedFiles, DraggingOutside, PendingDragOut, RightDrag, ShelfDrag, accepts_drop,
-    drop_external_into, drop_into, report_drop_target,
+    drop_external_into, drop_into, hold_temp_drop, new_drop_folder, report_drop_target, stop_drag,
 };
 pub(crate) use icons::IconSize;
 pub(crate) use layout::{SharedPreview, shared_preview};
 pub(crate) use menu::{app_name, menu_open_with_found, open_with_list, set_open_with};
 #[cfg(test)]
 pub(crate) use preview::PreviewBody;
+pub(crate) use top_bar::TitleLayout;
 
+pub(crate) use ops::commit_problem;
 pub(crate) use ops::{
     CopyFiles, CutFiles, DeleteFiles, NewFolder, PasteFiles, RedoFileOp, RedoStack, RenameFile,
     UndoFileOp, UndoHistory,
 };
 #[cfg(test)]
-pub(crate) use ops::{changes_share_list, commit_problem, typing_problem};
-pub(crate) use view::{caption_buttons, ghost_button, kind_icon, tooltip};
+pub(crate) use ops::{changes_share_list, typing_problem};
+pub(crate) use view::{caption_buttons, error_toast, ghost_button, kind_icon, tooltip};
 
 use crate::bench::{Bench, BenchStep};
 use crate::media::MediaStore;
@@ -127,6 +131,8 @@ actions!(
         Escape,
         OpenSelected,
         OpenInNewTab,
+        /// Alt+Enter: the Properties window for the selection.
+        ShowProperties,
         OpenLocation,
         GoUp,
         GoBack,
@@ -161,11 +167,16 @@ actions!(
         FocusOtherPane,
         /// Ctrl+Shift+A: put the selection on the shelf.
         AddToShelf,
+        /// Ctrl+= / Ctrl+- / Ctrl+0 in Quick Look: zoom the preview in, out, back to normal.
+        LookZoomIn,
+        LookZoomOut,
+        LookZoomReset,
     ]
 );
 
 pub(crate) fn bind_keys(cx: &mut App) {
     path_bar::bind_keys(cx);
+    crate::properties::bind_keys(cx);
     let list = Some("FileList");
     let root = Some("Explorer");
     let filter = Some("FilterBar");
@@ -187,6 +198,7 @@ pub(crate) fn bind_keys(cx: &mut App) {
         KeyBinding::new("escape", Escape, list),
         KeyBinding::new("enter", OpenSelected, list),
         KeyBinding::new("ctrl-enter", OpenInNewTab, list),
+        KeyBinding::new("alt-enter", ShowProperties, list),
         KeyBinding::new("shift-enter", OpenLocation, list),
         KeyBinding::new("backspace", GoUp, list),
         // Grid view: move one cell left or right (no-op in details view).
@@ -202,6 +214,10 @@ pub(crate) fn bind_keys(cx: &mut App) {
         KeyBinding::new("alt-m", MoveToPeer, list),
         KeyBinding::new("tab", FocusOtherPane, list),
         KeyBinding::new("shift-tab", FocusOtherPane, list),
+        // Only while Quick Look is open; otherwise they pass on.
+        KeyBinding::new("ctrl-=", LookZoomIn, list),
+        KeyBinding::new("ctrl--", LookZoomOut, list),
+        KeyBinding::new("ctrl-0", LookZoomReset, list),
         // Down in the filter box moves focus to the list.
         KeyBinding::new("down", SelectNext, filter),
         KeyBinding::new("alt-up", GoUp, root),
@@ -324,6 +340,13 @@ pub(crate) enum AppEvent {
         generation: u64,
         data: preview::PreviewData,
     },
+    /// A page rendered for the preview pane's page list
+    PanePdfPage(preview::RenderedPage),
+    /// Creation time of the previewed item, read when its entry came without one (search hits).
+    PreviewCreated {
+        generation: u64,
+        created: std::time::SystemTime,
+    },
     /// High-resolution image for Quick Look's actual-size mode.
     ZoomImage {
         generation: u64,
@@ -358,11 +381,8 @@ pub(crate) enum AppEvent {
         version: u64,
         scan: crate::shell::CloudScan,
     },
-    /// "Show more options" menu is ready.
-    ShellMenu {
-        request: u64,
-        result: Result<crate::shell::ShellMenu, crate::shell::ShellError>,
-    },
+    /// The Windows context menu ("Show more options" and pinned commands).
+    ShellMenu(menu::ShellMenuEvent),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
@@ -384,6 +404,18 @@ pub(crate) enum ExplorerEvent {
         path: PathBuf,
         activate: bool,
     },
+    /// A pinned tab was asked to go to another folder: it stays, and `path` opens in a new tab
+    /// with `select` selected there.
+    LockedNav {
+        path: PathBuf,
+        select: Vec<Arc<str>>,
+    },
+    /// "New folder in…" / "New file in…" on a subfolder of a pinned tab: `dir` opens in a new
+    /// tab (or the one already on it), and the item is made there.
+    LockedNewItem {
+        dir: PathBuf,
+        kind: ops::NewItem,
+    },
     /// Split or unsplit the current tab.
     ToggleSplit,
     /// This pane was clicked (becomes the active side in dual pane).
@@ -400,12 +432,12 @@ pub(crate) enum ExplorerEvent {
     NetLogin(PathBuf),
     /// Moved to another folder (recorded in Recent).
     /// Arrived at a folder; `stepped` when the history recorded a step back to where it was.
+    /// `kind` is how it got there (a history menu jump moves the timeline only once it lands).
     Navigated {
         path: PathBuf,
         stepped: bool,
+        kind: NavKind,
     },
-    /// The back (`true`) or forward toolbar button: the workspace decides what it moves.
-    HistoryButton(bool),
     /// Back left a folder that was opened from Home: the workspace shows Home again.
     BackToHome {
         start: bool,
@@ -424,6 +456,9 @@ pub(crate) enum ExplorerEvent {
     ToggleCompare,
     /// Dual pane: select what the comparison marked, in both panes.
     SelectDifferences,
+    /// F2 with nothing to rename in the list while a drive or network place is open: the
+    /// workspace renames that place if it can be renamed.
+    RenamePlace(PathBuf),
 }
 
 /// Where this `Explorer` sits in its tab. Set by `Workspace` before every render.
@@ -437,25 +472,16 @@ pub(crate) struct PaneInfo {
     pub(crate) split: bool,
     /// This is the active side.
     pub(crate) active: bool,
-    /// Window caption buttons go in this pane's top bar (the rightmost pane).
-    pub(crate) show_caption: bool,
-    /// The operation center button goes in this pane's top bar. It shows jobs from the whole app,
-    /// so a split tab draws it once (the rightmost pane), not once per side.
-    pub(crate) show_ops: bool,
     /// Current folder of the other pane (copy/move destination).
     pub(crate) peer: Option<PathBuf>,
     /// Share of the list area width.
     pub(crate) share: f32,
     /// Split tab: room at the tab's right end taken by the shared preview (both panes get it).
     pub(crate) reserve: Pixels,
-    /// Split tab: this pane's box runs on under the shared preview (the rightmost pane), so its
-    /// top bar spans the whole tab and keeps the caption buttons in the corner.
+    /// Split tab: this pane's box runs on under the shared preview (the rightmost pane).
     pub(crate) trailing: bool,
     /// Split tab: this is the active side and the tab's shared preview shows its item.
     pub(crate) preview_host: Option<SharedPreview>,
-    /// Back, forward and refresh are drawn in the sidebar header (vertical tabs); the top bar keeps
-    /// only up and the path.
-    pub(crate) nav_in_sidebar: bool,
     /// Dual pane: synchronized browsing is on for this tab.
     pub(crate) synced: bool,
     /// Dual pane: the folders are being compared.
@@ -470,14 +496,11 @@ impl Default for PaneInfo {
         Self {
             split: false,
             active: true,
-            show_caption: true,
-            show_ops: true,
             peer: None,
             share: 1.,
             reserve: px(0.),
             trailing: false,
             preview_host: None,
-            nav_in_sidebar: false,
             synced: false,
             comparing: false,
             pair_toggles: false,
@@ -513,6 +536,50 @@ pub(crate) struct Metrics {
     pub(crate) first_frame: Option<Duration>,
     pub(crate) first_listing: Option<Duration>,
     listing_ready: bool,
+    /// What this pane's first frame and listing are logged as, if anything.
+    pub(crate) clock: StartClock,
+    /// First frame, timed by `clock`.
+    pub(crate) clock_first_frame: Option<Duration>,
+}
+
+/// How a pane's first frame and first full listing are logged. A window hands its timing to the
+/// pane it shows in its first frame (`Workspace::render`); every other pane is untimed, since it
+/// may first be drawn hours later (a restored tab, a folder under Home).
+#[derive(Default, Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum StartClock {
+    #[default]
+    Untimed,
+    /// The window the process started with: a cold start, from process start.
+    Cold(Instant),
+    /// A window the resident process opened when asked: from when the request arrived.
+    Request(Instant),
+}
+
+impl StartClock {
+    /// A new window's: a cold start if it is the window the process started with.
+    pub(crate) fn for_window(started_at: Instant) -> Self {
+        if claim_cold_start(started_at) {
+            Self::Cold(started_at)
+        } else {
+            Self::Untimed
+        }
+    }
+}
+
+/// When the process started (set by `main`, except for a launch in the background, which opens
+/// no window). The window created with exactly this time is the first one; any other window (one
+/// a resident Arke opens hours later) would log hours as a "cold start".
+static PROCESS_START: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
+
+pub(crate) fn mark_process_start(at: Instant) {
+    let _ = PROCESS_START.set(at);
+}
+
+/// Whether a window created with `started_at` logs the cold-start timings; true at most once.
+pub(crate) fn claim_cold_start(started_at: Instant) -> bool {
+    static CLAIMED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    PROCESS_START.get() == Some(&started_at)
+        && !CLAIMED.swap(true, std::sync::atomic::Ordering::Relaxed)
 }
 
 /// Inputs a filter result depends on: directory, content version, sort, query. Any change means
@@ -522,8 +589,6 @@ type FilterKey = (Gen, u64, SortSpec, String);
 /// When only folder sizes changed and the list is this small, resort inline (about 10k comparisons,
 /// well under 1 ms).
 const INLINE_SORT_MAX: usize = 1_000;
-/// Minimum interval between resorts by size while folder sizes are still being computed.
-const SIZE_RESORT_EVERY: Duration = Duration::from_millis(300);
 
 /// Returns a sorted copy. When sorting by size, `dir_sizes` supplies folder sizes.
 fn sort_entries(
@@ -536,6 +601,10 @@ fn sort_entries(
         None => resort(entries, spec),
     }
 }
+
+/// A sort running in the background: (folder, content version, sort, folder size version, system
+/// type name version) it was started with.
+type SortJob = (Gen, u64, SortSpec, Option<u64>, Option<u32>);
 
 struct Filtered {
     key: FilterKey,
@@ -561,6 +630,10 @@ pub(crate) struct Explorer {
     /// Back and forward button states set by the workspace when they follow the timeline
     /// across tabs (`workspace_nav.rs`); `None`: this pane's own history.
     pub(crate) global_nav: Option<(bool, bool)>,
+    /// The pane is in a pinned tab, which keeps its folder: going anywhere else opens a new tab
+    /// instead ([`ExplorerEvent::LockedNav`]), and its own back and forward are off. Set by the
+    /// workspace.
+    pub(crate) locked: bool,
     pub(crate) sort: SortSpec,
     /// Last seen default sort and view. Tabs still on the old defaults follow when settings change.
     seen_defaults: (SortSpec, ViewMode),
@@ -576,6 +649,10 @@ pub(crate) struct Explorer {
     pub(crate) preview_resized: bool,
     /// Pressed on the preview pane's edge: where (x), and the pane's width then.
     preview_drag_start: Option<(Pixels, Pixels)>,
+    /// A column view column was dragged but its width is not saved yet (saved on release).
+    pub(crate) view_column_resized: Option<crate::prefs::ViewColumn>,
+    /// Pressed on a column view divider: which column, where (x), and the column's width then.
+    view_column_drag: Option<(crate::prefs::ViewColumn, Pixels, Pixels)>,
     /// Where the symlinks and junctions in this folder point (Link target column).
     link_targets: details::LinkTargets,
     /// Alt-drop with the menu still open: files to drop and destination.
@@ -588,16 +665,17 @@ pub(crate) struct Explorer {
     pub(crate) show_thumbnails: bool,
     /// Read images and exe icons on network locations too (settings, off by default).
     pub(crate) network_thumbnails: bool,
+    /// Names given to mapped drives and network places (settings), shown for their roots.
+    pub(crate) place_names: crate::place_names::Names,
     /// Language currently used for input placeholders.
     language: crate::settings::Language,
-    sort_inflight: Option<(Gen, u64, SortSpec, Option<u64>)>,
+    sort_inflight: Option<SortJob>,
+    /// Version of the system type names the current order was sorted with (`None`: the sort
+    /// doesn't use the Type column). Names arrive after the first sort.
+    type_order: Option<u32>,
     /// Folder size version the current order was sorted with (dir, content version, size version).
     /// `None` if sizes weren't used.
     size_order: Option<(Gen, u64, u64)>,
-    /// Just resorted by folder size; wait before the next resort so the list doesn't jump on every
-    /// finished folder.
-    size_resort_cooling: bool,
-    size_resort_task: Option<Task<()>>,
     show_hidden: bool,
     /// Hidden-rules version the list was built with.
     hidden_rules: u32,
@@ -619,11 +697,15 @@ pub(crate) struct Explorer {
     list_bounds: marquee::ListBounds,
     /// Folder dropdown opened from a breadcrumb chevron or the overflow button.
     path_popup: Option<path_bar::PathPopup>,
+    /// The folder dropdown a press outside it just closed.
+    path_popup_dismissed: Option<path_bar::Dismissed>,
     /// Autocomplete while typing a path.
     suggest: path_bar::Suggest,
     path_bounds: path_bar::PathBounds,
-    /// Width of the title bar slot the path bar sits in (it sizes to its content inside it).
+    /// Width of the title bar slot the path bar fills.
     path_slot: path_bar::SlotWidth,
+    /// The title row's search box width and the press-to-drag on the path bar.
+    top_row: top_bar::TopRow,
     filter_input: Entity<TextInput>,
     /// Filter box text, excluding uncommitted IME composition.
     pub(crate) query: String,
@@ -636,6 +718,9 @@ pub(crate) struct Explorer {
     filter_menu: Option<Facet>,
     /// Highlighted row of that menu.
     menu_cursor: usize,
+    /// Whether that row is lit: only once a key moved it or the menu was opened with the keys.
+    /// Opened with the mouse, the row under the pointer is the only one lit.
+    menu_keys: bool,
     /// Keyboard focus inside the search panel (Tab from the box). Mouse use keeps focus in the
     /// box so typing goes on there.
     panel_focus: FocusHandle,
@@ -730,6 +815,13 @@ pub(crate) struct Explorer {
     /// Press inside a multi-selection: keep the selection (it may be dragged) and narrow to this
     /// item on release if no drag happened.
     click_select: Option<usize>,
+    /// The last press landed on this item's name (set by the name, read by the item's handler,
+    /// which runs after it).
+    name_pressed: Option<usize>,
+    /// A press on the name of the only selected item (#89): released without a second click, it
+    /// renames once the double-click time has passed, like Explorer.
+    rename_press: Option<Arc<str>>,
+    rename_wait: Option<Task<()>>,
     /// List density (settings, shared by all tabs).
     pub(crate) density: Density,
     /// Preview pane on the right is open (settings).
@@ -771,6 +863,11 @@ pub(crate) struct Explorer {
     /// Sideways scroll the header was drawn at in this render (`None`: no header), to redraw it
     /// if the list clamps its own.
     header_x: std::cell::Cell<Option<Pixels>>,
+    /// Height the side preview's frame got at the last layout (less than asked for in a short
+    /// window), so a PDF's pages fit what is shown.
+    pane_frame_h: std::rc::Rc<std::cell::Cell<Option<Pixels>>>,
+    /// The side preview's details, which scroll (with a scrollbar) in a window too short for them.
+    pane_info_scroll: (gpui::ScrollHandle, crate::scrollbar::ScrollbarDrag),
     /// Full pane width including the preview pane. The top bar and context bar span it, so it
     /// decides which buttons collapse.
     pub(crate) bar_width: Pixels,
@@ -788,11 +885,14 @@ pub(crate) struct Explorer {
     /// Scroll position and scrollbar for scrollable content in the preview pane and Quick Look
     /// (text, folders, archives).
     pub(crate) preview_scroll: gpui::ScrollHandle,
-    /// Where the progress ring is drawn now; eases toward the real progress.
-    pub(crate) ring_shown: std::rc::Rc<std::cell::Cell<f32>>,
+    /// Where the progress ring is drawn now (eases toward the real progress), and its next frame.
+    pub(crate) ring: std::rc::Rc<op_view::RingState>,
     pub(crate) preview_scrollbar: crate::scrollbar::ScrollbarDrag,
+    /// Sideways scrollbars of the same two, for previews wider than their frame (sheets, CSV).
+    pub(crate) preview_hscrollbar: crate::scrollbar::ScrollbarDrag,
     pub(crate) look_scroll: gpui::ScrollHandle,
     pub(crate) look_scrollbar: crate::scrollbar::ScrollbarDrag,
+    pub(crate) look_hscrollbar: crate::scrollbar::ScrollbarDrag,
     /// Error banner button (server unreachable: retry; login needed: log in).
     pub(crate) error_action: Option<ErrorAction>,
     /// Showing the last cached contents of a network folder (fresh listing pending, or the server
@@ -801,12 +901,13 @@ pub(crate) struct Explorer {
     /// Changes on every navigation; auto-retry only reopens if the user hasn't gone elsewhere.
     retry_token: u64,
     last_timing: Option<ListTiming>,
-    window_title: String,
     started_at: Instant,
     pub(crate) metrics: Metrics,
     bench: Option<Bench>,
     loading_task: Option<Task<()>>,
     sort_task: Option<Task<()>>,
+    /// Watcher changes too many for the UI thread in a large folder, merged in the background
+    delta_merge: Option<DeltaMerge>,
     _event_loop: Task<()>,
     _subscriptions: Vec<Subscription>,
 }
@@ -822,11 +923,26 @@ pub(crate) fn short_path(path: &Path) -> String {
     format!("…{}{}", std::path::MAIN_SEPARATOR, tail.display())
 }
 
+/// Watcher changes being merged in the background ([`Explorer::merge_in_background`]).
+struct DeltaMerge {
+    generation: Gen,
+    /// Changes that arrived since, applied after the merge.
+    backlog: Vec<arke_core::Delta>,
+    _task: Task<()>,
+}
+
 pub(crate) fn spawn_thread(name: &str, f: impl FnOnce() + Send + 'static) {
     if let Err(err) = std::thread::Builder::new().name(name.into()).spawn(f) {
         log::error!("failed to spawn thread {name}: {err}");
     }
 }
+
+/// Most folders the back and forward buttons' menu lists.
+pub(crate) const HISTORY_MENU_MAX: usize = 15;
+
+/// How long a pinned tab waits to learn whether a path typed in it is a file before opening it
+/// in a new tab anyway.
+const LOCKED_PROBE_WAIT: Duration = Duration::from_millis(500);
 
 impl Explorer {
     #[allow(
@@ -895,6 +1011,7 @@ impl Explorer {
             history: History::default(),
             from_home: None,
             global_nav: None,
+            locked: false,
             sort: defaults.0,
             seen_defaults: defaults,
             // A benchmark measures a fixed view, never one saved by the user
@@ -907,6 +1024,8 @@ impl Explorer {
             column_resized: false,
             preview_resized: false,
             preview_drag_start: None,
+            view_column_resized: None,
+            view_column_drag: None,
             link_targets: details::LinkTargets::default(),
             pending_drop: None,
             right_press: None,
@@ -914,11 +1033,11 @@ impl Explorer {
             group_cache: groups::GroupCache::default(),
             show_thumbnails: settings.read(cx).settings.show_thumbnails,
             network_thumbnails: settings.read(cx).settings.network_thumbnails,
+            place_names: settings.read(cx).settings.place_names.clone(),
             language: crate::settings::Language::System,
             sort_inflight: None,
+            type_order: None,
             size_order: None,
-            size_resort_cooling: false,
-            size_resort_task: None,
             show_hidden: settings.read(cx).settings.show_hidden,
             hidden_rules: arke_core::entry::hidden_rules_version(),
             hidden_count: 0,
@@ -933,9 +1052,11 @@ impl Explorer {
             row_pressed: false,
             list_bounds: marquee::ListBounds::default(),
             path_popup: None,
+            path_popup_dismissed: None,
             suggest: path_bar::Suggest::default(),
             path_bounds: path_bar::PathBounds::default(),
             path_slot: path_bar::SlotWidth::default(),
+            top_row: top_bar::TopRow::default(),
             filter_input,
             query: String::new(),
             filtered: None,
@@ -944,6 +1065,7 @@ impl Explorer {
             content_filter: None,
             filter_menu: None,
             menu_cursor: 0,
+            menu_keys: false,
             panel_focus: cx.focus_handle(),
             panel_cursor: scope::PanelItem::Scope(scope::Scope::Here),
             panel_geometry: std::rc::Rc::default(),
@@ -998,6 +1120,9 @@ impl Explorer {
             pane: PaneInfo::default(),
             compare: None,
             click_select: None,
+            name_pressed: None,
+            rename_press: None,
+            rename_wait: None,
             density: settings.read(cx).settings.density,
             preview_pane: settings.read(cx).settings.preview_pane,
             preview_cue: crate::motion::Cue::default(),
@@ -1012,35 +1137,45 @@ impl Explorer {
             preview_gen: 0,
             zoom: preview::Zoom::default(),
             pdf_cache: preview::PdfCache::default(),
-            screen: (gpui::size(px(1280.), px(800.)), 1.),
+            screen: (
+                gpui::size(
+                    crate::theme::scaled_px(1280.),
+                    crate::theme::scaled_px(800.),
+                ),
+                1.,
+            ),
             cloud: cloud::CloudStates::default(),
             preview_task: None,
-            pane_width: px(1000.),
+            pane_width: crate::theme::scaled_px(1000.),
             fit: layout::Fit::default(),
             cols: None,
             header_x: std::cell::Cell::new(None),
-            bar_width: px(1000.),
-            paper_width: px(1000.),
+            pane_frame_h: std::rc::Rc::default(),
+            pane_info_scroll: Default::default(),
+            bar_width: crate::theme::scaled_px(1000.),
+            paper_width: crate::theme::scaled_px(1000.),
             show_loading: false,
             error: None,
             failed: None,
             scrollbar_drag: crate::scrollbar::ScrollbarDrag::default(),
             hscrollbar_drag: crate::scrollbar::ScrollbarDrag::default(),
             preview_scroll: gpui::ScrollHandle::new(),
-            ring_shown: std::rc::Rc::default(),
+            ring: std::rc::Rc::default(),
             preview_scrollbar: crate::scrollbar::ScrollbarDrag::default(),
+            preview_hscrollbar: crate::scrollbar::ScrollbarDrag::default(),
             look_scroll: gpui::ScrollHandle::new(),
             look_scrollbar: crate::scrollbar::ScrollbarDrag::default(),
+            look_hscrollbar: crate::scrollbar::ScrollbarDrag::default(),
             error_action: None,
             showing_cached: false,
             retry_token: 0,
             last_timing: None,
-            window_title: String::new(),
             started_at,
             metrics: Metrics::default(),
             bench,
             loading_task: None,
             sort_task: None,
+            delta_merge: None,
             _event_loop: event_loop,
             _subscriptions: subscriptions,
         };
@@ -1065,11 +1200,13 @@ impl Explorer {
             dir_service = dir_service.with_probe(probe);
         }
         let search_tx = events_tx.clone();
-        let search = SearchService::new(
+        // Below a network location in "this PC" search, its index stands in for walking the share.
+        let search = SearchService::with_index(
             Arc::clone(&services.fs),
             Arc::new(move |results| {
                 let _ = search_tx.send(AppEvent::Search(results));
             }),
+            Some(Arc::new(crate::global_search::indexed_tree)),
         );
         // Background results are handled in order on this foreground task; awaiting doesn't block
         // the UI thread.
@@ -1123,10 +1260,13 @@ impl Explorer {
             .is_some_and(arke_core::remote::is_remote)
     }
 
-    /// Tab title: the folder name (`C:\` for drive roots, the share name for `\server\share`).
+    /// Tab title: the folder name (`C:\` for drive roots, the share name for `\server\share`), or the
+    /// name given to a mapped drive or network place.
     pub(crate) fn tab_title(&self) -> SharedString {
         match self.display_path() {
-            Some(p) => tab_title_for(p).into(),
+            Some(p) => crate::place_names::shown_name(&self.place_names, p)
+                .unwrap_or_else(|| tab_title_for(p))
+                .into(),
             None => "Arke".into(),
         }
     }
@@ -1158,6 +1298,105 @@ impl Explorer {
         // Remote URLs in one spelling (`Path::join` adds backslashes), so history and the
         // sidebar compare them right.
         let path = arke_core::remote::canonical(path);
+        // A pinned tab keeps its folder (QTTabBar's locked tabs): somewhere else opens beside it.
+        if kind != NavKind::Refresh && self.locked_elsewhere(&path) {
+            cx.emit(ExplorerEvent::LockedNav { path, select });
+            return;
+        }
+        self.go_to(path, kind, select, cx);
+    }
+
+    /// The pane keeps its folder and `path` is another one.
+    fn locked_elsewhere(&self, path: &Path) -> bool {
+        self.keeps_folder()
+            && self
+                .display_path()
+                .is_some_and(|here| !same_folder(here, path))
+    }
+
+    /// The pane is pinned and has a folder to keep. One whose folder can't be shown (renamed,
+    /// deleted, a drive or server gone: the error page) can be pointed somewhere else in place.
+    pub(crate) const fn keeps_folder(&self) -> bool {
+        self.locked && !(self.failed.is_some() || (self.model.is_none() && self.pending.is_none()))
+    }
+
+    /// A path typed in a pinned tab's path bar opens beside it. A file isn't a folder to open a
+    /// tab on: it opens, and its folder shows it selected, in this tab when that is the pinned
+    /// folder. Whether it is a file is asked off the UI thread; a slow answer (a sleeping server)
+    /// leaves it to the new tab, which handles files itself.
+    fn locked_nav(&mut self, path: PathBuf, select: Vec<Arc<str>>, cx: &mut Context<Self>) {
+        let path = arke_core::remote::canonical(path);
+        if arke_core::remote::is_remote(&path) || path.file_name().is_none() {
+            cx.emit(ExplorerEvent::LockedNav { path, select });
+            return;
+        }
+        let fs = Arc::clone(&self.services.fs);
+        let probe = path.clone();
+        let (tx, rx) = flume::bounded(1);
+        spawn_thread("locked-nav-probe", move || {
+            let (stat_tx, stat_rx) = flume::bounded(1);
+            spawn_thread("locked-nav-stat", move || {
+                let _ = stat_tx.send(fs.stat(&probe).is_ok_and(|e| !e.is_dir_like()));
+            });
+            let _ = tx.send(stat_rx.recv_timeout(LOCKED_PROBE_WAIT).unwrap_or(false));
+        });
+        cx.spawn(async move |this, cx| {
+            let is_file = rx.recv_async().await.unwrap_or(false);
+            let _ = this.update(cx, |this, cx| {
+                this.finish_locked_nav(path, select, is_file, cx);
+            });
+        })
+        .detach();
+    }
+
+    fn finish_locked_nav(
+        &mut self,
+        path: PathBuf,
+        select: Vec<Arc<str>>,
+        is_file: bool,
+        cx: &mut Context<Self>,
+    ) {
+        let file = is_file
+            .then(|| Some((arke_core::path::parent(&path)?, path.file_name()?)))
+            .flatten();
+        let Some((parent, name)) = file else {
+            cx.emit(ExplorerEvent::LockedNav { path, select });
+            return;
+        };
+        let name: Arc<str> = name.to_string_lossy().into();
+        self.open_file(path.clone(), cx);
+        if self
+            .display_path()
+            .is_some_and(|here| same_folder(here, &parent))
+        {
+            self.select_in_folder(&parent, vec![name], cx);
+        } else {
+            cx.emit(ExplorerEvent::LockedNav {
+                path: parent,
+                select: vec![name],
+            });
+        }
+    }
+
+    /// [`Self::navigate`] even in a pinned tab: for moves the tab can't refuse, such as leaving a
+    /// drive that is being ejected.
+    pub(crate) fn navigate_unlocked(
+        &mut self,
+        path: PathBuf,
+        kind: NavKind,
+        cx: &mut Context<Self>,
+    ) {
+        let path = arke_core::remote::canonical(path);
+        self.go_to(path, kind, Vec::new(), cx);
+    }
+
+    fn go_to(
+        &mut self,
+        path: PathBuf,
+        kind: NavKind,
+        select: Vec<Arc<str>>,
+        cx: &mut Context<Self>,
+    ) {
         // A network location was opened, so the NAS is awake and global search can refresh its
         // index.
         crate::global_search::GlobalSearch::wake(&path, cx);
@@ -1358,14 +1597,24 @@ impl Explorer {
 
     /// State for the sidebar nav buttons: (can go back, can go forward, can refresh).
     pub(crate) const fn nav_state(&self) -> (bool, bool, bool) {
-        (
-            self.history.can_go_back(),
-            self.history.can_go_forward(),
-            self.model.is_some(),
-        )
+        (self.can_go(true), self.can_go(false), self.model.is_some())
+    }
+
+    /// Whether this pane's own history can go back (or forward). Never in a pinned tab: its
+    /// folder stays, and back from a tab opened out of it returns to it across tabs.
+    pub(crate) const fn can_go(&self, back: bool) -> bool {
+        !self.locked
+            && if back {
+                self.history.can_go_back()
+            } else {
+                self.history.can_go_forward()
+            }
     }
 
     pub(crate) fn go_back(&mut self, _: &GoBack, _: &mut Window, cx: &mut Context<Self>) {
+        if self.locked {
+            return;
+        }
         if let Some(target) = self.history.back_target() {
             let home = self
                 .from_home
@@ -1388,12 +1637,94 @@ impl Explorer {
     }
 
     pub(crate) fn go_forward(&mut self, _: &GoForward, _: &mut Window, cx: &mut Context<Self>) {
+        if self.locked {
+            return;
+        }
         if let Some(target) = self.history.forward_target() {
             self.navigate(target.to_path_buf(), NavKind::Forward, cx);
         }
     }
 
-    fn go_up(&mut self, _: &GoUp, _: &mut Window, cx: &mut Context<Self>) {
+    /// Folders the back (or forward) button's menu lists, the nearest first. None in a pinned
+    /// tab, whose buttons are off too.
+    pub(crate) fn history_menu(&self, back: bool) -> Vec<PathBuf> {
+        if self.locked {
+            return Vec::new();
+        }
+        let entries: Vec<&Path> = if back {
+            self.history.back_entries().collect()
+        } else {
+            self.history.forward_entries().collect()
+        };
+        // Home was where the tab started: Back stops on Home, so the folders under it can't be
+        // reached by going back (the menu doesn't offer them either).
+        let reachable = match self.from_home {
+            Some((at, true)) if back && at <= self.history.depth() => self.history.depth() + 1 - at,
+            _ => usize::MAX,
+        };
+        entries
+            .into_iter()
+            .take(HISTORY_MENU_MAX.min(reachable))
+            .map(Path::to_path_buf)
+            .collect()
+    }
+
+    /// How far down the back (or forward) history `path` is now: `steps` if it is still there,
+    /// else the nearest place it moved to (the history changed while a menu listing it was
+    /// open), or `None` if it is no longer on that side.
+    pub(crate) fn history_steps_to(&self, back: bool, steps: usize, path: &Path) -> Option<usize> {
+        let at = |steps| {
+            if back {
+                self.history.back_at(steps)
+            } else {
+                self.history.forward_at(steps)
+            }
+        };
+        if at(steps) == Some(path) {
+            return Some(steps);
+        }
+        let mut entries: Box<dyn Iterator<Item = &Path>> = if back {
+            Box::new(self.history.back_entries())
+        } else {
+            Box::new(self.history.forward_entries())
+        };
+        entries.position(|p| p == path).map(|ix| ix + 1)
+    }
+
+    /// Opens the `steps`-th folder of the back (or forward) history (1 is what the button
+    /// opens), leaving the ones passed over on the other side. Returns whether it started going
+    /// there. Going back past a folder opened from Home shows Home over the folder before it,
+    /// as pressing Back that many times does.
+    pub(crate) fn go_to_history(
+        &mut self,
+        back: bool,
+        steps: usize,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        if self.locked || steps == 0 {
+            return false;
+        }
+        let target = if back {
+            self.history.back_at(steps)
+        } else {
+            self.history.forward_at(steps)
+        };
+        let Some(target) = target.map(Path::to_path_buf) else {
+            return false;
+        };
+        let depth = self.history.depth();
+        let home = self
+            .from_home
+            .filter(|&(at, _)| back && at <= depth && depth - steps + 1 == at)
+            .map(|(_, start)| start);
+        self.navigate(target, NavKind::Jump { back, steps }, cx);
+        if let Some(start) = home {
+            cx.emit(ExplorerEvent::BackToHome { start });
+        }
+        true
+    }
+
+    pub(crate) fn go_up(&mut self, _: &GoUp, _: &mut Window, cx: &mut Context<Self>) {
         let Some(here) = self.display_path().map(Path::to_path_buf) else {
             return;
         };
@@ -1559,6 +1890,11 @@ impl Explorer {
                 self.handle_extract_done(result, folder, cx);
             }
             AppEvent::Preview { generation, data } => self.handle_preview(generation, data, cx),
+            AppEvent::PanePdfPage(page) => self.handle_pane_pdf_page(page, cx),
+            AppEvent::PreviewCreated {
+                generation,
+                created,
+            } => self.handle_preview_created(generation, created, cx),
             AppEvent::ZoomImage { generation, image } => {
                 self.handle_zoom_image(generation, image, cx);
             }
@@ -1573,7 +1909,7 @@ impl Explorer {
             AppEvent::LinkTargets { generation, found } => {
                 self.handle_link_targets(generation, found, cx);
             }
-            AppEvent::ShellMenu { request, result } => self.handle_shell_menu(request, result, cx),
+            AppEvent::ShellMenu(event) => self.handle_shell_menu_event(event, cx),
             AppEvent::Tree { node, rel, event } => self.handle_tree_io(node, &rel, event, cx),
         }
     }
@@ -1593,11 +1929,13 @@ impl Explorer {
             } if generation == current => {
                 if let Some(pending) = self.pending.take_if(|p| p.generation == generation) {
                     let folder_view = pending.folder_view;
+                    let kind = pending.kind;
                     let stepped = self.commit_navigation(pending, &path, sorted_by);
                     self.folder_view_on_commit(folder_view, cx);
                     cx.emit(ExplorerEvent::Navigated {
                         path: path.clone(),
                         stepped,
+                        kind,
                     });
                 }
                 let Some(model) = self.model.as_mut().filter(|m| m.generation == generation) else {
@@ -1637,12 +1975,16 @@ impl Explorer {
                 self.list_failed(path, error, kind, cx);
             }
             IoEvent::Delta { generation, delta } if generation == current => {
+                self.folder_contents_changed(cx);
                 self.apply_folder_delta(generation, delta, cx);
             }
             IoEvent::IsFile { generation, path } if generation == current => {
                 self.arrived_at_file(path, cx);
             }
-            IoEvent::NeedsRescan { generation } if generation == current => self.reload(cx),
+            IoEvent::NeedsRescan { generation } if generation == current => {
+                self.folder_contents_changed(cx);
+                self.reload(cx);
+            }
             // Stale results are dropped.
             _ => {}
         }
@@ -1655,11 +1997,24 @@ impl Explorer {
         delta: arke_core::Delta,
         cx: &mut Context<Self>,
     ) {
+        // A merge is running: this one follows it, in order.
+        if let Some(merge) = self
+            .delta_merge
+            .as_mut()
+            .filter(|m| m.generation == generation)
+        {
+            merge.backlog.push(delta);
+            return;
+        }
         // With folders expanded, rows above the screen may come and go: keep the view.
         let anchor = self.scroll_anchor(None);
         let Some(model) = self.model.as_mut().filter(|m| m.generation == generation) else {
             return;
         };
+        if model.delta_too_big(&delta) {
+            self.merge_in_background(generation, delta, cx);
+            return;
+        }
         let removed = delta.removed.clone();
         if model.apply_delta(delta) == DeltaOutcome::NeedsRescan {
             self.reload(cx);
@@ -1668,6 +2023,65 @@ impl Explorer {
         self.selection.remove_names(&removed);
         self.after_content_change(cx);
         self.restore_scroll_anchor(anchor);
+    }
+
+    /// A large folder got more changes than the UI thread applies in a frame: merge them into a
+    /// copy of the list on the background executor (one pass, O(n + k log k)) and swap it in,
+    /// instead of listing the whole folder again. Changes arriving meanwhile wait their turn.
+    fn merge_in_background(
+        &mut self,
+        generation: Gen,
+        delta: arke_core::Delta,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(model) = self.model.as_ref().filter(|m| m.generation == generation) else {
+            return;
+        };
+        let entries = Arc::clone(&model.entries);
+        let (spec, version) = (model.sorted_by, model.version);
+        let removed = delta.removed.clone();
+        let task = cx.spawn(async move |this, cx| {
+            let merged = cx
+                .background_executor()
+                .spawn(async move { arke_core::model::merged(&entries, &delta, spec) })
+                .await;
+            let _ = this.update(cx, |this, cx| {
+                this.finish_merge(generation, version, merged, &removed, cx);
+            });
+        });
+        self.delta_merge = Some(DeltaMerge {
+            generation,
+            backlog: Vec::new(),
+            _task: task,
+        });
+    }
+
+    fn finish_merge(
+        &mut self,
+        generation: Gen,
+        version: u64,
+        merged: Vec<Entry>,
+        removed: &[Arc<str>],
+        cx: &mut Context<Self>,
+    ) {
+        let Some(merge) = self.delta_merge.take_if(|m| m.generation == generation) else {
+            return;
+        };
+        let anchor = self.scroll_anchor(None);
+        let Some(model) = self.model.as_mut().filter(|m| m.generation == generation) else {
+            return;
+        };
+        // The list changed meanwhile (a re-sort finished): list it again, as before.
+        if !model.replace_merged(version, merged) {
+            self.reload(cx);
+            return;
+        }
+        self.selection.remove_names(removed);
+        self.after_content_change(cx);
+        self.restore_scroll_anchor(anchor);
+        for delta in merge.backlog {
+            self.apply_folder_delta(generation, delta, cx);
+        }
     }
 
     /// The folder asked for can't be listed: stay put and say why (or show the error page).
@@ -1872,19 +2286,32 @@ impl Explorer {
             .size_order
             .filter(|o| (o.0, o.1) == (model.generation, model.version))
             .map(|o| o.2);
-        let key = (model.generation, model.version, self.sort, want);
-        // Column and direction already match; only folder sizes are out of date.
+        let want_type = self
+            .sort
+            .uses(SortColumn::Type)
+            .then(arke_core::format::type_names_version);
+        let key = (model.generation, model.version, self.sort, want, want_type);
+        // Column and direction already match; only folder sizes (or type names) are out of date.
         let only_sizes = model.sorted_by == self.sort;
-        if (only_sizes && have == want) || self.sort_inflight == Some(key) {
+        if (only_sizes && have == want && self.type_order == want_type)
+            || self.sort_inflight == Some(key)
+        {
             return;
         }
+        // The order was sorted by folder sizes, but for an older listing.
+        let listing_changed = self
+            .size_order
+            .is_some_and(|o| (o.0, o.1) != (model.generation, model.version));
         if only_sizes
-            && have.is_some()
-            && want.is_some()
-            && self.size_resort_cooling
+            && self.sort.uses(SortColumn::Size)
+            && !listing_changed
             && self.folder_sizes.computing()
         {
-            // More folders finished; resort together once the cooldown timer fires.
+            // Folder sizes are still coming in: the rows keep their places (sizes fill in where
+            // they are) and the list reorders once, when the last one is known. Reordering as
+            // each arrived made the rows jump around under the pointer. Not when the listing
+            // changed meanwhile (a fresh listing knows no folder sizes, so its folders come in
+            // name order): that sorts once now with the sizes known so far.
             return;
         }
         let spec = self.sort;
@@ -1893,7 +2320,7 @@ impl Explorer {
         if only_sizes && model.entries.len() <= INLINE_SORT_MAX {
             // Small lists sort inline (under 1 ms) so a refresh doesn't briefly show name order.
             let sorted = sort_entries(&model.entries, spec, sizes.as_deref());
-            self.apply_sorted(sorted, spec, want, cx);
+            self.apply_sorted(sorted, spec, want, want_type, cx);
             return;
         }
         self.sort_inflight = Some(key);
@@ -1910,7 +2337,7 @@ impl Explorer {
                     && model.version == version
                     && this.sort == spec
                 {
-                    this.apply_sorted(sorted, spec, want, cx);
+                    this.apply_sorted(sorted, spec, want, want_type, cx);
                     // The user changed the sort: keep the selected item on screen. Don't scroll
                     // when only folder sizes arrived.
                     if !only_sizes && let Some(ix) = this.cursor {
@@ -1929,23 +2356,15 @@ impl Explorer {
         sorted: Vec<Entry>,
         spec: SortSpec,
         sizes_rev: Option<u64>,
+        type_rev: Option<u32>,
         cx: &mut Context<Self>,
     ) {
         let Some(model) = self.model.as_mut() else {
             return;
         };
         model.replace_sorted(Arc::new(sorted), spec);
+        self.type_order = type_rev;
         self.size_order = sizes_rev.map(|rev| (model.generation, model.version, rev));
-        if sizes_rev.is_some() && self.folder_sizes.computing() {
-            self.size_resort_cooling = true;
-            self.size_resort_task = Some(cx.spawn(async move |this, cx| {
-                cx.background_executor().timer(SIZE_RESORT_EVERY).await;
-                let _ = this.update(cx, |this, cx| {
-                    this.size_resort_cooling = false;
-                    this.ensure_sorted(cx);
-                });
-            }));
-        }
         self.ensure_filtered(cx);
         self.resolve_cursor();
         cx.notify();
@@ -2086,6 +2505,17 @@ impl Explorer {
                 }
                 .unwrap_or(0);
                 if ix < self.list_len() {
+                    // A folder opens in the list: the cursor goes there, as with a click, so the
+                    // search box doesn't stay focused and pop its options open (#76). So may a
+                    // shortcut, which opens its folder here too.
+                    let shortcut =
+                        |p: &Path| p.extension().is_some_and(|e| e.eq_ignore_ascii_case("lnk"));
+                    if self
+                        .path_at(ix)
+                        .is_some_and(|(path, is_dir)| is_dir || shortcut(&path))
+                    {
+                        window.focus(&self.list_focus, cx);
+                    }
                     self.open_index(ix, cx);
                 }
             }
@@ -2263,16 +2693,26 @@ impl Explorer {
         cx.notify();
     }
 
-    fn focus_filter(&mut self, _: &FocusFilter, window: &mut Window, cx: &mut Context<Self>) {
+    pub(crate) fn focus_filter(
+        &mut self,
+        _: &FocusFilter,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         self.focus_filter_input(window, cx);
     }
 
-    fn focus_search(&mut self, _: &FocusSearch, window: &mut Window, cx: &mut Context<Self>) {
+    pub(crate) fn focus_search(
+        &mut self,
+        _: &FocusSearch,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         self.set_scope(scope::Scope::Subfolders, cx);
         self.focus_filter_input(window, cx);
     }
 
-    fn focus_computer_search(
+    pub(crate) fn focus_computer_search(
         &mut self,
         _: &FocusComputerSearch,
         window: &mut Window,
@@ -2475,7 +2915,7 @@ impl Explorer {
     /// Height taken outside the list: top bar, context bar, column header, bottom margin and list
     /// padding.
     fn list_chrome() -> Pixels {
-        theme::H_BAR + theme::H_CTX + theme::H_HEADER + theme::S_8 + theme::S_8
+        theme::h_bar() + theme::h_ctx() + theme::h_header() + theme::s_8() + theme::s_8()
     }
 
     fn on_path_event(
@@ -2512,6 +2952,7 @@ impl Explorer {
         self.group_rows = settings.group_rows;
         self.show_thumbnails = settings.show_thumbnails;
         self.network_thumbnails = settings.network_thumbnails;
+        self.place_names = settings.place_names.clone();
         self.tree_setting(settings.details_tree);
         if settings.language != self.language {
             self.language = settings.language;
@@ -2565,20 +3006,15 @@ impl Explorer {
     }
 
     /// Split panes are half width, so they use compact density.
-    pub(crate) const fn row_height(&self) -> Pixels {
+    pub(crate) fn row_height(&self) -> Pixels {
         if self.pane.split {
-            return theme::H_ROW_COMPACT;
+            return theme::h_row_compact();
         }
         match self.density {
-            Density::Compact => theme::H_ROW_COMPACT,
-            Density::Standard => theme::H_ROW,
-            Density::Comfortable => theme::H_ROW_COMFORTABLE,
+            Density::Compact => theme::h_row_compact(),
+            Density::Standard => theme::h_row(),
+            Density::Comfortable => theme::h_row_comfortable(),
         }
-    }
-
-    /// Too narrow for the Date modified column.
-    pub(crate) fn narrow(&self) -> bool {
-        self.pane_width < px(560.)
     }
 
     fn page_rows(&self, window: &Window) -> usize {
@@ -2725,6 +3161,18 @@ impl Explorer {
         }
     }
 
+    /// Alt+Enter: the Properties window for the selection (the folder itself when nothing is
+    /// selected).
+    fn show_properties(&mut self, _: &ShowProperties, _: &mut Window, cx: &mut Context<Self>) {
+        let mut targets = self.menu_targets();
+        if targets.is_empty()
+            && let Some(path) = self.current_path()
+        {
+            targets.push((path.to_path_buf(), true));
+        }
+        self.open_properties(targets, cx);
+    }
+
     /// Shift+Enter (search results): goes to the item's folder and selects it.
     fn open_location(&mut self, _: &OpenLocation, _: &mut Window, cx: &mut Context<Self>) {
         let Some(hit) = self.search_hit(self.search_cursor) else {
@@ -2774,18 +3222,9 @@ impl Explorer {
         }
     }
 
-    /// Opens a bookmark: folders navigate here, files open with the default app.
-    pub(crate) fn open_bookmark(&mut self, path: PathBuf, is_dir: bool, cx: &mut Context<Self>) {
-        if is_dir {
-            self.navigate(path, NavKind::New, cx);
-        } else {
-            self.open_file(path, cx);
-        }
-    }
-
-    /// Opens with the default app. ShellExecuteExW loads third-party shell extensions, so it runs
-    /// on a
-    /// dedicated STA thread. Shortcuts (`.lnk`) to folders open in Arke instead of Explorer.
+    /// Opens with the default app, in this view's sort order (Photos steps through the folder in
+    /// it). ShellExecuteExW loads third-party shell extensions, so it runs on a dedicated STA
+    /// thread. Shortcuts (`.lnk`) to folders open in Arke instead of Explorer.
     fn open_file(&self, path: PathBuf, cx: &mut App) {
         // Opened files rank first among same-name results in "This PC" search.
         crate::search_history::SearchHistory::record(&path, false, cx);
@@ -2794,12 +3233,13 @@ impl Explorer {
         let shortcut = path
             .extension()
             .is_some_and(|e| e.eq_ignore_ascii_case("lnk"));
+        let sort = self.sort;
         spawn_thread("shell-open", move || {
             if shortcut && let Some((target, true)) = shell.shortcut_target(&path) {
                 let _ = tx.send(AppEvent::OpenFolder(target));
                 return;
             }
-            if let Err(error) = shell.open(&path) {
+            if let Err(error) = shell.open(&path, Some(sort)) {
                 let _ = tx.send(AppEvent::OpenFailed { path, error });
             }
         });
@@ -2812,9 +3252,30 @@ impl Explorer {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        let list_was_focused = self.list_focus.is_focused(window);
+        let on_name = self.name_pressed.take() == Some(ix);
         window.focus(&self.list_focus, cx);
         self.row_pressed = true;
         let m = event.modifiers;
+        self.rename_wait = None;
+        self.rename_press = None;
+        // Explorer's slow second click: the item was already the only selection, the list
+        // already had focus (the click isn't the one bringing Arke or the list back), and the
+        // press is on the name.
+        if on_name
+            && list_was_focused
+            && event.click_count == 1
+            && !event.first_mouse
+            && !(m.control || m.shift || m.alt || m.platform)
+            && !self.search_mode
+            && self.renaming.is_none()
+            && !crate::prefs::single_click()
+            && self.selection.len() == 1
+            && let Some(entry) = self.view().and_then(|v| v.get(ix).cloned())
+            && self.selection.contains(&entry.name)
+        {
+            self.rename_press = Some(entry.name);
+        }
         if self.search_mode {
             self.search_cursor = Some(ix);
         } else if let Some(view) = self.view() {
@@ -2842,6 +3303,49 @@ impl Explorer {
             self.open_index(ix, cx);
         }
         cx.notify();
+    }
+
+    /// The press on the selected item's name was released without a drag: rename once the
+    /// double-click time has passed with no other click or key (#89).
+    pub(super) fn on_row_released(
+        &mut self,
+        ix: usize,
+        event: &gpui::ClickEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(name) = self.rename_press.take() else {
+            return;
+        };
+        if event.click_count() != 1
+            || self
+                .view()
+                .and_then(|v| v.get(ix).map(|e| Arc::clone(&e.name)))
+                .is_none_or(|n| n != name)
+        {
+            return;
+        }
+        let wait = crate::win::double_click_time();
+        self.rename_wait = Some(cx.spawn_in(window, async move |this, cx| {
+            cx.background_executor().timer(wait).await;
+            let _ = this.update_in(cx, |this, window, cx| {
+                this.rename_wait = None;
+                // Search results can't be renamed; a search may have started meanwhile.
+                if this.renaming.is_none()
+                    && !this.search_mode
+                    && this.list_focus.is_focused(window)
+                    && this.selection.len() == 1
+                    && this.selection.contains(&name)
+                {
+                    this.start_rename(name, window, cx);
+                }
+            });
+        }));
+    }
+
+    /// Records a press on an item's name; the item's own press handler runs next.
+    pub(super) const fn on_name_pressed(&mut self, ix: usize) {
+        self.name_pressed = Some(ix);
     }
 
     /// Single-click mode: opens on release if there was no drag and no Ctrl/Shift. Returns whether
@@ -2888,6 +3392,8 @@ impl Explorer {
         if !self.list_focus.is_focused(window) {
             return;
         }
+        // A key between the clicks and the rename: no rename (#89).
+        self.rename_wait = None;
         let ks = &event.keystroke;
         if ks.modifiers.control || ks.modifiers.alt || ks.modifiers.platform {
             return;
@@ -2899,7 +3405,7 @@ impl Explorer {
             return;
         }
         if text == " " && !self.typeahead.is_typing(Instant::now()) {
-            self.toggle_quick_look(cx);
+            self.space_preview(cx);
             cx.stop_propagation();
             return;
         }
@@ -2919,7 +3425,12 @@ impl Explorer {
 
     // ───────────────────────── Path bar ─────────────────────────
 
-    fn focus_path_bar(&mut self, _: &FocusPathBar, window: &mut Window, cx: &mut Context<Self>) {
+    pub(crate) fn focus_path_bar(
+        &mut self,
+        _: &FocusPathBar,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         self.start_edit_path(window, cx);
     }
 
@@ -2981,7 +3492,12 @@ impl Explorer {
             .display_path()
             .map_or_else(|| PathBuf::from("C:\\"), Path::to_path_buf);
         if let Some(target) = arke_core::path::resolve_input(&base, &expanded) {
-            self.navigate(target, NavKind::New, cx);
+            // Typed in a pinned tab: it may be a file, which shouldn't get a tab of its own.
+            if self.locked_elsewhere(&target) {
+                self.locked_nav(target, Vec::new(), cx);
+            } else {
+                self.navigate(target, NavKind::New, cx);
+            }
         }
     }
 
@@ -3046,32 +3562,42 @@ impl Explorer {
 
     // ───────────────────────── Per frame ─────────────────────────
 
-    fn on_frame(&mut self, window: &mut Window, cx: &App) {
-        let title = match self.display_path() {
-            Some(_) => format!("{} - Arke", self.tab_title()),
-            None => "Arke".into(),
-        };
-        if title != self.window_title {
-            window.set_window_title(&title);
-            self.window_title = title;
+    /// Takes the window's start timing: this pane is the one its first frame shows.
+    pub(crate) const fn time_start(&mut self, clock: StartClock) {
+        if self.metrics.first_frame.is_none() {
+            self.metrics.clock = clock;
         }
+    }
 
+    fn on_frame(&mut self, window: &mut Window, cx: &App) {
         let since_start = self.started_at.elapsed();
+        let ms = |d: Duration| d.as_secs_f64() * 1e3;
         if self.metrics.first_frame.is_none() {
             self.metrics.first_frame = Some(since_start);
-            log::info!(
-                "cold start: first frame {:.1} ms",
-                since_start.as_secs_f64() * 1e3
-            );
+            if let StartClock::Cold(at) | StartClock::Request(at) = self.metrics.clock {
+                self.metrics.clock_first_frame = Some(at.elapsed());
+            }
+            if let StartClock::Cold(at) = self.metrics.clock {
+                log::info!("cold start: first frame {:.1} ms", ms(at.elapsed()));
+            }
         }
         let listing_ready = self.metrics.listing_ready && self.metrics.first_listing.is_none();
         if listing_ready {
             self.metrics.first_listing = Some(since_start);
-            log::info!(
-                "cold start: first full listing {:.1} ms ({} items)",
-                since_start.as_secs_f64() * 1e3,
-                self.entry_count()
-            );
+            match self.metrics.clock {
+                StartClock::Cold(at) => log::info!(
+                    "cold start: first full listing {:.1} ms ({} items)",
+                    ms(at.elapsed()),
+                    self.entry_count()
+                ),
+                StartClock::Request(at) => log::info!(
+                    "opened on request: first frame {:.1} ms, first full listing {:.1} ms ({} items)",
+                    self.metrics.clock_first_frame.map_or(-1.0, ms),
+                    ms(at.elapsed()),
+                    self.entry_count()
+                ),
+                StartClock::Untimed => {}
+            }
         }
 
         // Scroll metrics count rows; a grid row holds several items.
@@ -3158,6 +3684,17 @@ impl Drop for Explorer {
     fn drop(&mut self) {
         self.dir_service.cancel();
         self.search.stop();
+    }
+}
+
+/// Whether two paths are the same folder: local ones ignoring case and separators, remote URLs
+/// exactly (a server may tell `Docs` from `docs`).
+pub(crate) fn same_folder(a: &Path, b: &Path) -> bool {
+    if arke_core::remote::is_remote(a) || arke_core::remote::is_remote(b) {
+        arke_core::remote::canonical(a.to_path_buf())
+            == arke_core::remote::canonical(b.to_path_buf())
+    } else {
+        arke_core::takeover::same_path(a, b)
     }
 }
 

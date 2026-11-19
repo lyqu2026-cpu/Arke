@@ -45,6 +45,15 @@ pub(crate) enum ShellError {
         /// The items that failed, in order.
         failed: Vec<ItemFailure>,
     },
+    /// Cancelled partway, after items had already failed or while one was half deleted: says so,
+    /// instead of a plain "cancelled" that would hide them.
+    #[error("{}", stopped(.partial.as_deref(), .failed))]
+    Stopped {
+        /// The item being deleted when it stopped, if part of it was already gone.
+        partial: Option<String>,
+        /// Items that failed before it stopped, in order.
+        failed: Vec<ItemFailure>,
+    },
     /// Some items' cloud pin state could not be changed; one "name: reason" line each.
     #[error("{}", cloud_failures(.failed))]
     CloudPin {
@@ -242,6 +251,18 @@ pub(crate) fn items_failed(failed: &[ItemFailure]) -> String {
     text
 }
 
+/// "Stopped before the end. “x” was only partly deleted; … 1 item failed: …".
+fn stopped(partial: Option<&str>, failed: &[ItemFailure]) -> String {
+    let mut parts = vec![t!("fail.stopped").into_owned()];
+    if let Some(name) = partial {
+        parts.push(t!("fail.partly_deleted", name = name).into_owned());
+    }
+    if !failed.is_empty() {
+        parts.push(items_failed(failed));
+    }
+    parts.join(&t!("fail.sentence_gap"))
+}
+
 /// "Copies don't match: a.txt (different content), ..." with at most five names.
 fn verify_failures(failed: &[String]) -> String {
     const SHOWN: usize = 5;
@@ -338,6 +359,10 @@ pub(crate) enum ShellMenuEntry {
         #[serde(with = "icon_wire")]
         icon: Option<arke_core::thumbs::Thumbnail>,
         children: Vec<Self>,
+        /// Set when it was still empty: its extension may fill it only when it is opened, and
+        /// [`Shell::fill_shell_submenu`] reads it by this number then.
+        #[serde(default)]
+        lazy: Option<u32>,
     },
     Separator,
 }
@@ -699,7 +724,99 @@ pub(crate) struct DragImageRequest {
     pub(crate) badge: [u8; 3],
 }
 
+/// What a Properties window shows that a folder listing does not have.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct FileDetails {
+    /// Last access time.
+    pub(crate) accessed: Option<SystemTime>,
+    /// Space the file takes on disk (compressed or sparse files take less than their size, cloud
+    /// files that are not on this device none). `None` when unknown.
+    pub(crate) size_on_disk: Option<u64>,
+}
+
+/// A drive's label, file system and allocation unit.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct VolumeInfo {
+    /// Volume label; empty when it has none.
+    pub(crate) label: String,
+    /// "NTFS", "exFAT", ...
+    pub(crate) file_system: String,
+    /// Bytes per cluster; 0 when unknown.
+    pub(crate) cluster: u64,
+}
+
+/// `FILE_ATTRIBUTE_READONLY`.
+pub(crate) const ATTR_READONLY: u32 = 0x1;
+/// `FILE_ATTRIBUTE_HIDDEN`.
+pub(crate) const ATTR_HIDDEN: u32 = 0x2;
+
+/// Runs the item with `verb` ("properties", ...) from the classic Windows menu of `paths`. The
+/// menu process reads the menu, finds the item (including in submenus) and runs it, so third-party
+/// code stays in that process. `Ok(false)` when the menu has no such item. Background thread.
+pub(crate) fn run_menu_verb(
+    shell: &(impl Shell + ?Sized),
+    paths: &[PathBuf],
+    verb: &str,
+    owner: Option<isize>,
+) -> Result<bool, ShellError> {
+    fn find(entries: &[ShellMenuEntry], verb: &str) -> Option<u32> {
+        entries.iter().find_map(|e| match e {
+            ShellMenuEntry::Item {
+                id, verb: Some(v), ..
+            } if v.eq_ignore_ascii_case(verb) => Some(*id),
+            ShellMenuEntry::Submenu { children, .. } => find(children, verb),
+            _ => None,
+        })
+    }
+    let menu = shell.shell_menu(paths, false)?;
+    let Some(id) = find(&menu.entries, verb) else {
+        shell.release_shell_menu(menu.session);
+        return Ok(false);
+    };
+    shell.invoke_shell_menu(menu.session, id, (0, 0), owner)?;
+    Ok(true)
+}
+
 pub(crate) trait Shell: Send + Sync + 'static {
+    /// Last access time and space on disk of an item. Reads attributes only: a cloud file that is
+    /// not on this device is never downloaded. Background thread.
+    fn file_details(&self, path: &Path) -> FileDetails {
+        let _ = path;
+        FileDetails::default()
+    }
+    /// Sets the attribute bits in `set` and clears those in `clear` on each of `paths`, leaving
+    /// every other bit alone. Stops at the first item that fails. Background thread.
+    fn set_attributes(&self, paths: &[PathBuf], set: u32, clear: u32) -> Result<(), ShellError> {
+        let _ = (paths, set, clear);
+        Err(ShellError::Unsupported)
+    }
+    /// Friendly name of the program a file opens with ("Notepad"). Background thread.
+    fn default_app(&self, path: &Path) -> Option<String> {
+        let _ = path;
+        None
+    }
+    /// Label, file system and cluster size of the drive at `root`. Background thread.
+    fn volume_info(&self, root: &Path) -> Option<VolumeInfo> {
+        let _ = root;
+        None
+    }
+    /// Whether the file came from the internet and carries the mark Windows warns about
+    /// (`Zone.Identifier`). Only looks for the mark; never for a cloud file that is not on this
+    /// device. Background thread.
+    fn is_blocked(&self, path: &Path) -> bool {
+        let _ = path;
+        false
+    }
+    /// Removes the internet mark ("Unblock"). Background thread.
+    fn unblock(&self, path: &Path) -> Result<(), ShellError> {
+        let _ = path;
+        Err(ShellError::Unsupported)
+    }
+    /// Windows' own Properties window for `paths`, with the pages only Windows has (security,
+    /// sharing, previous versions, ...). Background thread.
+    fn show_properties(&self, paths: &[PathBuf], owner: Option<isize>) -> Result<(), ShellError> {
+        run_menu_verb(self, paths, "properties", owner).map(|_| ())
+    }
     /// Known folders and drive letters. Background thread; must not probe network drives.
     fn load_places(&self) -> Vec<Place>;
     /// Requeries (free, total) bytes for these drives (sidebar usage bars). Only asks for volume info, reads no files;
@@ -709,7 +826,9 @@ pub(crate) trait Shell: Send + Sync + 'static {
         Vec::new()
     }
     /// Opens a file with its default program. Background thread (runs shell extensions and other third-party code).
-    fn open(&self, path: &Path) -> Result<(), ShellError>;
+    /// `sort` is the order of the folder view it is opened from: viewers that step through the folder (Photos'
+    /// previous and next) follow it, as when opened from File Explorer. `None` outside a folder view.
+    fn open(&self, path: &Path, sort: Option<arke_core::SortSpec>) -> Result<(), ShellError>;
     /// Expands environment variables such as `%USERPROFILE%` and a leading `~`. Pure.
     fn expand_env(&self, input: &str) -> String;
     /// Local time for display. Pure.
@@ -751,6 +870,19 @@ pub(crate) trait Shell: Send + Sync + 'static {
     ) -> Result<DragOutEnd, ShellError> {
         let _ = (paths, image);
         Ok(DragOutEnd::Finished)
+    }
+    /// Whether another program's window is on top of `owner` at the cursor, such as a launcher
+    /// toolbar or an always-on-top window: a drag over it belongs to Windows drag and drop even
+    /// inside Arke's bounds (#128). UI thread, no file system access.
+    fn covered_at_cursor(&self, owner: Option<isize>) -> bool {
+        let _ = owner;
+        false
+    }
+    /// The top-level window under the cursor and where the cursor is in its client area
+    /// (physical pixels), for a tab dropped outside its window. `None` when unknown: the caller
+    /// then works it out from window bounds. UI thread, no file system access.
+    fn window_at_cursor(&self) -> Option<(isize, (i32, i32))> {
+        None
     }
     /// Builds the drag image. `base` is an existing thumbnail; falls back to the system icon. Background thread.
     fn drag_image(
@@ -798,13 +930,15 @@ pub(crate) trait Shell: Send + Sync + 'static {
             .collect();
         self.undo(&Undo::PutBack(back), owner)
     }
-    /// Permanently deletes Recycle Bin items. Does not prompt; the caller must confirm first. Background thread.
+    /// Permanently deletes Recycle Bin items (their data and their bin records). Shows no Windows dialogs: the caller
+    /// confirms first, progress goes to `progress` and setting `progress.cancel` stops before the next item. Items that
+    /// fail are reported by name in `ShellError::Items` while the rest are still deleted. Background thread.
     fn recycle_purge(
         &self,
         items: &[RecycledItem],
-        owner: Option<isize>,
+        progress: &OpProgress,
     ) -> Result<OpOutcome, ShellError> {
-        let _ = (items, owner);
+        let _ = (items, progress);
         Err(ShellError::Unsupported)
     }
     /// Puts files on the system clipboard and returns the resulting clipboard sequence number.
@@ -812,11 +946,19 @@ pub(crate) trait Shell: Send + Sync + 'static {
     fn set_clipboard_files(&self, files: &ClipboardFiles) -> Result<u32, ShellError>;
     /// Reads files from the clipboard with the sequence number at read time; `None` if there are no files. Background thread.
     fn clipboard_files(&self) -> Result<Option<(ClipboardFiles, u32)>, ShellError>;
+    /// Reads virtual files from the clipboard (Remote Desktop, Outlook attachments, files in a zip
+    /// folder), which have no `CF_HDROP` list on disk (#221); `None` if there are none. The
+    /// thread must have OLE (`ComThread::ole`) for as long as the result is used. Background thread.
+    fn clipboard_virtual_files(
+        &self,
+    ) -> Result<Option<crate::win_virtual_drop::VirtualDrop>, ShellError> {
+        Ok(None)
+    }
     /// Clears the clipboard after a cut and paste, only if the sequence is still `seq` so later copies survive. Background thread.
     fn clear_clipboard_if(&self, seq: u32);
     /// Clipboard sequence number; changes on every content change. Does not open the clipboard or block; UI thread safe.
     fn clipboard_seq(&self) -> u32;
-    /// Whether the clipboard has files (format check only, clipboard not opened). UI thread safe.
+    /// Whether the clipboard has files, virtual ones included (format check only, clipboard not opened). UI thread safe.
     fn clipboard_has_files(&self) -> bool;
 
     /// Whether the path is on a fixed local disk (thumbnails and system icons are local only). Background thread.
@@ -830,6 +972,25 @@ pub(crate) trait Shell: Send + Sync + 'static {
     }
     /// System icon (only requested for `.exe`, `.lnk`, `.ico`). Background thread (COM, may read the file).
     fn file_icon(&self, path: &Path, size: u32) -> Option<arke_core::thumbs::Thumbnail>;
+
+    /// The icon Windows has for files of type `ext` (lowercase, no dot) from the program
+    /// registered for it; `None` when none is registered (the theme icon stays). Reads no file.
+    /// Background thread.
+    fn type_icon(&self, _ext: &str) -> Option<arke_core::thumbs::Thumbnail> {
+        None
+    }
+
+    /// Windows' thumbnail of a video (a frame), fitted within `max_side`, made in a separate
+    /// process. Background thread; may take seconds. `Ok(None)`: the file has none. `Err`: none
+    /// could be asked for (the process can't start), which says nothing about the file.
+    fn video_thumbnail(
+        &self,
+        path: &Path,
+        max_side: u32,
+    ) -> Result<Option<arke_core::thumbs::Thumbnail>, ShellError> {
+        let _ = (path, max_side);
+        Ok(None)
+    }
 
     /// "More options": reads the Windows context menu entries (including third-party shell extensions) for Arke to draw.
     /// With `background`, `paths` is one folder and the menu is its empty-space menu (New, Open in Terminal, ...).
@@ -852,6 +1013,37 @@ pub(crate) trait Shell: Send + Sync + 'static {
     ) -> Result<(), ShellError>;
     /// Releases the menu object when the menu closes without a choice. Fire and forget; UI thread safe.
     fn release_shell_menu(&self, session: u64);
+    /// Fills and reads a submenu of menu `session` that was empty when the menu was read
+    /// ([`ShellMenuEntry::Submenu`]'s `lazy`), as it is opened. Its items are invoked through
+    /// `session` like the rest. Background thread.
+    fn fill_shell_submenu(
+        &self,
+        _session: u64,
+        _index: u32,
+    ) -> Result<Vec<ShellMenuEntry>, ShellError> {
+        Err(ShellError::Unsupported)
+    }
+    /// Context menu extensions that apply to `paths`, or the folder's empty space
+    /// (`win_menu_parts.rs`). Background thread.
+    fn shell_menu_handlers(
+        &self,
+        _paths: &[PathBuf],
+        _background: bool,
+    ) -> Result<Vec<crate::win_menu_parts::MenuHandler>, ShellError> {
+        Ok(Vec::new())
+    }
+    /// One extension's menu, read on its own beside the whole menu, and how long that took.
+    /// `group` is the Arke menu asking: older menus' extension menus are released. Invoked and
+    /// released like [`Shell::shell_menu`]'s. Background thread.
+    fn shell_menu_handler(
+        &self,
+        _paths: &[PathBuf],
+        _background: bool,
+        _handler: &crate::win_menu_parts::MenuHandler,
+        _group: u64,
+    ) -> Result<(ShellMenu, std::time::Duration), ShellError> {
+        Err(ShellError::Unsupported)
+    }
     /// Puts text on the clipboard ("Copy path"). Background thread.
     fn set_clipboard_text(&self, text: &str) -> Result<(), ShellError>;
     /// Opens in Windows Explorer, selecting the item when `select` is set. Background thread.
@@ -900,8 +1092,8 @@ pub(crate) trait Shell: Send + Sync + 'static {
         let _ = root;
         Err(ShellError::Unsupported)
     }
-    /// Windows "Open with" dialog. "Always use this app" is remembered by Windows itself.
-    /// Blocks until the dialog closes; background thread.
+    /// Windows "Choose another app" dialog, as Explorer opens it, with "Always" (saved by
+    /// Windows itself, never by Arke). Background thread.
     fn choose_app(&self, path: &Path, owner: Option<isize>) -> Result<(), ShellError> {
         let _ = (path, owner);
         Err(ShellError::Unsupported)
@@ -914,6 +1106,12 @@ pub(crate) trait Shell: Send + Sync + 'static {
     /// address bar). The first word is the program (resolved via PATH and App Paths), the rest are arguments. Background thread.
     fn run_in(&self, command_line: &str, dir: &Path) -> Result<(), ShellError> {
         let _ = (command_line, dir);
+        Err(ShellError::Unsupported)
+    }
+    /// Toggles QuickLook's preview of `item` (see `quicklook.rs`): over its pipe when it's running,
+    /// otherwise by starting `exe` (if found) with it. Returns once handed off. Background thread.
+    fn run_quicklook(&self, exe: Option<&Path>, item: &Path) -> Result<(), ShellError> {
+        let _ = (exe, item);
         Err(ShellError::Unsupported)
     }
     /// Local (year, month, day, hour, minute, second), for archive modification times. Pure.

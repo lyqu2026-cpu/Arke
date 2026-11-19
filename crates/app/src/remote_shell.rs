@@ -508,13 +508,14 @@ impl Shell for RemoteShell {
     fn disk_spaces(&self, roots: &[PathBuf]) -> Vec<(PathBuf, (u64, u64))> {
         self.inner.disk_spaces(roots)
     }
-    fn open(&self, path: &Path) -> Result<(), ShellError> {
+    fn open(&self, path: &Path, sort: Option<arke_core::SortSpec>) -> Result<(), ShellError> {
         match remote(path) {
+            // A downloaded copy has no folder to step through.
             Some(url) => {
                 let local = self.remotes.fetch(&url, OPEN_MAX)?;
-                self.inner.open(&local)
+                self.inner.open(&local, None)
             }
-            None => self.inner.open(path),
+            None => self.inner.open(path, sort),
         }
     }
     fn expand_env(&self, input: &str) -> String {
@@ -566,6 +567,9 @@ impl Shell for RemoteShell {
         }
         self.inner.drag_out(paths, image)
     }
+    fn covered_at_cursor(&self, owner: Option<isize>) -> bool {
+        self.inner.covered_at_cursor(owner)
+    }
     fn drag_image(
         &self,
         base: Option<arke_core::thumbs::Thumbnail>,
@@ -604,9 +608,9 @@ impl Shell for RemoteShell {
     fn recycle_purge(
         &self,
         items: &[RecycledItem],
-        owner: Option<isize>,
+        progress: &OpProgress,
     ) -> Result<OpOutcome, ShellError> {
-        self.inner.recycle_purge(items, owner)
+        self.inner.recycle_purge(items, progress)
     }
     fn set_clipboard_files(&self, files: &ClipboardFiles) -> Result<u32, ShellError> {
         if !files.paths.iter().any(|p| remote(p).is_some()) {
@@ -632,6 +636,11 @@ impl Shell for RemoteShell {
             (found, _) => found,
         })
     }
+    fn clipboard_virtual_files(
+        &self,
+    ) -> Result<Option<crate::win_virtual_drop::VirtualDrop>, ShellError> {
+        self.inner.clipboard_virtual_files()
+    }
     fn clear_clipboard_if(&self, seq: u32) {
         self.inner.clear_clipboard_if(seq);
     }
@@ -652,6 +661,19 @@ impl Shell for RemoteShell {
             return None;
         }
         self.inner.file_icon(path, size)
+    }
+    fn type_icon(&self, ext: &str) -> Option<arke_core::thumbs::Thumbnail> {
+        self.inner.type_icon(ext)
+    }
+    fn video_thumbnail(
+        &self,
+        path: &Path,
+        max_side: u32,
+    ) -> Result<Option<arke_core::thumbs::Thumbnail>, ShellError> {
+        if remote(path).is_some() {
+            return Ok(None);
+        }
+        self.inner.video_thumbnail(path, max_side)
     }
     fn shell_menu(&self, paths: &[PathBuf], background: bool) -> Result<ShellMenu, ShellError> {
         if paths.iter().any(|p| remote(p).is_some()) {
@@ -675,6 +697,36 @@ impl Shell for RemoteShell {
     fn release_shell_menu(&self, session: u64) {
         self.inner.release_shell_menu(session);
     }
+    fn fill_shell_submenu(
+        &self,
+        session: u64,
+        index: u32,
+    ) -> Result<Vec<crate::shell::ShellMenuEntry>, ShellError> {
+        self.inner.fill_shell_submenu(session, index)
+    }
+    fn shell_menu_handlers(
+        &self,
+        paths: &[PathBuf],
+        background: bool,
+    ) -> Result<Vec<crate::win_menu_parts::MenuHandler>, ShellError> {
+        if paths.iter().any(|p| remote(p).is_some()) {
+            return Err(ShellError::NotOnRemote);
+        }
+        self.inner.shell_menu_handlers(paths, background)
+    }
+    fn shell_menu_handler(
+        &self,
+        paths: &[PathBuf],
+        background: bool,
+        handler: &crate::win_menu_parts::MenuHandler,
+        group: u64,
+    ) -> Result<(ShellMenu, std::time::Duration), ShellError> {
+        if paths.iter().any(|p| remote(p).is_some()) {
+            return Err(ShellError::NotOnRemote);
+        }
+        self.inner
+            .shell_menu_handler(paths, background, handler, group)
+    }
     fn set_clipboard_text(&self, text: &str) -> Result<(), ShellError> {
         self.inner.set_clipboard_text(text)
     }
@@ -683,6 +735,45 @@ impl Shell for RemoteShell {
             return Err(ShellError::NotOnRemote);
         }
         self.inner.reveal_in_explorer(path, select)
+    }
+    fn file_details(&self, path: &Path) -> crate::shell::FileDetails {
+        if remote(path).is_some() {
+            return crate::shell::FileDetails::default();
+        }
+        self.inner.file_details(path)
+    }
+    fn set_attributes(&self, paths: &[PathBuf], set: u32, clear: u32) -> Result<(), ShellError> {
+        if paths.iter().any(|p| remote(p).is_some()) {
+            return Err(ShellError::NotOnRemote);
+        }
+        self.inner.set_attributes(paths, set, clear)
+    }
+    fn is_blocked(&self, path: &Path) -> bool {
+        remote(path).is_none() && self.inner.is_blocked(path)
+    }
+    fn unblock(&self, path: &Path) -> Result<(), ShellError> {
+        if remote(path).is_some() {
+            return Err(ShellError::NotOnRemote);
+        }
+        self.inner.unblock(path)
+    }
+    fn default_app(&self, path: &Path) -> Option<String> {
+        if remote(path).is_some() {
+            return None;
+        }
+        self.inner.default_app(path)
+    }
+    fn volume_info(&self, root: &Path) -> Option<crate::shell::VolumeInfo> {
+        if remote(root).is_some() {
+            return None;
+        }
+        self.inner.volume_info(root)
+    }
+    fn show_properties(&self, paths: &[PathBuf], owner: Option<isize>) -> Result<(), ShellError> {
+        if paths.iter().any(|p| remote(p).is_some()) {
+            return Err(ShellError::NotOnRemote);
+        }
+        self.inner.show_properties(paths, owner)
     }
     fn shortcut_target(&self, path: &Path) -> Option<(PathBuf, bool)> {
         if remote(path).is_some() {
@@ -732,6 +823,12 @@ impl Shell for RemoteShell {
             return Err(ShellError::NotOnRemote);
         }
         self.inner.run_in(command_line, dir)
+    }
+    fn run_quicklook(&self, exe: Option<&Path>, item: &Path) -> Result<(), ShellError> {
+        if remote(item).is_some() {
+            return Err(ShellError::NotOnRemote);
+        }
+        self.inner.run_quicklook(exe, item)
     }
     fn local_parts(&self, time: SystemTime) -> Option<[u16; 6]> {
         self.inner.local_parts(time)

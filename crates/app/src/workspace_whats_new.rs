@@ -96,6 +96,11 @@ impl WhatsNewPage {
         }
         // An update's own notes, or the newest version: open; the rest folded.
         let expanded = (!sections.is_empty()).then_some(0).into_iter().collect();
+        if let Mode::Available(release) = &mode
+            && lang != "en"
+        {
+            Self::fetch_localized_notes(release.version.clone(), lang, cx);
+        }
         Self {
             mode,
             version,
@@ -104,6 +109,41 @@ impl WhatsNewPage {
             focus: cx.focus_handle(),
             scroll: ScrollHandle::new(),
         }
+    }
+
+    /// The GitHub release body is English only. Fetches the new version's section of the
+    /// changelog in the UI language (what What's new shows after the update) and swaps it in when
+    /// it arrives; on any failure the English notes stay.
+    fn fetch_localized_notes(version: String, lang: &'static str, cx: &mut Context<Self>) {
+        let (tx, rx) = flume::bounded(1);
+        let asked = version.clone();
+        crate::explorer::spawn_thread("update-notes", move || {
+            let _ = tx.send(whats_new::fetch_localized_changelog(lang, &asked));
+        });
+        cx.spawn(async move |this, cx| {
+            let Ok(text) = rx.recv_async().await else {
+                return;
+            };
+            let Some(localized) = whats_new::available_in(&version, text.as_deref()) else {
+                return;
+            };
+            let _ = this.update(cx, |page, cx| {
+                if let Some(first) = page.sections.first_mut()
+                    && first.release.version == version
+                {
+                    first.release = localized;
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
+    }
+
+    #[cfg(test)]
+    pub(crate) fn first_notes_for_test(&self) -> Vec<Block> {
+        self.sections
+            .first()
+            .map_or_default(|s| s.release.blocks.clone())
     }
 
     #[cfg(test)]
@@ -140,7 +180,7 @@ impl WhatsNewPage {
         };
         let line = |text: String| {
             div()
-                .text_size(theme::FS_13)
+                .text_size(theme::fs_13())
                 .text_color(theme::text_muted())
                 .child(text)
                 .into_any_element()
@@ -185,17 +225,17 @@ impl WhatsNewPage {
             .id(("whats-new-section", ix))
             .debug_selector(move || format!("whats-new-section-{ix}"))
             .a11y(gpui::Role::Button, release.version.clone())
-            .h(theme::H_ROW)
-            .px(theme::S_12)
+            .h(theme::h_row())
+            .px(theme::s_12())
             .flex()
             .items_center()
-            .gap(theme::S_8)
+            .gap(theme::s_8())
             .cursor_pointer()
             .hover(|s| s.bg(theme::wash()))
             .child(
                 svg()
                     .path(Icon::ChevronRight.path())
-                    .size(theme::ICON_SM)
+                    .size(theme::icon_sm())
                     .text_color(theme::text_muted())
                     .when(open, |s| {
                         s.with_transformation(gpui::Transformation::rotate(gpui::radians(
@@ -210,16 +250,16 @@ impl WhatsNewPage {
             )
             .children(release.date.clone().map(|d| {
                 div()
-                    .text_size(theme::FS_12)
+                    .text_size(theme::fs_12())
                     .text_color(theme::text_muted())
                     .child(d)
             }))
             .children(tag.map(|tag| {
                 div()
-                    .px(theme::S_6)
+                    .px(theme::s_6())
                     .rounded(theme::R_FULL)
                     .bg(theme::signal_wash())
-                    .text_size(theme::FS_12)
+                    .text_size(theme::fs_12())
                     .child(tag.into_owned())
             }))
             .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
@@ -230,11 +270,11 @@ impl WhatsNewPage {
             }));
         let body = open.then(|| {
             div()
-                .px(theme::S_16)
-                .pb(theme::S_12)
+                .px(theme::s_16())
+                .pb(theme::s_12())
                 .flex()
                 .flex_col()
-                .gap(theme::S_4)
+                .gap(theme::s_4())
                 .children(release.blocks.iter().map(render_block))
                 .when(release.blocks.is_empty(), |d| {
                     d.child(
@@ -245,7 +285,7 @@ impl WhatsNewPage {
                 })
         });
         div()
-            .rounded(theme::R_8)
+            .rounded(theme::r_8())
             .border_1()
             .border_color(theme::line())
             .overflow_hidden()
@@ -258,20 +298,20 @@ impl WhatsNewPage {
 fn render_block(block: &Block) -> AnyElement {
     match block {
         Block::Heading(text) => div()
-            .pt(theme::S_8)
-            .text_size(theme::FS_12)
+            .pt(theme::s_8())
+            .text_size(theme::fs_12())
             .font_weight(theme::FW_STRONG)
             .text_color(theme::signal())
             .child(whats_new::plain(text))
             .into_any_element(),
         Block::Item(text) => div()
             .flex()
-            .gap(theme::S_8)
+            .gap(theme::s_8())
             .child(div().flex_none().text_color(theme::text_muted()).child("•"))
             .child(div().flex_1().min_w_0().child(whats_new::plain(text)))
             .into_any_element(),
         Block::Text(text) => div()
-            .pt(theme::S_4)
+            .pt(theme::s_4())
             .text_color(theme::text_muted())
             .child(whats_new::plain(text))
             .into_any_element(),
@@ -307,9 +347,9 @@ impl Render for WhatsNewPage {
             .child(
                 div()
                     .w_full()
-                    .px(theme::S_32)
-                    .pt(theme::S_24)
-                    .pb(theme::S_32)
+                    .px(theme::s_32())
+                    .pt(theme::s_24())
+                    .pb(theme::s_32())
                     .flex()
                     .justify_center()
                     .child(
@@ -318,28 +358,28 @@ impl Render for WhatsNewPage {
                             .max_w(gpui::px(760.))
                             .flex()
                             .flex_col()
-                            .gap(theme::S_12)
+                            .gap(theme::s_12())
                             .child(
                                 div()
                                     .flex()
                                     .items_start()
-                                    .gap(theme::S_12)
+                                    .gap(theme::s_12())
                                     .child(
                                         div()
                                             .flex_1()
                                             .min_w_0()
                                             .flex()
                                             .flex_col()
-                                            .gap(theme::S_4)
+                                            .gap(theme::s_4())
                                             .child(
                                                 div()
-                                                    .text_size(theme::FS_24)
+                                                    .text_size(theme::fs_24())
                                                     .font_weight(theme::FW_STRONG)
                                                     .child(title),
                                             )
                                             .children(subtitle.map(|s| {
                                                 div()
-                                                    .text_size(theme::FS_13)
+                                                    .text_size(theme::fs_13())
                                                     .text_color(theme::text_muted())
                                                     .child(s)
                                             })),
@@ -349,11 +389,11 @@ impl Render for WhatsNewPage {
                             .children(sections)
                             .child(
                                 div()
-                                    .pt(theme::S_8)
+                                    .pt(theme::s_8())
                                     .flex()
                                     .flex_wrap()
-                                    .gap_x(theme::S_16)
-                                    .text_size(theme::FS_12)
+                                    .gap_x(theme::s_16())
+                                    .text_size(theme::fs_12())
                                     .text_color(theme::text_muted())
                                     .when(matches!(self.mode, Mode::Updated { .. }), |d| {
                                         d.child(t!("whats_new.reopen").into_owned())
@@ -535,36 +575,24 @@ impl Workspace {
         cx: &mut Context<Self>,
     ) -> Option<AnyElement> {
         let page = self.whats_new.as_ref().filter(|p| self.shows(&p.owner))?;
-        let horizontal = Self::horizontal_tabs(cx);
         let top_bar = div()
-            .h(theme::H_BAR)
+            .h(theme::h_bar())
             .flex_none()
             .flex()
             .items_center()
-            .gap(theme::S_2)
-            .pr(theme::S_8)
-            .when(horizontal, |d| {
-                d.child(crate::explorer::ghost_button(
-                    "whats-new-back",
-                    Icon::ArrowLeft,
-                    true,
-                    t!("nav.back"),
-                    cx.listener(|this, _: &ClickEvent, window, cx| {
-                        this.close_whats_new(window, cx);
-                    }),
-                ))
-            })
+            .gap(theme::s_2())
+            .pr(theme::s_8())
             .child(
                 div()
                     .flex()
                     .flex_none()
                     .items_center()
-                    .gap(theme::S_8)
-                    .px(theme::S_8)
+                    .gap(theme::s_8())
+                    .px(theme::s_8())
                     .child(
                         svg()
                             .path(Icon::Bolt.path())
-                            .size(theme::ICON)
+                            .size(theme::icon())
                             .text_color(theme::text_muted()),
                     )
                     .child(
@@ -574,9 +602,7 @@ impl Workspace {
                     ),
             )
             .child(super::drag_area("whats-new-drag", cx).flex_1().h_full())
-            .when(!horizontal, |d| {
-                d.child(crate::explorer::caption_buttons(window))
-            });
+            .child(crate::explorer::caption_buttons(window));
         Some(
             div()
                 .id("whats-new-page")
@@ -586,6 +612,7 @@ impl Workspace {
                 .flex()
                 .flex_col()
                 .child(top_bar)
+                .children(self.tab_strip_under_bar(window, cx))
                 .child(
                     div()
                         .relative()
@@ -593,9 +620,9 @@ impl Workspace {
                         .flex_col()
                         .flex_1()
                         .min_h_0()
-                        .mr(theme::S_8)
-                        .mb(theme::S_8)
-                        .rounded(theme::R_12)
+                        .mr(theme::s_8())
+                        .mb(theme::s_8())
+                        .rounded(theme::r_12())
                         .bg(theme::paper())
                         .shadow(theme::elev_2())
                         .overflow_hidden()

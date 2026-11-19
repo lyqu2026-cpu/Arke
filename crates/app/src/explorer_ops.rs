@@ -51,8 +51,8 @@ pub(crate) fn bind_keys(cx: &mut App) {
         KeyBinding::new("ctrl-z", UndoFileOp, root),
         KeyBinding::new("ctrl-y", RedoFileOp, root),
         KeyBinding::new("ctrl-shift-z", RedoFileOp, root),
-        // Ctrl+Z inside a text input must not undo a file operation (nor Ctrl+Y redo one).
-        KeyBinding::new("ctrl-z", gpui::NoAction, Some("TextInput")),
+        // Ctrl+Z inside a text input undoes the typing (`text_input.rs`), not a file operation; Ctrl+Y
+        // redoes nothing there either.
         KeyBinding::new("ctrl-y", gpui::NoAction, Some("TextInput")),
         KeyBinding::new("ctrl-shift-z", gpui::NoAction, Some("TextInput")),
     ]);
@@ -86,7 +86,7 @@ impl Global for UndoHistory {}
 impl UndoHistory {
     /// Records an operation for Ctrl+Z and returns its id. A new operation (`fresh`, anything but
     /// a redo) clears what Ctrl+Y could redo, like every editor.
-    pub(super) fn push(
+    pub(crate) fn push(
         cx: &mut App,
         verb: &'static str,
         undo: Undo,
@@ -437,6 +437,85 @@ impl JobEnv {
     }
 }
 
+/// Writes virtual files to a folder of Arke's own, then moves them into `dest`: what a drop and
+/// a paste of virtual files (#206, #221) share. Background thread with COM.
+fn stage_and_move_virtual(
+    drop: crate::win_virtual_drop::VirtualDrop,
+    dest: PathBuf,
+    env: &JobEnv,
+    progress: &Arc<OpProgress>,
+    follow: &mut OpFollowUp,
+) -> Result<OpOutcome, ShellError> {
+    match super::new_drop_folder() {
+        Err(e) => Err(e.into()),
+        Ok(stage) => {
+            let result = move_virtual_drop(drop, &stage, dest, env, progress, follow);
+            // What the move left (skipped in a conflict, or cancelled) goes too, unless
+            // TeraCopy still has to move it.
+            if !follow.handed_off {
+                let _ = std::fs::remove_dir_all(&stage);
+            }
+            result
+        }
+    }
+}
+
+/// Writes a drop of virtual files into `stage`, then moves what was written into `dest`.
+/// Background thread with COM.
+fn move_virtual_drop(
+    drop: crate::win_virtual_drop::VirtualDrop,
+    stage: &Path,
+    dest: PathBuf,
+    env: &JobEnv,
+    progress: &Arc<OpProgress>,
+    follow: &mut OpFollowUp,
+) -> Result<OpOutcome, ShellError> {
+    use std::sync::atomic::Ordering;
+    let extracted = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        drop.extract(stage, progress)
+    }))
+    .map_err(|_panic| job_crashed())?;
+    if extracted.cancelled {
+        return Ok(OpOutcome::Cancelled);
+    }
+    if extracted.top.is_empty() {
+        return extracted.failed.map_or(Ok(OpOutcome::Done), Err);
+    }
+    follow.arrive = Some((
+        dest.clone(),
+        extracted
+            .top
+            .iter()
+            .filter_map(|p| p.file_name())
+            .map(|n| Arc::from(n.to_string_lossy().as_ref()))
+            .collect(),
+    ));
+    // The move reports its own progress.
+    progress.work_done.store(0, Ordering::Relaxed);
+    progress.work_total.store(0, Ordering::Relaxed);
+    let op = FileOp::Move {
+        sources: extracted.top,
+        dest,
+    };
+    let (result, undo, handed_off) = env.run(&op, progress);
+    follow.handed_off = handed_off;
+    // Undone like a copy: what arrived is removed (to the Recycle Bin), not put back in the
+    // temp folder.
+    follow.undo = undo.map(|undo| match undo {
+        Undo::PutBack(items) => Undo::Remove(
+            items
+                .into_iter()
+                .map(|item| PathBuf::from(item.now))
+                .collect(),
+        ),
+        removed @ Undo::Remove(_) => removed,
+    });
+    match (result, extracted.failed) {
+        (Ok(OpOutcome::Done), Some(failed)) => Err(failed),
+        (result, _) => result,
+    }
+}
+
 /// The error a job reports when its thread panicked (logged by the panic hook).
 fn job_crashed() -> ShellError {
     std::io::Error::other(t!("ops.crashed").into_owned()).into()
@@ -742,7 +821,22 @@ impl Explorer {
             let mut verb = "op.paste";
             let result = match shell.clipboard_files() {
                 Err(e) => Err(e),
-                Ok(None) => Err(crate::shell::ShellError::ClipboardEmpty),
+                // No files on disk: it may still hold virtual ones (a Remote Desktop copy, an
+                // Outlook attachment), which are saved here like a drop (#221).
+                Ok(None) => {
+                    // The clipboard's data object may be a proxy to the program that copied
+                    // the files, so OLE stays up on this thread until they are written.
+                    let _ole = crate::win_virtual_drop::ComThread::ole();
+                    match shell.clipboard_virtual_files() {
+                        Err(e) => Err(e),
+                        Ok(None) => Err(crate::shell::ShellError::ClipboardEmpty),
+                        Ok(Some(drop)) => {
+                            verb = "op.copy";
+                            follow.subject = drop.subject();
+                            stage_and_move_virtual(drop, dest, &env, &progress, &mut follow)
+                        }
+                    }
+                }
                 // Cut and pasted back into the same folder: nothing to do.
                 Ok(Some((files, _)))
                     if files.cut && files.paths.iter().all(|p| p.parent() == Some(&*dest)) =>
@@ -886,6 +980,36 @@ impl Explorer {
         cx.notify();
     }
 
+    /// Virtual files dropped into `dest` (see `win_virtual_drop.rs`): written to a folder of
+    /// Arke's own on a background thread, then moved into `dest` like any drop, so conflicts
+    /// ask the same question. Listed in the progress center as a copy, and undone like one.
+    pub(crate) fn drop_virtual_files(
+        &mut self,
+        drop: crate::win_virtual_drop::VirtualDrop,
+        dest: PathBuf,
+        cx: &mut Context<Self>,
+    ) {
+        let env = self.job_env(true, cx);
+        let tx = self.events_tx.clone();
+        self.ops_running += 1;
+        let (job, progress) = self.track_op("op.copy", drop.subject(), true, cx);
+        spawn_thread("virtual drop", move || {
+            let _com = crate::win_virtual_drop::ComThread::init();
+            let mut follow = OpFollowUp {
+                job,
+                touched: Some(dest.clone()),
+                ..OpFollowUp::default()
+            };
+            let result = stage_and_move_virtual(drop, dest, &env, &progress, &mut follow);
+            let _ = tx.send(AppEvent::OpFinished {
+                verb: "op.copy",
+                result,
+                follow: Box::new(follow),
+            });
+        });
+        cx.notify();
+    }
+
     // ───────────────────────── Delete ─────────────────────────
 
     pub(super) fn delete_files(
@@ -983,6 +1107,11 @@ impl Explorer {
             .cursor
             .and_then(|ix| self.view()?.get(ix).map(|e| Arc::clone(&e.name)));
         let Some(name) = name else {
+            // Nothing in the list to rename: a mapped drive or network place open here is the
+            // one to rename (the workspace checks it can be).
+            if let Some(path) = self.current_path() {
+                cx.emit(super::ExplorerEvent::RenamePlace(path.to_path_buf()));
+            }
             return;
         };
         // Multiple selected with the cursor inside: edit the cursor item, then rename all selected
@@ -1295,6 +1424,11 @@ impl Explorer {
         } else if dir == shown {
             self.create_new(kind, None, cx);
             return;
+        } else if self.keeps_folder() {
+            // A pinned tab keeps its folder: the item is made in a tab on `dir` instead.
+            let dir = arke_core::remote::canonical(dir.to_path_buf());
+            cx.emit(super::ExplorerEvent::LockedNewItem { dir, kind });
+            return;
         } else {
             let dir = arke_core::remote::canonical(dir.to_path_buf());
             self.navigate(dir.clone(), arke_core::NavKind::New, cx);
@@ -1304,6 +1438,29 @@ impl Explorer {
                 row: None,
             });
         }
+        self.poll_pending_create(cx);
+    }
+
+    /// Makes a new item in `dir` once this pane shows it listed (a pinned tab asked a tab on
+    /// `dir` to make it, see [`super::ExplorerEvent::LockedNewItem`]).
+    pub(crate) fn create_on_arrival(
+        &mut self,
+        kind: NewItem,
+        dir: PathBuf,
+        cx: &mut Context<Self>,
+    ) {
+        if !self
+            .display_path()
+            .is_some_and(|here| super::same_folder(here, &dir))
+        {
+            return;
+        }
+        let dir = self.display_path().map_or(dir, Path::to_path_buf);
+        self.pending_create = Some(PendingCreate {
+            kind,
+            dir,
+            row: None,
+        });
         self.poll_pending_create(cx);
     }
 
@@ -1627,9 +1784,8 @@ impl Explorer {
         }
         // Delete, copy and move change free space, so refresh the sidebar capacity bars.
         self.refresh_disk_space();
-        // Shelf items and bookmarks may have been moved or deleted.
+        // Shelf items may have been moved or deleted.
         self.recheck_shelf(cx);
-        self.recheck_bookmarks(cx);
         if let Some(id) = follow.job {
             if let Some(subject) = follow.subject.clone() {
                 crate::op_center::OpCenter::set_subject(cx, id, subject);

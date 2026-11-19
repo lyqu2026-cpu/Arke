@@ -143,75 +143,165 @@ pub(crate) fn set_backdrop(image: Option<(std::path::PathBuf, f32)>) -> bool {
 }
 pub(crate) const FW_STRONG: FontWeight = FontWeight::SEMIBOLD;
 
-/// Keyboard shortcut badges only (`Ctrl T`, `Esc`); everything else reads at 12 px or more.
-pub(crate) const FS_11: Pixels = px(11.);
-/// Secondary text: dates, types, sizes, captions, hints.
-pub(crate) const FS_12: Pixels = px(12.);
-pub(crate) const FS_13: Pixels = px(13.);
-/// Body: list names, menu items, sidebar items, section headings (WinUI's body size).
-pub(crate) const FS_14: Pixels = px(14.);
-pub(crate) const FS_15: Pixels = px(15.);
-pub(crate) const FS_20: Pixels = px(20.);
-/// Page titles (Home, Settings), semibold.
-pub(crate) const FS_24: Pixels = px(24.);
+// --- Interface scale ---
+
+/// Interface scale in percent (80..=150), applied on top of the Windows DPI scale.
+static SCALE_PCT: AtomicU32 = AtomicU32::new(100);
+
+pub(crate) const SCALES: [u32; 6] = [80, 90, 100, 110, 125, 150];
+
+/// Sets the interface scale (percent). Returns whether it changed; every window repaints.
+pub(crate) fn set_scale(pct: u32) -> bool {
+    let pct = pct.clamp(SCALES[0], SCALES[SCALES.len() - 1]);
+    if SCALE_PCT.swap(pct, Ordering::Relaxed) == pct {
+        return false;
+    }
+    LOOK.fetch_add(1, Ordering::Relaxed);
+    true
+}
+
+pub(crate) fn scale_pct() -> u32 {
+    SCALE_PCT.load(Ordering::Relaxed)
+}
+
+/// A size in logical pixels at 100%, multiplied by the interface scale.
+pub(crate) fn scaled_px(base: f32) -> Pixels {
+    px(base * scale_pct() as f32 / 100.)
+}
+
+macro_rules! scaled {
+    ($name:ident, $base:expr) => {
+        #[inline]
+        pub(crate) fn $name() -> Pixels {
+            scaled_px($base)
+        }
+    };
+}
+
+// Keyboard shortcut badges only (`Ctrl T`, `Esc`); everything else reads at 12 px or more.
+scaled!(fs_11, 11.);
+// Secondary text: dates, types, sizes, captions, hints.
+scaled!(fs_12, 12.);
+scaled!(fs_13, 13.);
+// Body: list names, menu items, sidebar items, section headings (WinUI's body size).
+scaled!(fs_14, 14.);
+scaled!(fs_15, 15.);
+scaled!(fs_20, 20.);
+// Page titles (Home, Settings), semibold.
+scaled!(fs_24, 24.);
 
 // --- Spacing and heights (multiples of 4) ---
 
-pub(crate) const S_2: Pixels = px(2.);
-pub(crate) const S_4: Pixels = px(4.);
-pub(crate) const S_6: Pixels = px(6.);
-pub(crate) const S_8: Pixels = px(8.);
-pub(crate) const S_12: Pixels = px(12.);
-pub(crate) const S_16: Pixels = px(16.);
-pub(crate) const S_20: Pixels = px(20.);
-pub(crate) const S_24: Pixels = px(24.);
-/// Max tooltip width; longer text wraps.
-pub(crate) const TOOLTIP_MAX_W: Pixels = px(360.);
-pub(crate) const S_32: Pixels = px(32.);
+scaled!(s_2, 2.);
+scaled!(s_4, 4.);
+scaled!(s_6, 6.);
+scaled!(s_8, 8.);
+scaled!(s_12, 12.);
+scaled!(s_16, 16.);
+scaled!(s_20, 20.);
+scaled!(s_24, 24.);
+// Max tooltip width; longer text wraps.
+scaled!(tooltip_max_w, 360.);
+scaled!(s_32, 32.);
 
-/// List row height (standard density).
-pub(crate) const H_ROW: Pixels = px(32.);
-/// List row height (compact, used in dual pane).
-pub(crate) const H_ROW_COMPACT: Pixels = px(28.);
-/// List row height (comfortable).
-pub(crate) const H_ROW_COMFORTABLE: Pixels = px(40.);
-/// Controls: buttons, inputs.
-pub(crate) const H_CTL: Pixels = px(32.);
-/// Small controls: context bar actions.
-pub(crate) const H_CTL_SM: Pixels = px(26.);
-/// Controls inside popovers: segments, filter buttons, menu rows.
-pub(crate) const H_CTL_MD: Pixels = px(30.);
-/// Frame top bar.
-pub(crate) const H_BAR: Pixels = px(48.);
-/// Context bar.
-pub(crate) const H_CTX: Pixels = px(44.);
-/// Column header row.
-pub(crate) const H_HEADER: Pixels = px(30.);
+// List row height (standard density).
+scaled!(h_row, 32.);
+// List row height (compact, used in dual pane).
+scaled!(h_row_compact, 28.);
+// List row height (comfortable).
+scaled!(h_row_comfortable, 40.);
+// Controls: buttons, inputs.
+scaled!(h_ctl, 32.);
+// Small controls: context bar actions.
+scaled!(h_ctl_sm, 26.);
+// Controls inside popovers: segments, filter buttons, menu rows.
+scaled!(h_ctl_md, 30.);
+// Frame top bar.
+scaled!(h_bar, 48.);
+// Context bar.
+scaled!(h_ctx, 44.);
+// Column header row.
+scaled!(h_header, 30.);
 
-/// Sidebar width, including the left margin.
-pub(crate) const SIDEBAR_W: Pixels = px(248.);
-pub(crate) const FILTER_W: Pixels = px(220.);
-/// Narrowest the path bar gets on a short path, so it stays an easy click target; the rest of
-/// the title bar drags the window.
-pub(crate) const PATH_MIN_W: Pixels = px(200.);
-/// Search options panel below the filter box (scope, filters, contents): wide enough for every
-/// control on one line in each language.
-pub(crate) const SEARCH_PANEL_W: Pixels = px(456.);
-/// Widest value shown on a filter button (a long hand-typed term is cut off).
-pub(crate) const FILTER_VALUE_MAX_W: Pixels = px(180.);
-/// Narrowest filter menu in the search panel.
-pub(crate) const FILTER_MENU_W: Pixels = px(208.);
-/// The Name column's automatic width, until the user sizes it: what the other columns leave in
-/// the pane, but at least `COL_NAME` and at most `COL_NAME_MAX` (see `explorer_layout.rs`).
-pub(crate) const COL_NAME: Pixels = px(240.);
-pub(crate) const COL_NAME_MAX: Pixels = px(480.);
-pub(crate) const COL_MODIFIED: Pixels = px(140.);
-pub(crate) const COL_TYPE: Pixels = px(130.);
-pub(crate) const COL_SIZE: Pixels = px(84.);
-pub(crate) const COL_EXTENSION: Pixels = px(72.);
-pub(crate) const COL_ATTRIBUTES: Pixels = px(64.);
-pub(crate) const COL_LINK_TARGET: Pixels = px(240.);
-pub(crate) const COL_LOCATION: Pixels = px(260.);
+// Sidebar width, including the left margin.
+pub(crate) const SIDEBAR_W_BASE: f32 = 248.;
+pub(crate) const SIDEBAR_MIN: f32 = 180.;
+pub(crate) const SIDEBAR_MAX: f32 = 420.;
+
+static SIDEBAR_BASE: AtomicU32 = AtomicU32::new(0);
+
+/// Sets the dragged sidebar width (at 100%); 0 is the default. Returns whether it changed.
+pub(crate) fn set_sidebar_base(base: f32) -> bool {
+    let bits = if base <= 0. {
+        0
+    } else {
+        base.clamp(SIDEBAR_MIN, SIDEBAR_MAX).to_bits()
+    };
+    if SIDEBAR_BASE.swap(bits, Ordering::Relaxed) == bits {
+        return false;
+    }
+    LOOK.fetch_add(1, Ordering::Relaxed);
+    true
+}
+
+/// The dragged sidebar width at 100% (0 when it is the default).
+pub(crate) fn sidebar_base() -> f32 {
+    f32::from_bits(SIDEBAR_BASE.load(Ordering::Relaxed))
+}
+
+/// Full sidebar width, including the left margin.
+pub(crate) fn sidebar_full_width() -> Pixels {
+    let bits = SIDEBAR_BASE.load(Ordering::Relaxed);
+    scaled_px(if bits == 0 {
+        SIDEBAR_W_BASE
+    } else {
+        f32::from_bits(bits)
+    })
+}
+// Width of the collapsed sidebar: a column of icons (#91).
+scaled!(rail_w, 52.);
+
+static SIDEBAR_COLLAPSED: AtomicBool = AtomicBool::new(false);
+
+/// Collapses or expands the sidebar. Returns whether it changed; windows must repaint if so.
+pub(crate) fn set_sidebar_collapsed(collapsed: bool) -> bool {
+    let changed = SIDEBAR_COLLAPSED.swap(collapsed, Ordering::Relaxed) != collapsed;
+    if changed {
+        LOOK.fetch_add(1, Ordering::Relaxed);
+    }
+    changed
+}
+
+pub(crate) fn sidebar_collapsed() -> bool {
+    SIDEBAR_COLLAPSED.load(Ordering::Relaxed)
+}
+
+/// The sidebar's width now: full, or the column of icons.
+pub(crate) fn sidebar_width() -> Pixels {
+    if sidebar_collapsed() {
+        rail_w()
+    } else {
+        sidebar_full_width()
+    }
+}
+// Search options panel below the filter box (scope, filters, contents): wide enough for every
+// control on one line in each language.
+scaled!(search_panel_w, 456.);
+// Widest value shown on a filter button (a long hand-typed term is cut off).
+scaled!(filter_value_max_w, 180.);
+// Narrowest filter menu in the search panel.
+scaled!(filter_menu_w, 208.);
+// The Name column's automatic width, until the user sizes it: what the other columns leave in
+// the pane, but at least `col_name()` and at most `col_name_max()` (see `explorer_layout.rs`).
+scaled!(col_name, 240.);
+scaled!(col_name_max, 480.);
+scaled!(col_modified, 140.);
+scaled!(col_type, 130.);
+scaled!(col_size, 84.);
+scaled!(col_extension, 72.);
+scaled!(col_attributes, 64.);
+scaled!(col_link_target, 240.);
+scaled!(col_location, 260.);
 /// One icon size of the grid: cell size, the area a thumbnail fills, and the kind icon drawn when
 /// there is no thumbnail.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -252,32 +342,32 @@ pub(crate) const TILE_XL: Tile = Tile {
     image: px(192.),
     icon: px(128.),
 };
-/// Details view tree: indent per nesting level and the expand chevron's box.
-pub(crate) const TREE_INDENT: Pixels = px(18.);
-pub(crate) const TREE_CHEVRON: Pixels = px(16.);
-/// Quick Look card: the largest it grows on big screens, and the smallest gap it keeps to the
-/// window edges (it otherwise takes a share of the window, see `explorer_preview.rs`).
-pub(crate) const QL_MAX_W: Pixels = px(1280.);
-pub(crate) const QL_MAX_H: Pixels = px(960.);
-pub(crate) const QL_MARGIN: Pixels = px(24.);
-/// Comfortable reading width for documents (Quick Look's Markdown).
-pub(crate) const READ_W: Pixels = px(760.);
-/// Quick Look's empty states: the kind icon, large.
-pub(crate) const ICON_HERO: Pixels = px(96.);
-/// Title icons (the preview pane's folder name, Quick Look's title bar).
-pub(crate) const ICON_LG: Pixels = px(20.);
-/// Icons.
-pub(crate) const ICON: Pixels = px(16.);
-pub(crate) const ICON_SM: Pixels = px(12.);
+// Details view tree: indent per nesting level and the expand chevron's box.
+scaled!(tree_indent, 18.);
+scaled!(tree_chevron, 16.);
+// Quick Look card: the largest it grows on big screens, and the smallest gap it keeps to the
+// window edges (it otherwise takes a share of the window, see `explorer_preview.rs`).
+scaled!(ql_max_w, 1280.);
+scaled!(ql_max_h, 960.);
+scaled!(ql_margin, 24.);
+// Comfortable reading width for documents (Quick Look's Markdown).
+scaled!(read_w, 760.);
+// Quick Look's empty states: the kind icon, large.
+scaled!(icon_hero, 96.);
+// Title icons (the preview pane's folder name, Quick Look's title bar).
+scaled!(icon_lg, 20.);
+// Icons.
+scaled!(icon, 16.);
+scaled!(icon_sm, 12.);
 
 // --- Radii: outer - padding = inner ---
 
-/// Badges, kbd, thumbnails.
-pub(crate) const R_4: Pixels = px(4.);
-/// Buttons, rows, inputs, menu items.
-pub(crate) const R_8: Pixels = px(8.);
-/// Cards, menus, dialogs.
-pub(crate) const R_12: Pixels = px(12.);
+// Badges, kbd, thumbnails.
+scaled!(r_4, 4.);
+// Buttons, rows, inputs, menu items.
+scaled!(r_8, 8.);
+// Cards, menus, dialogs.
+scaled!(r_12, 12.);
 /// Pills, progress bars.
 pub(crate) const R_FULL: Pixels = px(999.);
 
@@ -387,7 +477,51 @@ pub(crate) const DARK: Palette = Palette {
     kind_c: 0.12,
 };
 
+/// Dark, gray: the dark theme of Arke 0.4 and earlier, a softer gray with white text, kept for
+/// those who prefer it. Contrast on surface/ground: muted 7.6/8.1, subtle 4.8/5.0, signal 6.6/7.5.
+pub(crate) const GRAY: Palette = Palette {
+    ground: hex(0x1c1c1c),
+    surface: hex(0x272727),
+    // Floating layers sit clearly above the paper (#272727); at #2c2c2c menus melted into it.
+    overlay: hex(0x353535),
+    ink: hex(0xf3f3f3),
+    danger_surface: hex(0x442726),
+    a_muted: 0.70,
+    a_subtle: 0.52,
+    a_disabled: 0.32,
+    a_line: 0.09,
+    a_line_strong: 0.20,
+    a_wash: 0.05,
+    a_wash_strong: 0.09,
+    a_signal_wash: 0.15,
+    ..DARK
+};
+
+/// What differs between the two dark shades besides the palette.
+struct DarkShade {
+    /// Base of the translucent paper under Mica.
+    mica_paper: u32,
+    /// How much of the frame color lies over Mica (untinted).
+    frame_over_mica: f32,
+    /// Neutral selection strength.
+    selection: f32,
+}
+
+const BLACK_SHADE: DarkShade = DarkShade {
+    mica_paper: 0x001e_1f22,
+    // Half, so the near-black ground still reads through the material.
+    frame_over_mica: 0.5,
+    selection: 0.11,
+};
+const GRAY_SHADE: DarkShade = DarkShade {
+    mica_paper: 0x003a_3a3a,
+    frame_over_mica: 0.35,
+    selection: 0.13,
+};
+
 static IS_DARK: AtomicBool = AtomicBool::new(false);
+/// The dark theme uses the gray shade ([`GRAY`]) instead of the near-black one ([`DARK`]).
+static DARK_GRAY: AtomicBool = AtomicBool::new(false);
 static MICA: AtomicBool = AtomicBool::new(false);
 /// Bumped on every mode or accent change. Each window remembers the version it drew and repaints fully on mismatch.
 static LOOK: AtomicU32 = AtomicU32::new(0);
@@ -448,7 +582,7 @@ pub(crate) fn set_accent(color: Option<u32>) -> bool {
         Some(rgb) => {
             let color = hex(rgb & 0x00ff_ffff);
             let (light, on_light) = accent_for(color, &LIGHT);
-            let (dark, on_dark) = accent_for(color, &DARK);
+            let (dark, on_dark) = accent_for(color, dark_palette());
             [pack(light), pack(on_light), pack(dark), pack(on_dark)]
         }
     };
@@ -456,7 +590,7 @@ pub(crate) fn set_accent(color: Option<u32>) -> bool {
         None => [NO_ACCENT; 2],
         Some(_) => [
             wash_strength(hex(values[0]), &LIGHT).to_bits(),
-            wash_strength(hex(values[2]), &DARK).to_bits(),
+            wash_strength(hex(values[2]), dark_palette()).to_bits(),
         ],
     };
     for (slot, value) in ACCENT_WASH.iter().zip(washes) {
@@ -616,8 +750,8 @@ static PAPER_TINT: [AtomicU32; 4] = [
 const TINT_CHROMA: f32 = 0.035;
 /// Paper gets half the tint: same hue as the frame, without skewing file icon and thumbnail colors.
 const PAPER_TINT_CHROMA: f32 = 0.016;
-/// Base color of the translucent paper under Mica (light, dark theme).
-const MICA_PAPER: [u32; 2] = [0x00ff_ffff, 0x001e_1f22];
+/// Base color of the translucent paper under Mica in the light theme (dark: [`DarkShade`]).
+const MICA_PAPER_LIGHT: u32 = 0x00ff_ffff;
 
 /// Tints the frame with the hue of `color` (`None` is neutral gray). Returns whether it changed.
 pub(crate) fn set_tint(color: Option<u32>) -> bool {
@@ -625,7 +759,10 @@ pub(crate) fn set_tint(color: Option<u32>) -> bool {
         None => [NO_ACCENT; 2],
         Some(rgb) => {
             let color = hex(rgb & 0x00ff_ffff);
-            [pack(tint_for(color, &LIGHT)), pack(tint_for(color, &DARK))]
+            [
+                pack(tint_for(color, &LIGHT)),
+                pack(tint_for(color, dark_palette())),
+            ]
         }
     };
     let paper = match color {
@@ -635,9 +772,9 @@ pub(crate) fn set_tint(color: Option<u32>) -> bool {
             let like = |base: Rgba| pack(tint_like(color, base, PAPER_TINT_CHROMA));
             [
                 like(LIGHT.surface),
-                like(DARK.surface),
-                like(hex(MICA_PAPER[0])),
-                like(hex(MICA_PAPER[1])),
+                like(dark_palette().surface),
+                like(hex(MICA_PAPER_LIGHT)),
+                like(hex(dark_shade().mica_paper)),
             ]
         }
     };
@@ -682,13 +819,22 @@ pub(crate) struct ModePreview {
     pub(crate) accent: Rgba,
 }
 
-pub(crate) fn mode_preview(dark: bool) -> ModePreview {
-    let palette = if dark { &DARK } else { &LIGHT };
+/// Colors for a theme tile: light, or dark in the near-black or `gray` shade. The stored tint and
+/// accent are worked out for the shade in use, so the other dark tile shows its plain palette
+/// with the accent.
+pub(crate) fn mode_preview(dark: bool, gray: bool) -> ModePreview {
+    let palette = match (dark, gray) {
+        (false, _) => &LIGHT,
+        (true, false) => &DARK,
+        (true, true) => &GRAY,
+    };
     let slot = usize::from(dark);
+    let in_use = !dark || gray == DARK_GRAY.load(Ordering::Relaxed);
     let stored = |value: u32| (value != NO_ACCENT).then(|| hex(value));
+    let tinted = |value: u32| stored(value).filter(|_| in_use);
     ModePreview {
-        frame: stored(TINT[slot].load(Ordering::Relaxed)).unwrap_or(palette.ground),
-        paper: stored(PAPER_TINT[slot].load(Ordering::Relaxed)).unwrap_or(palette.surface),
+        frame: tinted(TINT[slot].load(Ordering::Relaxed)).unwrap_or(palette.ground),
+        paper: tinted(PAPER_TINT[slot].load(Ordering::Relaxed)).unwrap_or(palette.surface),
         ink: alpha(palette.ink, palette.a_muted),
         ink_faint: alpha(palette.ink, palette.a_disabled),
         accent: stored(ACCENT[slot * 2].load(Ordering::Relaxed)).unwrap_or(palette.signal),
@@ -738,8 +884,34 @@ pub(crate) fn is_dark() -> bool {
     IS_DARK.load(Ordering::Relaxed)
 }
 
+/// Picks the dark theme's shade: gray (Arke 0.4's) or near-black. Returns whether it changed;
+/// set it before the accent and tint, which are worked out against the palette.
+pub(crate) fn set_dark_gray(gray: bool) -> bool {
+    let changed = DARK_GRAY.swap(gray, Ordering::Relaxed) != gray;
+    if changed {
+        LOOK.fetch_add(1, Ordering::Relaxed);
+    }
+    changed
+}
+
+fn dark_palette() -> &'static Palette {
+    if DARK_GRAY.load(Ordering::Relaxed) {
+        &GRAY
+    } else {
+        &DARK
+    }
+}
+
+fn dark_shade() -> &'static DarkShade {
+    if DARK_GRAY.load(Ordering::Relaxed) {
+        &GRAY_SHADE
+    } else {
+        &BLACK_SHADE
+    }
+}
+
 fn p() -> &'static Palette {
-    if is_dark() { &DARK } else { &LIGHT }
+    if is_dark() { dark_palette() } else { &LIGHT }
 }
 
 const fn alpha(c: Rgba, a: f32) -> Rgba {
@@ -775,18 +947,23 @@ pub(crate) fn frame() -> Rgba {
     if !mica() {
         return base;
     }
-    // Use a heavier layer when tinted, otherwise the material washes out the color. Dark: half,
-    // so the near-black ground still reads through the material.
+    // Use a heavier layer when tinted, otherwise the material washes out the color.
     alpha(
         base,
         if tinted() {
             0.78
         } else if is_dark() {
-            0.5
+            dark_shade().frame_over_mica
         } else {
             0.35
         },
     )
+}
+
+/// The frame's color without Mica's transparency, for what is drawn over the content (the
+/// collapsed sidebar opened on hover), which must hide what is under it.
+pub(crate) fn frame_solid() -> Rgba {
+    mix(ground(), signal(), p().frame_tint)
 }
 
 /// Paper (list, preview): a translucent layer over the material under Mica (like WinUI's Layer), solid surface otherwise.
@@ -794,14 +971,27 @@ pub(crate) fn paper() -> Rgba {
     if !mica() {
         return surface();
     }
-    let base = paper_tint(2).unwrap_or_else(|| hex(MICA_PAPER[usize::from(is_dark())]));
+    let base = paper_tint(2).unwrap_or_else(|| {
+        hex(if is_dark() {
+            dark_shade().mica_paper
+        } else {
+            MICA_PAPER_LIGHT
+        })
+    });
     alpha(base, if is_dark() { 0.45 } else { 0.7 })
 }
 
 /// Selected items in navigation-style lists (sidebar, recycle bin rows, settings pages): a
 /// neutral wash strong enough to read at a glance on its own.
 pub(crate) fn selection() -> Rgba {
-    alpha(p().ink, if is_dark() { 0.11 } else { 0.10 })
+    alpha(
+        p().ink,
+        if is_dark() {
+            dark_shade().selection
+        } else {
+            0.10
+        },
+    )
 }
 
 /// Selected rows in the file list and keyboard-driven pickers: the accent wash while the list
@@ -820,7 +1010,7 @@ pub(crate) fn list_selection(focused: bool) -> Rgba {
 /// edge, so it reads as a sheet rather than a hole in the pane.
 pub(crate) fn preview_sheet<E: gpui::Styled>(element: E) -> E {
     element
-        .rounded(R_8)
+        .rounded(r_8())
         .border_1()
         .border_color(line())
         .bg(card())
@@ -1014,7 +1204,7 @@ pub(crate) fn elev_1() -> Vec<BoxShadow> {
 }
 /// Raised paper (the list sheet, Home, Settings).
 ///
-/// The first shadow is always the outer edge (`elev_2_active` swaps it for the accent). In the
+/// The first shadow is always the outer edge. In the
 /// dark theme the paper gets a near-black outline plus a faint inner line, except under Mica:
 /// drop shadows are painted as full rectangles under the element, and Mica paper is
 /// translucent, so a dark outline there would darken the whole sheet.
@@ -1029,12 +1219,6 @@ pub(crate) fn elev_2() -> Vec<BoxShadow> {
     } else {
         vec![hairline(line()), drop]
     }
-}
-/// Active paper in dual pane: the outer edge uses the signal color.
-pub(crate) fn elev_2_active() -> Vec<BoxShadow> {
-    let mut shadows = elev_2();
-    shadows[0] = hairline(signal_line());
-    shadows
 }
 /// Floating surfaces: menus, popovers, tooltips, toasts, drag previews. They are always opaque
 /// (`overlay()`), so the dark theme can use the outline plus a lit inner edge.
@@ -1296,7 +1480,7 @@ mod tests {
             Icon::Cloud,
             Icon::Drive,
         ];
-        for (dark, p) in [(false, &LIGHT), (true, &DARK)] {
+        for (dark, p) in [(false, &LIGHT), (true, &DARK), (true, &GRAY)] {
             let lines = places.map(|icon| {
                 let (line, _) = place_tint_in(icon, p, dark).expect("tinted");
                 for bg in [p.surface, p.ground] {
@@ -1320,8 +1504,12 @@ mod tests {
     #[test]
     fn text_roles_meet_contrast_targets() {
         // Read the palettes directly instead of the global mode and accent, which other tests change concurrently.
-        for (dark, p) in [(false, &LIGHT), (true, &DARK)] {
-            let selection = if dark { 0.11 } else { 0.10 };
+        let shades = [
+            (false, &LIGHT, 0.10),
+            (true, &DARK, BLACK_SHADE.selection),
+            (true, &GRAY, GRAY_SHADE.selection),
+        ];
+        for (dark, p, selection) in shades {
             for bg in [p.surface, p.ground] {
                 assert!(
                     contrast(alpha(p.ink, p.a_muted), bg) >= 7.0,
@@ -1390,7 +1578,7 @@ mod tests {
             0xfff4c2, 0x10203a, 0x808080,
         ]);
         for rgb in colors {
-            for palette in [&LIGHT, &DARK] {
+            for palette in [&LIGHT, &DARK, &GRAY] {
                 let (signal, on) = accent_for(hex(rgb), palette);
                 for bg in [palette.surface, palette.ground] {
                     assert!(
@@ -1417,7 +1605,7 @@ mod tests {
     /// Selected rows stand out from the paper the same with any preset accent as with Arke orange.
     #[test]
     fn accent_washes_stand_out_alike() {
-        for palette in [&LIGHT, &DARK] {
+        for palette in [&LIGHT, &DARK, &GRAY] {
             let arke = contrast(
                 mix(palette.surface, palette.signal, palette.a_signal_wash),
                 palette.surface,
@@ -1441,7 +1629,7 @@ mod tests {
         tints.extend((0..36).map(|i| accent_from_hue(i as f32 * 10.)));
         tints.extend([0x000000, 0xffffff, 0xff0000, 0xffff00, 0x0000ff]);
         for rgb in tints {
-            for palette in [&LIGHT, &DARK] {
+            for palette in [&LIGHT, &DARK, &GRAY] {
                 let bg = tint_for(hex(rgb), palette);
                 let paper = tint_like(hex(rgb), palette.surface, PAPER_TINT_CHROMA);
                 let ink = |a: f32| alpha(palette.ink, a);

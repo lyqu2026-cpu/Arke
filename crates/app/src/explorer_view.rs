@@ -1,6 +1,6 @@
 //! Rendering for `Explorer`.
 //!
-//! - **Top bar** is drawn on the frame (transparent): back/forward/up, path, drag area, filter box,
+//! - **Top bar** is drawn on the frame (transparent): back/forward/up, path, filter box, drag area,
 //!   window buttons.
 //! - **Paper** (`surface` + `elev_2`): context bar, column headers, list; toasts sit in the paper's
 //!   bottom-right.
@@ -17,20 +17,21 @@ use std::time::{Duration, Instant};
 
 use arke_core::Entry;
 use arke_core::NavKind;
+use arke_core::SortColumn;
 use arke_core::filetype::{FileKind, file_kind};
 use arke_core::format::{format_count, format_size};
 use arke_core::path::NameError;
 use arke_core::search::MAX_HITS;
 use gpui::{
-    AnyElement, App, ClickEvent, Context, Entity, ExternalPaths, Focusable, MouseButton,
-    MouseDownEvent, NavigationDirection, ObjectFit, Pixels, RenderImage, SharedString, Window,
-    WindowControlArea, anchored, deferred, div, img, prelude::*, px, svg, uniform_list,
+    AnyElement, App, ClickEvent, Context, Entity, ExternalPaths, MouseButton, MouseDownEvent,
+    NavigationDirection, ObjectFit, Pixels, RenderImage, SharedString, Window, WindowControlArea,
+    anchored, deferred, div, img, prelude::*, px, svg, uniform_list,
 };
 
 use super::layout;
 use super::{
     CopyFiles, CutFiles, DeleteFiles, ErrorAction, Escape, Explorer, ExplorerEvent, FocusOtherPane,
-    GoBack, GoForward, GoUp, NewFolder, OpenSelected, PasteFiles, Refresh, RenameFile, ViewColumns,
+    GoBack, GoForward, GoUp, NewFolder, OpenSelected, PasteFiles, RenameFile, ViewColumns,
     ViewDetails, ViewMode,
 };
 use super::{DragPreview, DraggedFiles, drop_external_into, drop_into};
@@ -47,16 +48,18 @@ use crate::workspace::TooltipBelowExt as _;
 /// It's added as blank trailing list items (see [`tail_items`]), not as bottom padding:
 /// `uniform_list` only draws rows inside its padded area, so padding would leave a blank band at
 /// the bottom of the list at every scroll position, not just after the last row.
-const LIST_TAIL: Pixels = px(96.);
+fn list_tail() -> gpui::Pixels {
+    crate::theme::scaled_px(96.)
+}
 
-/// Number of blank trailing items of height `item` that make up [`LIST_TAIL`]. The row callbacks
+/// Number of blank trailing items of height `item` that make up [`list_tail()`]. The row callbacks
 /// draw nothing for indexes past the real items, so these are just empty space.
 fn tail_items(item: Pixels) -> usize {
     if item <= px(0.) {
         return 0;
     }
     // A handful at most (3 rows, or one tile row), so the cast can't truncate.
-    (LIST_TAIL / item).ceil() as usize
+    (list_tail() / item).ceil() as usize
 }
 
 /// How long regular toasts stay before closing
@@ -64,144 +67,66 @@ const NOTICE_TTL: Duration = Duration::from_secs(5);
 /// A notice with Undo stays longer, so there's time to reach the button.
 const NOTICE_UNDO_TTL: Duration = Duration::from_secs(10);
 /// Widest the rename problem message gets before wrapping.
-const RENAME_BALLOON_W: Pixels = px(440.);
+fn rename_balloon_w() -> gpui::Pixels {
+    crate::theme::scaled_px(440.)
+}
 /// Above this many selected items the total size isn't computed (avoids a long walk on every
 /// render)
-const SIZE_SUM_MAX: usize = 5_000;
-/// Below this pane width the filter box collapses to a magnifier, leaving room for the path
-const NARROW_TOP_BAR: Pixels = px(760.);
+pub(super) const SIZE_SUM_MAX: usize = 5_000;
 /// Below this pane width context bar buttons show icons only
-const COMPACT_BAR: Pixels = px(860.);
+fn compact_bar() -> gpui::Pixels {
+    crate::theme::scaled_px(860.)
+}
 /// Below this pane width "Copy to/Move to the other side" show icons only (split view)
-const PEER_LABELS_MIN: Pixels = px(600.);
+fn peer_labels_min() -> gpui::Pixels {
+    crate::theme::scaled_px(600.)
+}
 /// Scrollbar width (subtracted when computing grid columns)
-const SCROLLBAR_GUTTER: Pixels = px(12.);
+fn scrollbar_gutter() -> gpui::Pixels {
+    crate::theme::scaled_px(12.)
+}
 
 impl Explorer {
     // ───────────────────────── Top bar (on the frame) ─────────────────────────
 
-    fn render_top_bar(&mut self, window: &Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let (can_back, can_forward) = self
-            .global_nav
-            .unwrap_or_else(|| (self.history.can_go_back(), self.history.can_go_forward()));
-        let can_up = self
-            .display_path()
-            .and_then(arke_core::path::parent)
-            .is_some();
-        let nav_here = !self.pane.nav_in_sidebar;
-        div()
-            .flex()
-            .flex_none()
-            .items_center()
-            .gap(theme::S_2)
-            .h(theme::H_BAR)
-            .pr(theme::S_8)
-            .when(nav_here, |d| {
-                d.child(crate::spring::back_target(
-                    "list",
-                    crate::spring::Target::Explorer(cx.entity().downgrade()),
-                    can_back,
-                    ghost_button(
-                        "back",
-                        Icon::ArrowLeft,
-                        can_back,
-                        t!("nav.back"),
-                        cx.listener(|_, _: &ClickEvent, _, cx| {
-                            cx.emit(ExplorerEvent::HistoryButton(true));
-                        }),
-                    ),
-                    cx,
-                ))
-                .child(ghost_button(
-                    "forward",
-                    Icon::ArrowRight,
-                    can_forward,
-                    t!("nav.forward"),
-                    cx.listener(|_, _: &ClickEvent, _, cx| {
-                        cx.emit(ExplorerEvent::HistoryButton(false));
-                    }),
-                ))
-            })
-            .child(ghost_button(
-                "up",
-                Icon::ArrowUp,
-                can_up,
-                t!("nav.up"),
-                cx.listener(|this, _: &ClickEvent, w, cx| this.go_up(&GoUp, w, cx)),
-            ))
-            .when(nav_here && !self.pane.split, |d| d.child(ghost_button(
-                "refresh",
-                Icon::Refresh,
-                self.model.is_some(),
-                t!("nav.refresh"),
-                cx.listener(|this, _: &ClickEvent, w, cx| this.refresh(&Refresh, w, cx)),
-            )))
-            // Space after the path drags the window and maximizes on double click (the system
-            // handles both through the caption hit test).
-            .child({
-                let drag = div()
-                    .id("drag")
-                    .window_control_area(WindowControlArea::Drag)
-                    // Click on empty title bar space ends path editing (not consumed, so the window
-                    // still drags).
-                    .on_mouse_down(
-                        MouseButton::Left,
-                        cx.listener(|this, _: &MouseDownEvent, window, cx| {
-                            this.cancel_path_edit(window, cx);
-                        }),
-                    )
-                    .on_mouse_up(
-                        gpui::MouseButton::Right,
-                        cx.listener(|_, e: &gpui::MouseUpEvent, _, cx| {
-                            cx.emit(ExplorerEvent::WindowMenu(e.position));
-                            cx.stop_propagation();
-                        }),
-                    );
-                self.render_path_slot(drag, window, cx)
-            })
-            // The operation center is window-wide state, so split view shows it once (right pane).
-            .when(self.pane.show_ops, |d| {
-                d.children(self.render_op_center(window, cx))
-            })
-            .child(self.render_filter_box(window, cx))
-            .when(self.pane.show_caption, |d| d.child(caption_buttons(window)))
-    }
-
-    fn render_filter_box(&mut self, window: &Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let in_box = self
-            .filter_input
-            .read(cx)
-            .focus_handle(cx)
-            .contains_focused(window, cx);
-        // The search panel below counts as part of the box.
-        let focused = in_box || self.panel_focus.contains_focused(window, cx);
+    /// The search box at `width` (see [`super::top_bar`]). At the width of a button it shows only
+    /// its magnifier until clicked (or Ctrl+F).
+    pub(super) fn render_filter_box(
+        &mut self,
+        state: layout::SearchBox,
+        width: Pixels,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let focused = state == layout::SearchBox::Typing;
         let active = !self.query.is_empty() || self.search_mode;
-        // When narrow, show only the magnifier until clicked (or Ctrl+F), leaving room for the
-        // path.
-        let collapsed = !focused
-            && !active
-            && if self.pane.split {
-                self.narrow()
-            } else {
-                self.bar_width < NARROW_TOP_BAR
-            };
+        let collapsed = width <= theme::h_ctl();
+        // Not in use but holding text: it shows from its start and ends in "…"; the tooltip has
+        // all of it.
+        let summary = !focused && !collapsed && !self.query.is_empty();
         let filter_box = div()
             .id("filter-box")
+            .debug_selector(|| "filter-box".to_owned())
             .key_context("FilterBar")
             .on_action(cx.listener(Self::filter_to_list))
             .w_full()
-            .on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
-                this.focus_filter_input(window, cx);
-            }))
+            .map(|d| Self::search_box_presses(d, collapsed, summary, cx))
             .overflow_hidden()
-            .when(collapsed, |d| d.tooltip_below(t!("filter.placeholder")))
-            .h(theme::H_CTL)
+            .when(collapsed, |d| {
+                d.tooltip_below(if self.query.is_empty() {
+                    t!("filter.placeholder").into_owned()
+                } else {
+                    self.query.clone()
+                })
+            })
+            .when(summary, |d| d.tooltip_below(self.query.clone()))
+            .h(theme::h_ctl())
             .flex()
             .items_center()
-            .gap(theme::S_6)
+            .gap(theme::s_6())
             .when(collapsed, gpui::Styled::justify_center)
-            .when(!collapsed, |d| d.pl(theme::S_12).pr(theme::S_4))
-            .rounded(theme::R_8)
+            .when(!collapsed, |d| d.pl(theme::s_12()).pr(theme::s_4()))
+            .rounded(theme::r_8())
             .border_1()
             .when(focused, |d| {
                 d.bg(theme::surface()).border_color(theme::signal_line())
@@ -216,7 +141,7 @@ impl Explorer {
             .child(
                 svg()
                     .path(Icon::Search.path())
-                    .size(theme::ICON)
+                    .size(theme::icon())
                     .flex_none()
                     .text_color(if active {
                         theme::text_muted()
@@ -231,34 +156,39 @@ impl Explorer {
                         .flex_1()
                         .min_w_0()
                         .overflow_hidden()
-                        .child(self.filter_input.clone()),
+                        .when(summary, |d| {
+                            d.relative()
+                                .truncate()
+                                .text_color(theme::text())
+                                .child(self.search_summary_measure())
+                                .child(SharedString::from(self.query.clone()))
+                        })
+                        .when(!summary, |d| d.child(self.filter_input.clone())),
                 )
             })
-            .when(!self.query.is_empty(), |d| d.child(Self::filter_clear(cx)))
+            .when(!self.query.is_empty() && !collapsed, |d| {
+                d.child(Self::filter_clear(cx))
+            })
             // Scope other than "this folder": show it on the right.
             .when(!collapsed, |d| d.children(self.render_scope_chip(focused, cx)));
         let filter_box = Self::bind_scope_actions(filter_box, cx);
         div()
             .relative()
-            .w(if collapsed {
-                theme::H_CTL
-            } else if self.pane.split {
-                px(150.)
-            } else {
-                theme::FILTER_W
-            })
-            .min_w(theme::H_CTL)
-            .when(!self.pane.split, gpui::Styled::flex_none)
-            .mr(theme::S_8)
+            .flex_none()
+            .w(width)
+            .min_w(theme::h_ctl())
             .child(filter_box)
             // While the box has focus, the scope strip shows below (this folder / subfolders / this
             // PC). It collapses once typing starts so it doesn't cover the list (Tab or the scope
             // chip reopens it).
+            // Not while the box's edit menu is open (right-click on the empty box): the menu is
+            // what was asked for.
             .when(
                 focused
                     && !self.panel_dismissed
-                    && (self.query.is_empty() || self.scope_strip_open),
-                |d| d.child(self.render_scope_strip(window, cx)),
+                    && (self.query.is_empty() || self.scope_strip_open)
+                    && !self.filter_input.read(cx).menu_open(),
+                |d| d.child(self.render_scope_strip(width, window, cx)),
             )
     }
 
@@ -267,18 +197,18 @@ impl Explorer {
         div()
             .id("filter-clear")
             .a11y_button(t!("a11y.clear_filter"))
-            .size(theme::S_20)
+            .size(theme::s_20())
             .flex()
             .flex_none()
             .items_center()
             .justify_center()
-            .rounded(theme::R_4)
+            .rounded(theme::r_4())
             .cursor_pointer()
             .hover(|s| s.bg(theme::wash_strong()))
             .child(
                 svg()
                     .path(Icon::Close.path())
-                    .size(theme::ICON_SM)
+                    .size(theme::icon_sm())
                     .text_color(theme::text_muted()),
             )
             .on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
@@ -290,51 +220,36 @@ impl Explorer {
 
     // ───────────────────────── Context bar ─────────────────────────
 
-    /// The left side changes: folder info with no selection, actions for the selection otherwise.
-    /// View tools on the right never move, even with a selection, so they can't be misclicked.
-    fn render_context_bar(&self, window: &Window, cx: &mut Context<Self>) -> AnyElement {
-        let compact = self.compact_bar();
-        let left = if !self.search_mode && !self.selection.is_empty() {
-            self.render_selection_actions(compact, cx)
-        } else {
-            self.render_folder_actions(compact, cx)
-        };
-        div()
-            .flex()
-            .flex_none()
-            .items_center()
-            .gap(theme::S_4)
-            .h(theme::H_CTX)
-            .pl(theme::S_20)
-            .pr(theme::S_12)
-            .child(left)
-            .child(vertical_divider())
-            .child(self.render_view_controls(window, cx))
-            .into_any_element()
-    }
-
-    /// Context bar buttons show icons only (labels move to tooltips): in split view or when the
-    /// pane is narrow.
+    /// Shorter texts in the pane row (in split view or when the pane is narrow).
     pub(super) fn compact_bar(&self) -> bool {
-        self.pane.split || self.bar_width < COMPACT_BAR
+        self.pane.split || self.bar_width < compact_bar()
     }
 
-    fn render_folder_actions(&self, compact: bool, cx: &mut Context<Self>) -> AnyElement {
+    /// With nothing selected, the pane row's end before the view buttons: the folder's item count
+    /// (or the search's), then paste and new folder. It gives way to the path bar: the count is
+    /// cut off first.
+    pub(super) fn render_folder_actions(
+        &self,
+        compact: bool,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
         // A server's share list takes no new items.
         let loaded = self.model.is_some() && !lists_shares(self.current_path());
         let can_paste = loaded && !self.search_mode && self.services.shell.clipboard_has_files();
         div()
             .flex()
-            .flex_1()
             .min_w_0()
+            // Squeezed past its buttons (a small window at a large scale): cut off, rather than
+            // drawn over the view buttons.
+            .overflow_hidden()
             .items_center()
-            .gap(theme::S_4)
+            .gap(theme::s_4())
             .child(
                 div()
-                    .flex_1()
+                    .debug_selector(|| "pane-info".to_owned())
                     .min_w_0()
                     .truncate()
-                    .text_size(theme::FS_12)
+                    .text_size(theme::fs_12())
                     .text_color(theme::text_subtle())
                     .child(self.info_parts(cx).join(" · ")),
             )
@@ -366,12 +281,16 @@ impl Explorer {
     }
 
     /// View tools: details/icons/columns with the view options flyout, preview pane, split.
-    fn render_view_controls(&self, window: &Window, cx: &mut Context<Self>) -> impl IntoElement {
+    pub(super) fn render_view_controls(
+        &self,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
         div()
             .flex()
             .flex_none()
             .items_center()
-            .gap(theme::S_4)
+            .gap(theme::s_4())
             // Split panes are half width: the switcher folds into the view options button (the
             // flyout has the same choices), leaving room for Copy to/Move to.
             .when(!self.pane.split, |d| {
@@ -380,9 +299,9 @@ impl Explorer {
                     .flex()
                     .flex_none()
                     .items_center()
-                    .gap(theme::S_2)
-                    .p(theme::S_2)
-                    .rounded(theme::R_8)
+                    .gap(theme::s_2())
+                    .p(theme::s_2())
+                    .rounded(theme::r_8())
                     // Same segmented style as the search scope strip: a recessed track with the
                     // current view as a raised pill.
                     .bg(theme::segment_track())
@@ -425,7 +344,11 @@ impl Explorer {
             ))
     }
 
-    fn render_selection_actions(&self, compact: bool, cx: &mut Context<Self>) -> AnyElement {
+    pub(super) fn render_selection_actions(
+        &self,
+        compact: bool,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
         // `compact` decides whether the summary includes the total size; action buttons are always
         // icon-only to keep the bar uncluttered.
         let narrow = compact;
@@ -444,26 +367,29 @@ impl Explorer {
         // Split view with both sides on different folders: Copy to/Move to take the room of the
         // regular buttons. Same folder: they'd copy items onto themselves, so they're left out and
         // the regular buttons come back.
+        if self.selection_folds() {
+            return self.render_folded_selection(count, cx);
+        }
         let peer_actions = self.render_peer_actions(cx);
         let crowded = peer_actions.is_some();
         div()
+            .debug_selector(|| "selection-actions".to_owned())
             .flex()
-            .flex_1()
             .min_w_0()
             .items_center()
-            .gap(theme::S_4)
+            .gap(theme::s_4())
             .overflow_hidden()
             .child(
                 div()
                     .flex()
                     .flex_none()
                     .items_center()
-                    .gap(theme::S_8)
-                    .mr(theme::S_4)
+                    .gap(theme::s_8())
+                    .mr(theme::s_4())
                     .font_weight(theme::FW_STRONG)
                     .child(
                         div()
-                            .size(theme::S_6)
+                            .size(theme::s_6())
                             .rounded(theme::R_FULL)
                             .bg(theme::signal()),
                     )
@@ -530,6 +456,79 @@ impl Explorer {
             .into_any_element()
     }
 
+    /// Whether the pane is too narrow for the selection's buttons next to the path bar and the
+    /// view buttons (a split pane in a small window, say): they fold into a "⋯" menu.
+    pub(crate) fn selection_folds(&self) -> bool {
+        let needs = if self.pane.split { 600. } else { 720. };
+        self.paper_width < theme::scaled_px(needs)
+    }
+
+    /// The selection in a narrow pane: "● 3" (the tooltip has the whole summary) and "⋯", which
+    /// opens the selection's context menu under it: open, cut, copy, rename, delete, copy or
+    /// move to the other side are all there.
+    fn render_folded_selection(&self, count: usize, cx: &mut Context<Self>) -> AnyElement {
+        let mut summary = t!("sel.count", count = format_count(count)).into_owned();
+        if let Some(size) = self.selected_size() {
+            let _ = write!(summary, " · {}", format_size(size));
+        }
+        div()
+            .debug_selector(|| "selection-actions".to_owned())
+            .flex()
+            .flex_none()
+            .items_center()
+            .gap(theme::s_2())
+            .child(
+                div()
+                    .id("sel-count")
+                    .debug_selector(|| "sel-count".to_owned())
+                    .flex()
+                    .flex_none()
+                    .items_center()
+                    .gap(theme::s_6())
+                    .h(theme::h_ctl_sm())
+                    .px(theme::s_6())
+                    .font_weight(theme::FW_STRONG)
+                    .child(
+                        div()
+                            .size(theme::s_6())
+                            .rounded(theme::R_FULL)
+                            .bg(theme::signal()),
+                    )
+                    .child(format_count(count))
+                    .tooltip_below(summary),
+            )
+            .child(
+                div()
+                    .id("sel-more")
+                    .debug_selector(|| "sel-more".to_owned())
+                    .a11y_button(t!("sel.more"))
+                    .flex()
+                    .flex_none()
+                    .items_center()
+                    .justify_center()
+                    .size(theme::h_ctl_sm())
+                    .rounded(theme::r_8())
+                    .cursor_pointer()
+                    .hover(|s| s.bg(theme::wash()))
+                    .child(
+                        svg()
+                            .path(Icon::More.path())
+                            .size(theme::icon())
+                            .text_color(theme::text_muted()),
+                    )
+                    .tooltip_below(t!("sel.more").to_string())
+                    // Opens on press, like the other menus.
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(|this, event: &MouseDownEvent, window, cx| {
+                            cx.stop_propagation();
+                            this.open_context_menu(event.position, window, cx);
+                        }),
+                    ),
+            )
+            .into_any_element()
+    }
+
     /// The other pane's folder, when copying or moving there makes sense: split view with the other
     /// side somewhere else. Both sides on the same folder would copy items onto themselves.
     fn peer_target(&self) -> Option<&Path> {
@@ -542,7 +541,7 @@ impl Explorer {
     /// down to "…" says nothing.
     fn render_peer_actions(&self, cx: &mut Context<Self>) -> Option<impl IntoElement + use<>> {
         let peer = self.peer_target()?.to_path_buf();
-        let labels = self.paper_width >= PEER_LABELS_MIN;
+        let labels = self.paper_width >= peer_labels_min();
         let name = peer.file_name().map_or_else(
             || peer.display().to_string(),
             |n| n.to_string_lossy().into_owned(),
@@ -552,7 +551,7 @@ impl Explorer {
                 .flex()
                 .min_w_0()
                 .items_center()
-                .gap(theme::S_4)
+                .gap(theme::s_4())
                 .child(peer_button(
                     "sel-copy-peer",
                     Icon::Copy,
@@ -608,7 +607,7 @@ impl Explorer {
     }
 
     /// Info on the left of the context bar (replaces the old status bar).
-    pub(super) fn info_parts(&self, cx: &App) -> Vec<String> {
+    pub(crate) fn info_parts(&self, cx: &App) -> Vec<String> {
         let mut parts: Vec<String> = Vec::new();
         if self.search_global {
             return self.computer_info(cx);
@@ -732,9 +731,9 @@ impl Explorer {
             .h(height)
             .flex()
             .items_center()
-            .pl(layout::ROW_PAD_L)
-            .pr(layout::ROW_PAD_R)
-            .gap(layout::COL_GAP)
+            .pl(layout::row_pad_l())
+            .pr(layout::row_pad_r())
+            .gap(layout::col_gap())
     }
 
     /// Shared by rows and tiles: selection background, cursor ring, mouse events.
@@ -759,10 +758,11 @@ impl Explorer {
                 },
             )
             // Click without drag: in a multi-selection, select only this item.
-            .on_click(cx.listener(move |this, event: &ClickEvent, _, cx| {
+            .on_click(cx.listener(move |this, event: &ClickEvent, window, cx| {
                 if this.on_row_click(ix, event, cx) {
                     return;
                 }
+                this.on_row_released(ix, event, window, cx);
                 if this.click_select == Some(ix) && event.click_count() == 1 {
                     this.click_select = None;
                     if let Some(view) = this.view() {
@@ -795,7 +795,7 @@ impl Explorer {
                     drop_external_into(paths, external.clone(), &target, window, cx);
                 })
             })
-            .rounded(theme::R_8)
+            .rounded(theme::r_8())
             .border_1()
             .border_color(if is_cursor && focused {
                 theme::signal_line()
@@ -848,14 +848,25 @@ impl Explorer {
         entry: &Entry,
         rename_input: Option<(Entity<TextInput>, Option<NameError>)>,
         (in_cloud, sync): (bool, Option<arke_core::entry::CloudSync>),
+        cx: &mut Context<Self>,
     ) -> impl IntoElement {
+        let press: NamePress =
+            Box::new(cx.listener(move |this, _: &gpui::MouseDownEvent, _, _| {
+                this.on_name_pressed(ix);
+            }));
         div()
             .flex_1()
             .min_w_0()
             .flex()
             .items_center()
-            .gap(theme::S_12)
-            .child(name_cell(entry, rename_input, self.show_extensions, true))
+            .gap(theme::s_12())
+            .child(name_cell(
+                entry,
+                rename_input,
+                self.show_extensions,
+                true,
+                Some(press),
+            ))
             .children(super::compare::compare_badge(
                 self.compare_mark(&entry.name),
             ))
@@ -868,17 +879,19 @@ impl Explorer {
         div()
             .flex()
             .items_center()
-            .gap(layout::COL_GAP)
+            .gap(layout::col_gap())
             .map(|d| match self.cols {
                 Some(c) => d.w(c.name).flex_none(),
                 None => d.flex_1().min_w_0(),
             })
     }
 
+    /// `tips`: which of the rows get a tooltip with their whole name (column view names cut off).
     pub(super) fn render_rows(
         &mut self,
         range: Range<usize>,
         focused: bool,
+        tips: &[bool],
         cx: &mut Context<Self>,
     ) -> Vec<AnyElement> {
         let started = Instant::now();
@@ -917,6 +930,9 @@ impl Explorer {
                     .show_checkboxes
                     .then(|| self.item_checkbox(ix, is_selected, cx));
                 self.row_shell(ix, is_selected, is_cursor, focused, cx)
+                    .when(tips.get(k).copied().unwrap_or(false), |d| {
+                        d.tooltip(tooltip(SharedString::from(&*entry.name)))
+                    })
                     .a11y_item(ix, is_selected, cursor == Some(ix), || {
                         self.item_a11y_label(entry)
                     })
@@ -935,7 +951,7 @@ impl Explorer {
                             .child(self.tree_lead(
                                 ix,
                                 entry,
-                                listed_visual(shares, entry, image, theme::ICON, theme::ICON),
+                                listed_visual(shares, entry, image, theme::icon(), theme::icon()),
                                 cx,
                             ))
                             .child(self.name_column(
@@ -943,6 +959,7 @@ impl Explorer {
                                 entry,
                                 rename_input,
                                 (in_cloud, sync.get(&entry.name).copied()),
+                                cx,
                             )),
                     )
                     .when(columns, |d| d.children(Self::column_row_tail(entry)))
@@ -959,36 +976,42 @@ impl Explorer {
     }
 
     /// Thumbnails or system icons for visible items (once loaded), and hand the visible range plus
-    /// one page ahead to the media cache.
-    fn media_for(
+    /// a page ahead and a page back to the media cache.
+    pub(crate) fn media_for(
         &mut self,
         entries: &[Entry],
         range: Range<usize>,
         thumbnails: bool,
         cx: &mut Context<Self>,
     ) -> Vec<Option<Arc<RenderImage>>> {
+        self.folder_sizes_shown(entries, range.clone(), cx);
         let Some(dir) = self.current_path().map(Path::to_path_buf) else {
             return Vec::new();
         };
+        // Elsewhere (network shares) only type icons: they read no file.
         let allowed = self.media_ok(&dir, cx);
-        if !allowed {
-            return Vec::new();
-        }
         let thumb_px = (thumbnails && self.show_thumbnails).then(|| self.thumbnail_px());
         let key = |ix: usize| {
-            entries
-                .get(ix)
-                .and_then(|e| MediaKey::sized(&dir, e, thumb_px))
+            entries.get(ix).and_then(|e| {
+                if allowed {
+                    MediaKey::sized(&dir, e, thumb_px)
+                } else {
+                    MediaKey::type_icon(e)
+                }
+            })
         };
         let keys: Vec<Option<MediaKey>> = range.clone().map(key).collect();
+        // A page ahead, then a page back (scrolling back finds them still decoded).
         let prefetch_end = (range.end + range.len()).min(entries.len());
+        let prefetch_start = range.start.saturating_sub(range.len());
         let wanted: Vec<MediaKey> = keys
             .iter()
             .flatten()
             .cloned()
             .chain((range.end..prefetch_end).filter_map(key))
+            .chain((prefetch_start..range.start).rev().filter_map(key))
             .collect();
-        self.media.update(cx, |m, _| m.want(wanted));
+        self.media.update(cx, |m, cx| m.want(wanted, cx));
         let media = self.media.read(cx);
         // A thumbnail decoded for another icon size stands in until this size's arrives.
         keys.iter()
@@ -1013,6 +1036,39 @@ impl Explorer {
 
     /// Rows of grid tiles: each row is a contiguous run of items (when grouped, a group's last row
     /// may be partial).
+    /// A tile's name (two lines at most), or its rename box.
+    fn tile_label(
+        &self,
+        ix: usize,
+        entry: &Entry,
+        rename_input: Option<(Entity<TextInput>, Option<NameError>)>,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        match rename_input {
+            Some(rename) => name_cell(entry, Some(rename), true, false, None),
+            None => div()
+                .debug_selector({
+                    let name = Arc::clone(&entry.name);
+                    move || format!("name:{name}")
+                })
+                .w_full()
+                .text_center()
+                .line_clamp(2)
+                // Two lines can't fit (long name with no break points): ellipsize the second line
+                // rather than clipping the sides.
+                .text_ellipsis()
+                .text_size(theme::fs_12())
+                .child(shown_name(entry, self.show_extensions))
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(move |this, _: &gpui::MouseDownEvent, _, _| {
+                        this.on_name_pressed(ix);
+                    }),
+                )
+                .into_any_element(),
+        }
+    }
+
     pub(super) fn render_tile_rows(
         &mut self,
         rows: Vec<Range<usize>>,
@@ -1052,34 +1108,22 @@ impl Explorer {
                             .filter(|(name, _)| *name == entry.name)
                             .map(|(_, rename)| rename.clone());
                         let image = images.get(k).cloned().flatten();
-                        let label = match rename_input {
-                            Some(rename) => name_cell(entry, Some(rename), true, false),
-                            None => div()
-                            .w_full()
-                            .text_center()
-                            .line_clamp(2)
-                            // Two lines can't fit (long name with no break points): ellipsize the
-                            // second line rather than clipping the sides.
-                            .text_ellipsis()
-                            .text_size(theme::FS_12)
-                            .child(shown_name(entry, self.show_extensions))
-                            .into_any_element(),
-                        };
+                        let label = self.tile_label(ix, entry, rename_input, cx);
                         // Folder compare badge in the tile's top-right
                         let badge = super::compare::compare_badge(self.compare_mark(&entry.name))
                             .map(|badge| {
                                 div()
                                     .absolute()
-                                    .top(theme::S_4)
-                                    .right(theme::S_4)
+                                    .top(theme::s_4())
+                                    .right(theme::s_4())
                                     .child(badge)
                             });
                         // Checkbox in the tile's top-left
                         let check = self.show_checkboxes.then(|| {
                             div()
                                 .absolute()
-                                .top(theme::S_6)
-                                .left(theme::S_6)
+                                .top(theme::s_6())
+                                .left(theme::s_6())
                                 .child(self.item_checkbox(ix, is_selected, cx))
                         });
                         Self::item_shell(ix, is_selected, is_cursor, focused, self.drop_dir(ix), cx)
@@ -1096,9 +1140,9 @@ impl Explorer {
                             .flex()
                             .flex_col()
                             .items_center()
-                            .pt(theme::S_4)
-                            .px(theme::S_4)
-                            .gap(theme::S_4)
+                            .pt(theme::s_4())
+                            .px(theme::s_4())
+                            .gap(theme::s_4())
                             .when(entry.is_hidden(), |d| d.text_color(theme::text_subtle()))
                             .when(cut.get(k).copied().unwrap_or(false), |d| d.opacity(0.5))
                             .child(
@@ -1118,7 +1162,7 @@ impl Explorer {
                     .collect();
                 div()
                     .flex()
-                    .px(theme::S_8)
+                    .px(theme::s_8())
                     .children(tiles)
                     .into_any_element()
             })
@@ -1128,8 +1172,11 @@ impl Explorer {
     fn grid_list(&mut self, len: usize, focused: bool, cx: &mut Context<Self>) -> AnyElement {
         // Pane width (preview pane already excluded) minus paper margin, list padding and
         // scrollbar.
-        let avail =
-            self.pane_width - theme::S_8 - theme::S_32 - SCROLLBAR_GUTTER - layout::LIST_GUTTER;
+        let avail = self.pane_width
+            - theme::s_8()
+            - theme::s_32()
+            - scrollbar_gutter()
+            - layout::list_gutter();
         let tile = self.tile();
         self.grid_cols = ((avail / tile.w).floor() as usize).max(1);
         if std::mem::take(&mut self.recenter_grid)
@@ -1156,7 +1203,7 @@ impl Explorer {
         .track_scroll(&self.scroll)
         // A sideways swipe is back or forward (#70), not a scroll down the list.
         .map(sideways_is_not_down)
-        .pt(theme::S_4)
+        .pt(theme::s_4())
         .flex_1();
         self.with_scrollbar(list, &self.scroll)
     }
@@ -1168,24 +1215,27 @@ impl Explorer {
             "files",
             self.display_len(len) + tail_items(self.row_height()),
             cx.processor(
-                move |this, range: Range<usize>, _window, cx| match this.groups() {
-                    Some(groups) => this.render_grouped_rows(&groups, range, focused, cx),
-                    None => this.render_rows(range, focused, cx),
+                move |this, range: Range<usize>, window, cx| {
+                    if let Some(groups) = this.groups() {
+                        return this.render_grouped_rows(&groups, range, focused, cx);
+                    }
+                    let tips = this.column_name_tips(range.clone(), window);
+                    this.render_rows(range, focused, &tips, cx)
                 },
             ),
         )
         .track_scroll(&self.scroll)
         // A sideways swipe is back or forward (#70), not a scroll down the list.
         .map(sideways_is_not_down)
-        .pl(theme::S_8)
-        .pr(theme::S_8 + layout::LIST_GUTTER)
+        .pl(theme::s_8())
+        .pr(theme::s_8() + layout::list_gutter())
         .flex_1();
         self.with_scrollbars(list, &self.scroll)
     }
 
     /// [`Self::with_scrollbar`] for Details rows and search results: columns wider than the pane
     /// scroll sideways (the header along), like Explorer, with a scrollbar along the bottom. The
-    /// list's right padding keeps [`layout::LIST_GUTTER`] blank after the last column even then.
+    /// list's right padding keeps [`layout::list_gutter()`] blank after the last column even then.
     fn with_scrollbars(
         &self,
         list: gpui::UniformList,
@@ -1243,7 +1293,7 @@ impl Explorer {
     ) -> AnyElement {
         let icon = svg()
             .path(Icon::Search.path())
-            .size(theme::S_32)
+            .size(theme::s_32())
             .text_color(theme::text_subtle())
             .into_any_element();
         let widen = if self.query.trim().is_empty() {
@@ -1270,17 +1320,17 @@ impl Explorer {
             .flex_col()
             .items_center()
             .justify_center()
-            .gap(theme::S_8)
+            .gap(theme::s_8())
             .child(div().opacity(0.7).child(icon))
             .child(
                 div()
-                    .text_size(theme::FS_15)
+                    .text_size(theme::fs_15())
                     .text_color(theme::text_muted())
                     .child(title),
             )
             .children(hint.map(|h| {
                 div()
-                    .text_size(theme::FS_12)
+                    .text_size(theme::fs_12())
                     .text_color(theme::text_subtle())
                     .child(h)
             }))
@@ -1302,17 +1352,17 @@ impl Explorer {
             .flex_col()
             .items_center()
             .justify_center()
-            .gap(theme::S_8)
-            .px(theme::S_32)
+            .gap(theme::s_8())
+            .px(theme::s_32())
             .child(
                 svg()
                     .path(Icon::Close.path())
-                    .size(theme::S_24)
+                    .size(theme::s_24())
                     .text_color(theme::danger()),
             )
             .child(
                 div()
-                    .text_size(theme::FS_15)
+                    .text_size(theme::fs_15())
                     .font_weight(theme::FW_STRONG)
                     .child(t!("list.failed_title", name = name).into_owned()),
             )
@@ -1325,7 +1375,7 @@ impl Explorer {
             .child(
                 div()
                     .max_w_full()
-                    .text_size(theme::FS_12)
+                    .text_size(theme::fs_12())
                     .text_color(theme::text_subtle())
                     .overflow_hidden()
                     .whitespace_nowrap()
@@ -1335,8 +1385,8 @@ impl Explorer {
             .child(
                 div()
                     .flex()
-                    .gap(theme::S_8)
-                    .mt(theme::S_8)
+                    .gap(theme::s_8())
+                    .mt(theme::s_8())
                     .child(outline_button(
                         "failed-retry",
                         if login {
@@ -1425,18 +1475,22 @@ impl Explorer {
                     // after the name.
                     .child(
                         self.name_block()
-                            .child(entry_visual(entry, None, theme::ICON, theme::ICON))
+                            .child(entry_visual(entry, None, theme::icon(), theme::icon()))
                             .child(
                                 div()
                                     .flex_1()
                                     .min_w_0()
                                     .flex()
                                     .items_center()
-                                    .gap(theme::S_12)
+                                    .gap(theme::s_12())
                                     .child(
                                         div()
+                                            .debug_selector({
+                                                let name = Arc::clone(&entry.name);
+                                                move || format!("name:{name}")
+                                            })
                                             .when(hit.snippet.is_some(), |d| {
-                                                d.flex_none().max_w(px(240.))
+                                                d.flex_none().max_w(crate::theme::scaled_px(240.))
                                             })
                                             .min_w_0()
                                             .truncate()
@@ -1447,7 +1501,7 @@ impl Explorer {
                                             .flex_1()
                                             .min_w_0()
                                             .truncate()
-                                            .text_size(theme::FS_12)
+                                            .text_size(theme::fs_12())
                                             .text_color(theme::text_muted())
                                             .child(SharedString::from(line))
                                     })),
@@ -1455,13 +1509,13 @@ impl Explorer {
                     )
                     .child(
                         div()
-                            .w(theme::COL_LOCATION)
+                            .w(theme::col_location())
                             .flex_none()
                             // Keep the end of long paths (the folders nearest the file).
                             .overflow_hidden()
                             .whitespace_nowrap()
                             .text_ellipsis_start()
-                            .text_size(theme::FS_12)
+                            .text_size(theme::fs_12())
                             .text_color(theme::text_muted())
                             .child(location),
                     )
@@ -1469,7 +1523,7 @@ impl Explorer {
                         div()
                             .w(crate::prefs::modified_width())
                             .flex_none()
-                            .text_size(theme::FS_12)
+                            .text_size(theme::fs_12())
                             .text_color(theme::text_muted())
                             .child(
                                 entry
@@ -1484,6 +1538,7 @@ impl Explorer {
     }
 
     /// List content: rows, tiles, search results, or the empty/loading state.
+    #[allow(clippy::too_many_lines, reason = "one match over every list state")]
     fn list_body(&mut self, focused: bool, cx: &mut Context<Self>) -> AnyElement {
         let message = |text: SharedString| {
             div()
@@ -1517,8 +1572,8 @@ impl Explorer {
                     .track_scroll(&self.search_scroll)
                     // A sideways swipe is back or forward (#70), not a scroll down the list.
                     .map(sideways_is_not_down)
-                    .pl(theme::S_8)
-                    .pr(theme::S_8 + layout::LIST_GUTTER)
+                    .pl(theme::s_8())
+                    .pr(theme::s_8() + layout::list_gutter())
                     .flex_1();
                     self.with_scrollbars(list, &self.search_scroll)
                 }
@@ -1541,13 +1596,17 @@ impl Explorer {
                     if view_len == Some(0) && model.complete && lists_shares(Some(&model.path)) =>
                 {
                     Self::empty_state(
-                        crate::assets::tinted(Icon::NetDrive, px(40.), theme::text_muted()),
+                        crate::assets::tinted(
+                            Icon::NetDrive,
+                            crate::theme::scaled_px(40.),
+                            theme::text_muted(),
+                        ),
                         t!("list.no_shares").into_owned(),
                         None,
                     )
                 }
                 Some(model) if view_len == Some(0) && model.complete => Self::empty_state(
-                    kind_icon(FileKind::Folder, px(40.)),
+                    kind_icon(FileKind::Folder, crate::theme::scaled_px(40.)),
                     t!("list.empty").into_owned(),
                     Some(t!("list.empty_hint").into_owned()),
                 ),
@@ -1559,6 +1618,7 @@ impl Explorer {
                     let list = self.details_list(view_len.unwrap_or(0), focused, cx);
                     if self.columns_active() {
                         div()
+                            .relative()
                             .flex()
                             .flex_1()
                             .min_h_0()
@@ -1569,9 +1629,10 @@ impl Explorer {
                                     .flex_col()
                                     .flex_1()
                                     .min_w_0()
-                                    .pt(theme::S_4)
+                                    .pt(theme::s_4())
                                     .child(list),
                             )
+                            .child(self.render_parent_divider(cx))
                             .into_any_element()
                     } else {
                         list
@@ -1606,7 +1667,7 @@ impl Explorer {
             .flex_col()
             .flex_1()
             .min_h_0()
-            .pb(theme::S_8)
+            .pb(theme::s_8())
             .on_mouse_down(
                 MouseButton::Left,
                 cx.listener(|this, e: &MouseDownEvent, window, cx| {
@@ -1650,9 +1711,19 @@ impl Explorer {
             .on_action(cx.listener(Self::escape))
             .on_action(cx.listener(Self::open_selected))
             .on_action(cx.listener(Self::open_in_new_tab))
+            .on_action(cx.listener(Self::show_properties))
             .on_action(cx.listener(Self::open_location))
             .on_action(cx.listener(Self::move_left))
             .on_action(cx.listener(Self::move_right))
+            .on_action(cx.listener(|this, _: &super::LookZoomIn, window, cx| {
+                this.look_zoom_key(Some(1), window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &super::LookZoomOut, window, cx| {
+                this.look_zoom_key(Some(-1), window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &super::LookZoomReset, window, cx| {
+                this.look_zoom_key(None, window, cx);
+            }))
             .child(body)
             .children(self.render_marquee(cx))
             .child(Self::render_zoom_capture(cx))
@@ -1694,11 +1765,12 @@ impl Explorer {
         self.notice_timer = Some((notice, task));
     }
 
-    /// Running file operation: current item, progress bar, cancel.
-    fn op_toast(
+    /// Running file operation: current item, progress bar, cancel. Also drawn by other views
+    /// that run an operation of their own (the Recycle Bin page).
+    pub(crate) fn op_toast<V: 'static>(
         progress: &Arc<crate::shell::OpProgress>,
         verb: &'static str,
-        cx: &mut Context<Self>,
+        cx: &mut Context<V>,
     ) -> AnyElement {
         use std::sync::atomic::Ordering;
         let done = progress.done.load(Ordering::Relaxed);
@@ -1881,12 +1953,12 @@ impl Explorer {
         Some(
             div()
                 .absolute()
-                .right(theme::S_16)
-                .bottom(theme::S_16)
-                .w(px(360.))
+                .right(theme::s_16())
+                .bottom(theme::s_16())
+                .w(crate::theme::scaled_px(360.))
                 .flex()
                 .flex_col()
-                .gap(theme::S_8)
+                .gap(theme::s_8())
                 .children(toasts)
                 .into_any_element(),
         )
@@ -1948,9 +2020,9 @@ impl Explorer {
         Some(
             div()
                 .absolute()
-                .right(theme::S_16)
-                .bottom(theme::S_16)
-                .w(px(360.))
+                .right(theme::s_16())
+                .bottom(theme::s_16())
+                .w(crate::theme::scaled_px(360.))
                 .flex()
                 .flex_col()
                 .child(crate::motion::leave(
@@ -1981,6 +2053,22 @@ enum Progress {
     /// Unknown remaining time: draw a fixed-length segment
     Indeterminate,
     Fraction(f32),
+}
+
+/// An error toast with Close, for views outside the file list (the Recycle Bin page).
+pub(crate) fn error_toast(
+    id: &'static str,
+    text: String,
+    on_close: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
+) -> AnyElement {
+    toast(
+        id,
+        Icon::Close,
+        text,
+        Tone::Danger,
+        Progress::None,
+        vec![(t!("toast.close"), Box::new(on_close) as Listener)],
+    )
 }
 
 /// A toast that rises in when it first shows up.
@@ -2038,10 +2126,10 @@ fn toast_body(
     toast
         .flex()
         .flex_col()
-        .gap(theme::S_8)
-        .px(theme::S_16)
-        .py(theme::S_12)
-        .rounded(theme::R_12)
+        .gap(theme::s_8())
+        .px(theme::s_16())
+        .py(theme::s_12())
+        .rounded(theme::r_12())
         .bg(if danger {
             theme::danger_surface()
         } else {
@@ -2052,8 +2140,8 @@ fn toast_body(
             div()
                 .flex()
                 .items_center()
-                .gap(theme::S_8)
-                .child(glyph.size(theme::ICON).flex_none())
+                .gap(theme::s_8())
+                .child(glyph.size(theme::icon()).flex_none())
                 .child(div().flex_1().min_w_0().line_clamp(4).child(text))
                 .children(
                     actions
@@ -2062,12 +2150,13 @@ fn toast_body(
                         .map(|(ix, (label, on_click))| {
                             div()
                                 .id(("toast-action", ix))
+                                .debug_selector(move || format!("{id}-action-{ix}"))
                                 .a11y_button(label.to_string())
                                 .flex_none()
-                                .px(theme::S_6)
-                                .rounded(theme::R_4)
+                                .px(theme::s_6())
+                                .rounded(theme::r_4())
                                 .cursor_pointer()
-                                .text_size(theme::FS_12)
+                                .text_size(theme::fs_12())
                                 .text_color(theme::text_muted())
                                 .hover(|s| s.bg(theme::wash_strong()).text_color(theme::text()))
                                 .child(label.to_string())
@@ -2085,7 +2174,7 @@ fn toast_body(
                 div()
                     .id("toast-progress")
                     .a11y_progress(known)
-                    .h(theme::S_4)
+                    .h(theme::s_4())
                     .w_full()
                     .rounded(theme::R_FULL)
                     .bg(theme::line())
@@ -2111,20 +2200,44 @@ pub(crate) fn tooltip(
 
 fn kbd(text: &'static str) -> impl IntoElement {
     div()
-        .px(theme::S_4)
-        .rounded(theme::R_4)
+        .px(theme::s_4())
+        .rounded(theme::r_4())
         .border_1()
         .border_color(theme::line_strong())
-        .text_size(theme::FS_11)
+        .text_size(theme::fs_11())
         .text_color(theme::text_subtle())
         .child(text)
 }
 
-fn vertical_divider() -> impl IntoElement {
+/// Outlines the pane the search box is searching, while it's typed in. Drawn over the paper; it
+/// takes no clicks.
+/// Split view: the active pane's thin accent edge, drawn over the paper's border (a shadow would
+/// show through the translucent paper and tint the whole pane).
+fn active_outline() -> impl IntoElement {
+    div()
+        .debug_selector(|| "active-pane-outline".to_owned())
+        .absolute()
+        .inset_0()
+        .rounded(theme::r_12())
+        .border_1()
+        .border_color(theme::signal_line())
+}
+
+fn search_outline() -> impl IntoElement {
+    div()
+        .debug_selector(|| "search-target".to_owned())
+        .absolute()
+        .inset_0()
+        .rounded(theme::r_12())
+        .border_2()
+        .border_color(theme::signal_line())
+}
+
+pub(super) fn vertical_divider() -> impl IntoElement {
     div()
         .w(px(1.))
-        .h(theme::S_16)
-        .mx(theme::S_4)
+        .h(theme::s_16())
+        .mx(theme::s_4())
         .flex_none()
         .bg(theme::line())
 }
@@ -2154,12 +2267,12 @@ pub(crate) fn ghost_button_turned(
         .id(id)
         .a11y_button(tip.clone())
         .a11y_disabled(!enabled)
-        .size(theme::H_CTL)
+        .size(theme::h_ctl())
         .flex()
         .flex_none()
         .items_center()
         .justify_center()
-        .rounded(theme::R_8)
+        .rounded(theme::r_8())
         .when(enabled, |d| {
             d.cursor_pointer()
                 .hover(|s| s.bg(theme::wash_strong()))
@@ -2168,7 +2281,7 @@ pub(crate) fn ghost_button_turned(
         .child(
             svg()
                 .path(icon.path())
-                .size(theme::ICON)
+                .size(theme::icon())
                 .with_transformation(gpui::Transformation::rotate(gpui::radians(turn)))
                 .text_color(if enabled {
                     theme::text_muted()
@@ -2198,15 +2311,15 @@ fn action_button(
         .id(id)
         .a11y_button(label.clone())
         .group(id)
-        .h(theme::H_CTL_SM)
-        .px(theme::S_8)
+        .h(theme::h_ctl_sm())
+        .px(theme::s_8())
         .flex()
         .flex_none()
         .items_center()
-        .gap(theme::S_6)
-        .rounded(theme::R_8)
+        .gap(theme::s_6())
+        .rounded(theme::r_8())
         .cursor_pointer()
-        .text_size(theme::FS_12)
+        .text_size(theme::fs_12())
         .text_color(theme::text_muted())
         .hover(|s| {
             let s = s.bg(theme::wash());
@@ -2219,7 +2332,7 @@ fn action_button(
         .child(
             svg()
                 .path(icon.path())
-                .size(theme::ICON)
+                .size(theme::icon())
                 .text_color(theme::text_muted())
                 .group_hover(id, move |s| {
                     s.text_color(if danger {
@@ -2230,7 +2343,7 @@ fn action_button(
                 }),
         )
         // At half width keep only the icon and move the label to the tooltip.
-        .when(compact, |d| d.px(theme::S_6).tooltip_below(label.clone()))
+        .when(compact, |d| d.px(theme::s_6()).tooltip_below(label.clone()))
         .when(!compact, |d| d.child(label.clone()))
         .on_click(on_click)
 }
@@ -2243,21 +2356,21 @@ fn clear_selection_button(
     div()
         .id("sel-clear")
         .a11y_button(t!("sel.clear"))
-        .h(theme::H_CTL_SM)
-        .px(theme::S_8)
+        .h(theme::h_ctl_sm())
+        .px(theme::s_8())
         .flex()
         .flex_none()
         .items_center()
-        .gap(theme::S_6)
-        .rounded(theme::R_8)
+        .gap(theme::s_6())
+        .rounded(theme::r_8())
         .cursor_pointer()
-        .text_size(theme::FS_12)
+        .text_size(theme::fs_12())
         .text_color(theme::text_muted())
         .hover(|s| s.bg(theme::wash()).text_color(theme::text()))
         .child(
             svg()
                 .path(Icon::Close.path())
-                .size(theme::ICON_SM)
+                .size(theme::icon_sm())
                 .text_color(theme::text_subtle()),
         )
         .when(!compact, |d| {
@@ -2276,16 +2389,16 @@ fn outline_button(
     div()
         .id(id)
         .a11y_lazy(gpui::Role::Button, || label.to_string())
-        .h(theme::H_CTL_SM)
-        .px(theme::S_12)
+        .h(theme::h_ctl_sm())
+        .px(theme::s_12())
         .flex()
         .flex_none()
         .items_center()
-        .rounded(theme::R_8)
+        .rounded(theme::r_8())
         .border_1()
         .border_color(theme::line_strong())
         .cursor_pointer()
-        .text_size(theme::FS_12)
+        .text_size(theme::fs_12())
         .hover(|s| s.bg(theme::wash()))
         .child(label.to_string())
         .on_click(on_click)
@@ -2317,19 +2430,19 @@ fn preview_button(on: bool, cx: &mut Context<Explorer>) -> impl IntoElement + us
     div()
         .id("toggle-preview")
         .a11y_toggle(t!("ctx.preview"), on)
-        .h(theme::H_CTL_SM)
-        .px(theme::S_6)
+        .h(theme::h_ctl_sm())
+        .px(theme::s_6())
         .flex()
         .flex_none()
         .items_center()
-        .rounded(theme::R_8)
+        .rounded(theme::r_8())
         .cursor_pointer()
         .when(on, |d| d.bg(theme::wash_strong()))
         .when(!on, |d| d.hover(|s| s.bg(theme::wash())))
         .child(
             svg()
                 .path(Icon::Preview.path())
-                .size(theme::ICON)
+                .size(theme::icon())
                 .text_color(if on {
                     theme::text()
                 } else {
@@ -2359,12 +2472,12 @@ fn split_button(
             },
             split,
         )
-        .h(theme::H_CTL_SM)
-        .px(theme::S_6)
+        .h(theme::h_ctl_sm())
+        .px(theme::s_6())
         .flex()
         .flex_none()
         .items_center()
-        .rounded(theme::R_8)
+        .rounded(theme::r_8())
         .cursor_pointer()
         .when(split, |d| d.bg(theme::wash_strong()))
         .when(!split, |d| d.hover(|s| s.bg(theme::wash())))
@@ -2372,7 +2485,7 @@ fn split_button(
         .child(
             svg()
                 .path(Icon::Split.path())
-                .size(theme::ICON)
+                .size(theme::icon())
                 .text_color(if split {
                     theme::text()
                 } else {
@@ -2397,25 +2510,25 @@ fn peer_button(
 ) -> impl IntoElement {
     div()
         .id(id)
-        .h(theme::H_CTL_SM)
-        .px(theme::S_8)
+        .h(theme::h_ctl_sm())
+        .px(theme::s_8())
         .flex()
         // Truncate the folder name when space is short so the button isn't squeezed out.
-        .when(show_label, |d| d.flex_shrink(1.).min_w(theme::S_32))
+        .when(show_label, |d| d.flex_shrink(1.).min_w(theme::s_32()))
         .when(!show_label, gpui::Styled::flex_none)
         .items_center()
-        .gap(theme::S_6)
-        .rounded(theme::R_8)
+        .gap(theme::s_6())
+        .rounded(theme::r_8())
         .border_1()
         .border_color(theme::signal_line())
         .cursor_pointer()
-        .text_size(theme::FS_12)
+        .text_size(theme::fs_12())
         .text_color(theme::text())
         .hover(|s| s.bg(theme::signal_wash()))
         .child(
             svg()
                 .path(icon.path())
-                .size(theme::ICON)
+                .size(theme::icon())
                 .flex_none()
                 .text_color(theme::signal()),
         )
@@ -2438,12 +2551,12 @@ fn segment(
 ) -> impl IntoElement {
     div()
         .id(id)
-        .w(px(28.))
-        .h(super::viewopts::SEGMENT_H)
+        .w(crate::theme::scaled_px(28.))
+        .h(super::viewopts::segment_h())
         .flex()
         .items_center()
         .justify_center()
-        .rounded(theme::R_4)
+        .rounded(theme::r_4())
         .cursor_pointer()
         .when(active, |d| {
             d.bg(theme::segment_thumb()).shadow(theme::elev_thumb())
@@ -2453,7 +2566,7 @@ fn segment(
         .child(
             svg()
                 .path(icon.path())
-                .size(theme::ICON)
+                .size(theme::icon())
                 .text_color(if active {
                     theme::text()
                 } else {
@@ -2467,9 +2580,17 @@ fn segment(
 
 /// Window buttons styled like the other icon buttons (rounded, same stroke), not imitating Windows.
 /// Clicks are still handled by the system (`WindowControlArea`), so maximize gets the Windows 11
-/// snap layouts menu.
+/// snap layouts menu. Maximized, they also take the screen edge above them and Close the corner
+/// (`caption.rs`).
 pub(crate) fn caption_buttons(window: &Window) -> impl IntoElement {
+    caption_group(window).pl(theme::s_8())
+}
+
+/// [`caption_buttons`] without the space before them (the title row makes that space a drag
+/// area).
+pub(super) fn caption_group(window: &Window) -> gpui::Div {
     let maximized = window.is_maximized();
+    let gap = theme::s_2();
     let button = |id: &'static str, icon: Icon, area: WindowControlArea, close: bool| {
         div()
             .id(id)
@@ -2480,20 +2601,25 @@ pub(crate) fn caption_buttons(window: &Window) -> impl IntoElement {
                 _ => t!("window.close"),
             })
             .group(id)
-            .size(theme::H_CTL)
+            .size(theme::h_ctl())
             .flex()
             .flex_none()
             .items_center()
             .justify_center()
-            .rounded(theme::R_8)
+            .rounded(theme::r_8())
             .window_control_area(area)
             .when(!close, |d| d.hover(|s| s.bg(theme::wash_strong())))
             .when(close, |d| d.hover(|s| s.bg(theme::danger())))
+            .child(crate::caption::edge_hit(area, close, gap))
             .child(
                 svg()
                     .path(icon.path())
-                    .size(theme::ICON)
-                    .text_color(theme::text_muted())
+                    .size(theme::icon())
+                    .text_color(if close && crate::caption::close_edge_hovered() {
+                        theme::on_signal()
+                    } else {
+                        theme::text_muted()
+                    })
                     .when(close, |d| {
                         d.group_hover(id, |s| s.text_color(theme::on_signal()))
                     }),
@@ -2503,8 +2629,7 @@ pub(crate) fn caption_buttons(window: &Window) -> impl IntoElement {
         .flex()
         .flex_none()
         .items_center()
-        .gap(theme::S_2)
-        .pl(theme::S_8)
+        .gap(gap)
         .child(button(
             "win-min",
             Icon::WinMin,
@@ -2545,7 +2670,9 @@ pub(crate) fn shown_name(entry: &Entry, show_ext: bool) -> SharedString {
 }
 
 /// Space between the rename box's edge and its text: its padding plus the 1 px border.
-const RENAME_INSET: Pixels = px(4. + 1.);
+fn rename_inset() -> gpui::Pixels {
+    crate::theme::scaled_px(4. + 1.)
+}
 
 /// Names of the entries in `range` (indexes past the end are skipped).
 fn names_in(entries: &[Entry], range: Range<usize>) -> Vec<Arc<str>> {
@@ -2554,17 +2681,23 @@ fn names_in(entries: &[Entry], range: Range<usize>) -> Vec<Arc<str>> {
         .collect()
 }
 
+/// Listener for a press on an item's name.
+type NamePress = Box<dyn Fn(&gpui::MouseDownEvent, &mut Window, &mut App)>;
+
 /// Name text, or the inline rename box with its problem message (if any) underneath.
 ///
 /// `in_row`: Details rows pull the box left by its inset, so the text stays exactly where the
 /// name was drawn instead of jumping right when renaming starts (grid tiles center the name, so
 /// they don't need it). In a tile the box spans the tile's width: tiles center their children,
 /// so without a width it would shrink to its border and hide the name (#38).
+///
+/// `on_press`: a press on the name itself (not the space after it), for click-to-rename (#89).
 fn name_cell(
     entry: &Entry,
     rename: Option<(Entity<TextInput>, Option<NameError>)>,
     show_ext: bool,
     in_row: bool,
+    on_press: Option<NamePress>,
 ) -> AnyElement {
     match rename {
         Some((input, problem)) => div()
@@ -2577,17 +2710,17 @@ fn name_cell(
             .relative()
             .map(|d| {
                 if in_row {
-                    d.flex_1().ml(-RENAME_INSET)
+                    d.flex_1().ml(-rename_inset())
                 } else {
                     d.w_full().flex_none()
                 }
             })
             .min_w_0()
-            .h(theme::S_24)
-            .px(RENAME_INSET - px(1.))
+            .h(theme::s_24())
+            .px(rename_inset() - px(1.))
             .flex()
             .items_center()
-            .rounded(theme::R_4)
+            .rounded(theme::r_4())
             .bg(theme::surface())
             .border_1()
             .border_color(if problem.is_some() {
@@ -2608,8 +2741,20 @@ fn name_cell(
         None => div()
             .flex_1()
             .min_w_0()
-            .truncate()
-            .child(shown_name(entry, show_ext))
+            .flex()
+            .child(
+                div()
+                    .debug_selector({
+                        let name = Arc::clone(&entry.name);
+                        move || format!("name:{name}")
+                    })
+                    .min_w_0()
+                    .truncate()
+                    .child(shown_name(entry, show_ext))
+                    .when_some(on_press, |d, press| {
+                        d.on_mouse_down(MouseButton::Left, press)
+                    }),
+            )
             .into_any_element(),
     }
 }
@@ -2621,22 +2766,22 @@ fn rename_balloon(problem: NameError) -> impl IntoElement {
     div().absolute().left_0().bottom_0().child(
         deferred(
             anchored()
-                .offset(gpui::point(px(0.), theme::S_4))
-                .snap_to_window_with_margin(theme::S_8)
+                .offset(gpui::point(px(0.), theme::s_4()))
+                .snap_to_window_with_margin(theme::s_8())
                 .child(
                     div()
                         .id("rename-problem")
                         .a11y_live(gpui::Role::Alert, problem.to_string())
                         .occlude()
-                        .max_w(RENAME_BALLOON_W)
-                        .px(theme::S_8)
-                        .py(theme::S_6)
-                        .rounded(theme::R_8)
+                        .max_w(rename_balloon_w())
+                        .px(theme::s_8())
+                        .py(theme::s_6())
+                        .rounded(theme::r_8())
                         .bg(theme::overlay())
                         .shadow(theme::elev_float())
                         .border_1()
                         .border_color(theme::danger())
-                        .text_size(theme::FS_12)
+                        .text_size(theme::fs_12())
                         .text_color(theme::text())
                         .whitespace_normal()
                         .child(problem.to_string()),
@@ -2698,7 +2843,7 @@ fn plain_visual(
         return img(image)
             .size(size)
             .flex_none()
-            .rounded(theme::R_4)
+            .rounded(theme::r_4())
             .object_fit(ObjectFit::Contain)
             .into_any_element();
     }
@@ -2718,7 +2863,7 @@ pub(crate) fn kind_icon(kind: FileKind, size: Pixels) -> AnyElement {
             .text_color(color)
     };
     let base = div().relative().size(size).flex_none();
-    let small = size <= SMALL_ICON;
+    let small = size <= small_icon();
     if kind == FileKind::Folder {
         let (back, front) = theme::folder_colors();
         if small {
@@ -2765,7 +2910,9 @@ pub(crate) fn kind_icon(kind: FileKind, size: Pixels) -> AnyElement {
 }
 
 /// Icons at or below this size count as small (list, Ctrl+T, menus)
-const SMALL_ICON: Pixels = px(20.);
+fn small_icon() -> gpui::Pixels {
+    crate::theme::scaled_px(20.)
+}
 /// Glyph scale for small icons
 const GLYPH_ZOOM: f32 = 1.25;
 
@@ -2804,8 +2951,8 @@ impl Explorer {
     /// Floating layers over the list: path bar menus, context menu, Quick Look.
     fn render_floating(&mut self, window: &mut Window, cx: &mut Context<Self>) -> Vec<AnyElement> {
         [
-            self.render_path_overlays(cx),
-            self.render_context_menu(window, cx),
+            self.render_path_overlays(window, cx),
+            self.render_context_menu(cx),
             self.render_quick_look(window, cx),
             self.render_confirm(cx),
         ]
@@ -2820,11 +2967,18 @@ impl Explorer {
     /// needed (preview, parent, folder sizes).
     fn before_render(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.on_frame(window, cx);
+        // Windows' type names arrive after the first sort: order by what the column shows.
+        if self.sort.uses(SortColumn::Type)
+            && self.type_order != Some(arke_core::format::type_names_version())
+        {
+            self.ensure_sorted(cx);
+        }
         self.track_notice_exit(cx);
         self.screen = (window.viewport_size(), window.scale_factor());
         let window_w = window.viewport_size().width;
         // A split tab's shared preview takes its room first; the panes share the rest.
-        self.paper_width = (window_w - theme::SIDEBAR_W - self.pane.reserve) * self.pane.share;
+        self.paper_width =
+            (window_w - theme::sidebar_width() - self.pane.reserve) * self.pane.share;
         self.bar_width = self.paper_width
             + if self.pane.trailing {
                 self.pane.reserve
@@ -2838,13 +2992,26 @@ impl Explorer {
             } else {
                 px(0.)
             };
-        self.cols = self.compute_columns();
+        // While a column divider is dragged, Name keeps its width: fitting it to the other
+        // columns live would move the dragged column's left edge, which the drag measures from.
+        // It fits again on release.
+        let held_name = (self.column_resized && cx.has_active_drag())
+            .then(|| self.cols.map(|c| c.name))
+            .flatten();
+        self.cols = self.compute_columns(held_name);
         self.header_x.set(None);
         // Preview pane edge released: save the width (app-wide).
         if self.preview_resized && !cx.has_active_drag() {
             let this = cx.entity().downgrade();
             cx.defer(move |cx| {
                 let _ = this.update(cx, Self::save_preview_width);
+            });
+        }
+        // Column view divider released: save the column widths (app-wide).
+        if self.view_column_resized.is_some() && !cx.has_active_drag() {
+            let this = cx.entity().downgrade();
+            cx.defer(move |cx| {
+                let _ = this.update(cx, Self::save_view_column_widths);
             });
         }
         self.poll_pending_create(cx);
@@ -2862,6 +3029,7 @@ impl Render for Explorer {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         crate::a11y::sync(window);
         self.before_render(window, cx);
+        let searching = self.search_box_state(window, cx) == layout::SearchBox::Typing;
         div()
             .id("explorer")
             .key_context("Explorer")
@@ -2870,8 +3038,72 @@ impl Render for Explorer {
             .flex_col()
             .text_color(theme::text())
             .ui_font()
-            .text_size(theme::FS_14)
-            .on_action(cx.listener(Self::go_back))
+            .text_size(theme::fs_14())
+            .map(|d| Self::root_actions(d, cx))
+            // Split view: clicking a side makes it active.
+            .on_any_mouse_down(cx.listener(|this, _: &MouseDownEvent, _, cx| {
+                if this.pane.split && !this.pane.active {
+                    cx.emit(ExplorerEvent::Activated);
+                }
+            }))
+            .map(|d| Self::mouse_navigation(d, cx))
+            .child(
+                // The paper: the single sheet holding the list
+                div()
+                    .relative()
+                    .flex()
+                    .flex_col()
+                    .flex_1()
+                    .min_h_0()
+                    .mr(self.paper_margin_right())
+                    .mb(theme::s_8())
+                    .rounded(theme::r_12())
+                    .bg(theme::paper())
+                    .shadow(theme::elev_2())
+                    .children(backdrop_layer())
+                    .child(self.render_pane_row(window, cx))
+                    .child(
+                        div()
+                            .flex()
+                            .flex_1()
+                            .min_h_0()
+                            .child(
+                                div()
+                                    .flex()
+                                    .flex_col()
+                                    .flex_1()
+                                    .min_w_0()
+                                    // Grid view has no columns, so no header. Also none while "this
+                                    // PC" has no results (off, no text, still building).
+                                    .when(
+                                        self.failed.is_none()
+                                            && (self.search_mode
+                                                || self.view_mode == ViewMode::Details)
+                                            && !(self.search_global
+                                                && self.search_results.is_none()),
+                                        |d| d.child(self.render_header(cx)),
+                                    )
+                                    .child(self.render_list_appearing(window, cx)),
+                            )
+                            .children(self.render_preview_appearing(cx)),
+                    )
+                    .children((self.pane.split && self.pane.active).then(active_outline))
+                    .children(searching.then(search_outline))
+                    .children(self.render_toast_stack(cx)),
+            )
+            .children(self.render_floating(window, cx))
+            .children(self.render_right_drag_listener(cx))
+    }
+}
+
+impl Explorer {
+    /// The pane's commands, reachable from anywhere in the pane and from its search box (which
+    /// is drawn in the title row, outside the pane).
+    pub(super) fn root_actions(
+        el: gpui::Stateful<gpui::Div>,
+        cx: &mut Context<Self>,
+    ) -> gpui::Stateful<gpui::Div> {
+        el.on_action(cx.listener(Self::go_back))
             .on_action(cx.listener(Self::go_forward))
             .on_action(cx.listener(Self::go_up))
             .on_action(cx.listener(Self::refresh))
@@ -2902,66 +3134,8 @@ impl Render for Explorer {
                     cx.propagate();
                 }
             }))
-            // Split view: clicking a side makes it active.
-            .on_any_mouse_down(cx.listener(|this, _: &MouseDownEvent, _, cx| {
-                if this.pane.split && !this.pane.active {
-                    cx.emit(ExplorerEvent::Activated);
-                }
-            }))
-            .map(|d| Self::mouse_navigation(d, cx))
-            .child(self.render_top_bar(window, cx))
-            .child(
-                // The paper: the single sheet holding the list
-                div()
-                    .relative()
-                    .flex()
-                    .flex_col()
-                    .flex_1()
-                    .min_h_0()
-                    .mr(self.paper_margin_right())
-                    .mb(theme::S_8)
-                    .rounded(theme::R_12)
-                    .bg(theme::paper())
-                    .shadow(if self.pane.split && self.pane.active {
-                        theme::elev_2_active()
-                    } else {
-                        theme::elev_2()
-                    })
-                    .children(backdrop_layer())
-                    .child(self.render_context_bar(window, cx))
-                    .child(
-                        div()
-                            .flex()
-                            .flex_1()
-                            .min_h_0()
-                            .child(
-                                div()
-                                    .flex()
-                                    .flex_col()
-                                    .flex_1()
-                                    .min_w_0()
-                                    // Grid view has no columns, so no header. Also none while "this
-                                    // PC" has no results (off, no text, still building).
-                                    .when(
-                                        self.failed.is_none()
-                                            && (self.search_mode
-                                                || self.view_mode == ViewMode::Details)
-                                            && !(self.search_global
-                                                && self.search_results.is_none()),
-                                        |d| d.child(self.render_header(cx)),
-                                    )
-                                    .child(self.render_list_appearing(window, cx)),
-                            )
-                            .children(self.render_preview_appearing(cx)),
-                    )
-                    .children(self.render_toast_stack(cx)),
-            )
-            .children(self.render_floating(window, cx))
-            .children(self.render_right_drag_listener(cx))
     }
-}
 
-impl Explorer {
     /// Tests: whether the preview pane fit at the last render, and its width.
     #[cfg(test)]
     pub(crate) fn fit_for_test(&self) -> (bool, f32) {
@@ -2972,9 +3146,9 @@ impl Explorer {
     /// shared preview too (the pane's box runs on under it).
     fn paper_margin_right(&self) -> Pixels {
         if self.pane.trailing {
-            theme::S_8 + self.pane.reserve
+            theme::s_8() + self.pane.reserve
         } else {
-            theme::S_8
+            theme::s_8()
         }
     }
 
@@ -3006,7 +3180,7 @@ impl Explorer {
 
     /// What [`layout::fit`] needs to know about this pane.
     pub(super) fn fit_input(&self, bar: Pixels, window: Pixels) -> layout::FitInput {
-        layout::FitInput {
+        let mut input = layout::FitInput {
             bar,
             window,
             details: self.view_mode == ViewMode::Details && !self.search_mode,
@@ -3016,8 +3190,9 @@ impl Explorer {
             // A split tab's preview pane is drawn once for the tab, not by each side.
             wants_preview: (self.preview_pane && !self.pane.split) || self.columns_active(),
             preview_user: crate::prefs::preview_width(),
-            parent_w: super::columns::PARENT_W,
-            location_w: theme::COL_LOCATION,
+            parent_w: Self::parent_column_width(),
+            current_w: crate::prefs::view_column_width(crate::prefs::ViewColumn::Current),
+            location_w: theme::col_location(),
             col_w: crate::prefs::Col::ALL.map(|col| {
                 // Search results always show modified and size.
                 let on = match col {
@@ -3029,7 +3204,10 @@ impl Explorer {
                 };
                 on.then(|| crate::prefs::width(col))
             }),
-        }
+        };
+        // The parent column's width is shared by all panes: never more than this one leaves it.
+        input.parent_w = input.parent_w.min(layout::parent_room(&input));
+        input
     }
 
     /// Preview pane slides in from the right when it is turned on (not when a tab showing it is
@@ -3044,6 +3222,15 @@ impl Explorer {
             self.preview_cue.wrap(
                 div()
                 .id("preview-pane")
+                .debug_selector(|| "preview-pane".to_owned())
+                // A click here leaves the search box (and the path being edited), as one on the
+                // list does; the preview itself takes no focus.
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(|this, _: &MouseDownEvent, window, cx| {
+                        this.cancel_path_edit(window, cx);
+                    }),
+                )
                 .a11y(gpui::Role::Region, t!("settings.preview"))
                 .when_some(
                     description,
@@ -3085,7 +3272,7 @@ impl Explorer {
                 frame
                     .items_center()
                     .justify_center()
-                    .text_size(theme::FS_12)
+                    .text_size(theme::fs_12())
                     .text_color(theme::text_subtle())
                     .child(t!("preview.in_last_column").to_string())
                     .into_any_element(),
@@ -3100,6 +3287,14 @@ impl Explorer {
             self.preview_cue.wrap(
                 div()
                 .id("shared-preview")
+                .debug_selector(|| "shared-preview".to_owned())
+                // A click here leaves the search box, as one in the single-pane preview does.
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(|this, _: &MouseDownEvent, window, cx| {
+                        this.cancel_path_edit(window, cx);
+                    }),
+                )
                 .a11y(gpui::Role::Region, t!("settings.preview"))
                 .when_some(
                     description,
@@ -3110,7 +3305,7 @@ impl Explorer {
                 .relative()
                 .size_full()
                 .flex()
-                .rounded(theme::R_12)
+                .rounded(theme::r_12())
                 .bg(theme::paper())
                 .shadow(theme::elev_2())
                 .children(contents)
@@ -3161,7 +3356,7 @@ fn backdrop_layer() -> Option<impl IntoElement> {
             .top_0()
             .left_0()
             .size_full()
-            .rounded(theme::R_12)
+            .rounded(theme::r_12())
             .overflow_hidden()
             .opacity(opacity)
             .child(
@@ -3181,7 +3376,7 @@ pub(super) fn date_cell(
     div()
         .w(width)
         .flex_none()
-        .text_size(theme::FS_12)
+        .text_size(theme::fs_12())
         .text_color(theme::text_muted())
         .child(time.map_or_default(|t| {
             if crate::prefs::full_dates() {
@@ -3215,7 +3410,12 @@ fn cloud_badge(
             .id(("cloud-badge", ix))
             .flex_none()
             .tooltip(tooltip(tip.into_owned()))
-            .child(svg().path(icon.path()).size(theme::ICON).text_color(color)),
+            .child(
+                svg()
+                    .path(icon.path())
+                    .size(theme::icon())
+                    .text_color(color),
+            ),
     )
 }
 

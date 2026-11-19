@@ -38,6 +38,9 @@ use crate::theme;
 
 /// Minimum time between list updates while matches stream in.
 const STREAM_EVERY: Duration = Duration::from_millis(80);
+/// Files of a network folder read at once by a content search: each waits on a round trip to
+/// the server, not on a disk here.
+const NET_READERS: usize = 8;
 
 /// The dropdown filters, in panel order.
 pub(crate) const FACETS: [Facet; 3] = [Facet::Type, Facet::Size, Facet::Date];
@@ -58,7 +61,8 @@ impl Drop for ContentFilter {
 }
 
 enum Found {
-    Match(Entry),
+    /// A matching file and its place among the files read.
+    Match(usize, Entry),
     Progress,
     Done,
 }
@@ -102,7 +106,11 @@ fn measure(geometry: &Rc<RefCell<PanelGeometry>>, what: Measured) -> impl IntoEl
         },
         |_, (), _, _| {},
     )
+    // Pinned to the corner: without insets an absolute child starts inside its parent's padding,
+    // which put a filter's menu and the press that closes it off its button.
     .absolute()
+    .top_0()
+    .left_0()
     .size_full()
 }
 
@@ -239,8 +247,9 @@ impl Explorer {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        // Ctrl+Z in the box takes the filter back out.
         self.filter_input.update(cx, |input, cx| {
-            input.set_text(text.clone(), cx);
+            input.replace_text(text.clone(), cx);
             let at = caret.unwrap_or(text.len());
             input.select_range(at..at, cx);
         });
@@ -348,11 +357,13 @@ impl Explorer {
         }
     }
 
-    /// Opens `facet`'s menu (or closes it when open) with the cursor on the current choice. The
-    /// panel takes keyboard focus so the arrows move in the menu.
+    /// Opens `facet`'s menu (or closes it when open) with the cursor on the current choice, shown
+    /// when opened with the keys (`keys`). The panel takes keyboard focus so the arrows move in the
+    /// menu.
     pub(crate) fn toggle_filter_menu(
         &mut self,
         facet: Facet,
+        keys: bool,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -360,6 +371,7 @@ impl Explorer {
             self.filter_menu = None;
         } else {
             self.filter_menu = Some(facet);
+            self.menu_keys = keys;
             self.menu_cursor = self
                 .menu_choices(facet)
                 .iter()
@@ -400,11 +412,11 @@ impl Explorer {
                 .id("filter-clear-all")
                 .a11y_button(t!("filter.clear_all"))
                 .when(at, gpui::StatefulInteractiveElement::aria_active_descendant)
-                .h(theme::S_24)
-                .px(theme::S_8)
+                .h(theme::s_24())
+                .px(theme::s_8())
                 .flex()
                 .items_center()
-                .rounded(theme::R_4)
+                .rounded(theme::r_4())
                 .border_1()
                 .border_color(if at {
                     theme::signal_line()
@@ -412,7 +424,7 @@ impl Explorer {
                     theme::clear()
                 })
                 .cursor_pointer()
-                .text_size(theme::FS_12)
+                .text_size(theme::fs_12())
                 .text_color(theme::text_muted())
                 .hover(|s| s.bg(theme::wash_strong()).text_color(theme::text()))
                 .child(t!("filter.clear_all").into_owned())
@@ -428,7 +440,7 @@ impl Explorer {
         div()
             .flex()
             .flex_col()
-            .gap(theme::S_8)
+            .gap(theme::s_8())
             .child(super::scope::panel_heading(t!("filter.section"), clear))
             .child(
                 div()
@@ -436,7 +448,7 @@ impl Explorer {
                     .a11y(gpui::Role::Group, t!("filter.section"))
                     .flex()
                     .flex_wrap()
-                    .gap(theme::S_8)
+                    .gap(theme::s_8())
                     .children(buttons),
             )
             .child(self.contents_row(cursor == Some(PanelItem::Contents), cx))
@@ -461,17 +473,17 @@ impl Explorer {
                     Facet::Date | Facet::Content => "filter-date-clear",
                 })
                 .a11y_button(label)
-                .size(theme::S_24)
+                .size(theme::s_24())
                 .flex()
                 .flex_none()
                 .items_center()
                 .justify_center()
-                .rounded(theme::R_4)
+                .rounded(theme::r_4())
                 .hover(|s| s.bg(theme::wash_strong()))
                 .child(
                     svg()
                         .path(Icon::Close.path())
-                        .size(theme::ICON_SM)
+                        .size(theme::icon_sm())
                         .text_color(theme::text_muted()),
                 )
                 .tooltip(crate::workspace::tooltip(t!("filter.remove")))
@@ -490,16 +502,16 @@ impl Explorer {
             )
             .relative()
             .flex_none()
-            .h(theme::H_CTL_MD)
-            .pl(theme::S_12)
-            .pr(if set { theme::S_2 } else { theme::S_8 })
+            .h(theme::h_ctl_md())
+            .pl(theme::s_12())
+            .pr(if set { theme::s_2() } else { theme::s_8() })
             .flex()
             .items_center()
-            .gap(theme::S_6)
-            .rounded(theme::R_8)
+            .gap(theme::s_6())
+            .rounded(theme::r_8())
             .border_1()
             .cursor_pointer()
-            .text_size(theme::FS_12)
+            .text_size(theme::fs_12())
             .text_color(theme::text())
             .whitespace_nowrap()
             .border_color(if at {
@@ -527,7 +539,7 @@ impl Explorer {
                 d.child(
                     div()
                         .min_w_0()
-                        .max_w(theme::FILTER_VALUE_MAX_W)
+                        .max_w(theme::filter_value_max_w())
                         .truncate()
                         .font_weight(theme::FW_STRONG)
                         .child(v),
@@ -535,8 +547,8 @@ impl Explorer {
             })
             .when(!set, |d| d.child(chevron()))
             .children(remove)
-            .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
-                this.toggle_filter_menu(facet, window, cx);
+            .on_click(cx.listener(move |this, e: &ClickEvent, window, cx| {
+                this.toggle_filter_menu(facet, e.is_keyboard(), window, cx);
             }))
             .into_any_element()
     }
@@ -563,15 +575,15 @@ impl Explorer {
                 gpui::StatefulInteractiveElement::aria_active_descendant,
             )
             .flex_none()
-            .h(theme::H_CTL_MD)
-            .pl(theme::S_8)
-            .pr(theme::S_16)
+            .h(theme::h_ctl_md())
+            .pl(theme::s_8())
+            .pr(theme::s_16())
             .flex()
             .items_center()
-            .gap(theme::S_8)
-            .rounded(theme::R_4)
+            .gap(theme::s_8())
+            .rounded(theme::r_4())
             .cursor_pointer()
-            .text_size(theme::FS_13)
+            .text_size(theme::fs_13())
             .text_color(theme::text())
             .whitespace_nowrap()
             .hover(|s| s.bg(theme::wash()))
@@ -580,7 +592,7 @@ impl Explorer {
                 svg()
                     .path(Icon::Check.path())
                     .flex_none()
-                    .size(theme::ICON)
+                    .size(theme::icon())
                     .text_color(if choice.selected {
                         theme::signal()
                     } else {
@@ -611,10 +623,10 @@ impl Explorer {
             let (panel, button) = (g.panel?, g.buttons[facet_slot(facet)]?);
             // Under the button, but not past the panel's right edge (the window edge may be
             // right there).
-            let room = (panel.size.width - theme::FILTER_MENU_W).max(gpui::px(0.));
+            let room = (panel.size.width - theme::filter_menu_w()).max(gpui::px(0.));
             (
                 (button.left() - panel.left()).min(room),
-                button.bottom() - panel.top() + theme::S_4,
+                button.bottom() - panel.top() + theme::s_4(),
             )
         };
         let choices = self.menu_choices(facet);
@@ -628,7 +640,7 @@ impl Explorer {
                 count,
                 choice,
                 keyboard && at,
-                at,
+                self.menu_keys && at,
                 cx,
             ));
             // "Any …" stands apart from the choices.
@@ -637,8 +649,8 @@ impl Explorer {
                     div()
                         .flex_none()
                         .h(px(1.))
-                        .my(theme::S_2)
-                        .mx(theme::S_8)
+                        .my(theme::s_2())
+                        .mx(theme::s_8())
                         .bg(theme::line())
                         .into_any_element(),
                 );
@@ -658,12 +670,25 @@ impl Explorer {
                         .on_mouse_down(MouseButton::Left, |_: &MouseDownEvent, _, cx| {
                             cx.stop_propagation();
                         })
-                        .min_w(theme::FILTER_MENU_W)
-                        .p(theme::S_4)
+                        // A press anywhere else closes it, like any menu. Its own button is left
+                        // to the button's click, which closes it (closing here would reopen it).
+                        .on_mouse_down_out({
+                            let geometry = Rc::clone(&self.panel_geometry);
+                            cx.listener(move |this, e: &MouseDownEvent, _, cx| {
+                                let on_button = geometry.borrow().buttons[facet_slot(facet)]
+                                    .is_some_and(|b| b.contains(&e.position));
+                                if !on_button && this.filter_menu == Some(facet) {
+                                    this.filter_menu = None;
+                                    cx.notify();
+                                }
+                            })
+                        })
+                        .min_w(theme::filter_menu_w())
+                        .p(theme::s_4())
                         .flex()
                         .flex_col()
-                        .gap(theme::S_2)
-                        .rounded(theme::R_8)
+                        .gap(theme::s_2())
+                        .rounded(theme::r_8())
                         .border_1()
                         .border_color(theme::line())
                         .bg(theme::overlay())
@@ -695,13 +720,15 @@ impl Explorer {
             .aria_description(detail.clone())
             .a11y_disabled(!usable)
             .when(at, gpui::StatefulInteractiveElement::aria_active_descendant)
-            .min_h(theme::H_CTL)
-            .px(theme::S_8)
-            .py(theme::S_4)
+            .min_h(theme::h_ctl())
+            // The text lines up with the rest of the panel; hover and focus reach past it.
+            .mx(-theme::s_8())
+            .px(theme::s_8())
+            .py(theme::s_4())
             .flex()
             .items_center()
-            .gap(theme::S_12)
-            .rounded(theme::R_8)
+            .gap(theme::s_12())
+            .rounded(theme::r_8())
             .border_1()
             .border_color(if at {
                 theme::signal_line()
@@ -711,11 +738,6 @@ impl Explorer {
             .when(usable, |d| {
                 d.cursor_pointer().hover(|s| s.bg(theme::wash()))
             })
-            .child(contents_icon(if on {
-                theme::signal()
-            } else {
-                theme::text_muted()
-            }))
             .child(
                 div()
                     .flex_1()
@@ -724,7 +746,7 @@ impl Explorer {
                     .flex_col()
                     .child(
                         div()
-                            .text_size(theme::FS_13)
+                            .text_size(theme::fs_13())
                             .text_color(if usable {
                                 theme::text()
                             } else {
@@ -734,7 +756,7 @@ impl Explorer {
                     )
                     .child(
                         div()
-                            .text_size(theme::FS_12)
+                            .text_size(theme::fs_12())
                             .text_color(theme::text_subtle())
                             .child(detail),
                     ),
@@ -825,24 +847,13 @@ impl Explorer {
                 .collect();
             total.store(candidates.len(), Ordering::Relaxed);
             let _ = tx.send(Found::Progress);
-            let mut last = Instant::now();
-            for entry in candidates {
-                if cancel.load(Ordering::Relaxed) {
-                    return;
-                }
-                let hit = matcher.find_in(&*fs, &dir.join(&*entry.name), &cancel);
-                read.fetch_add(1, Ordering::Relaxed);
-                if hit.is_some() {
-                    let _ = tx.send(Found::Match(entry));
-                } else if last.elapsed() >= STREAM_EVERY {
-                    let _ = tx.send(Found::Progress);
-                    last = Instant::now();
-                }
+            read_candidates(&*fs, &matcher, &dir, &candidates, &cancel, &read, &tx);
+            if !cancel.load(Ordering::Relaxed) {
+                let _ = tx.send(Found::Done);
             }
-            let _ = tx.send(Found::Done);
         });
         self.filter_task = Some(cx.spawn(async move |this, cx| {
-            let mut found: Vec<Entry> = Vec::new();
+            let mut found: Vec<(usize, Entry)> = Vec::new();
             loop {
                 let mut done = rx
                     .recv_async()
@@ -852,7 +863,7 @@ impl Explorer {
                 while !done && let Ok(msg) = rx.try_recv() {
                     done = take(msg, &mut found);
                 }
-                let entries = Arc::new(found.clone());
+                let entries = Arc::new(found.iter().map(|(_, e)| e.clone()).collect());
                 let current = this
                     .update(cx, |this, cx| {
                         if this.filter_inflight.as_ref() != Some(&key) {
@@ -880,11 +891,57 @@ impl Explorer {
     }
 }
 
-/// Adds a match; true once the reader is done.
-fn take(msg: Found, found: &mut Vec<Entry>) -> bool {
+/// Reads `candidates` (files in `dir`) for `matcher`, sending matches and progress to `tx`. On a
+/// file server each file waits on a round trip: several are read at once. Matches carry their
+/// place in the folder, so the list keeps the folder's order.
+fn read_candidates(
+    fs: &dyn arke_core::Fs,
+    matcher: &ContentMatcher,
+    dir: &std::path::Path,
+    candidates: &[Entry],
+    cancel: &AtomicBool,
+    read: &AtomicUsize,
+    tx: &flume::Sender<Found>,
+) {
+    let readers = if arke_core::fs::is_network_path(dir) {
+        NET_READERS
+    } else {
+        1
+    };
+    let next = AtomicUsize::new(0);
+    std::thread::scope(|scope| {
+        for _ in 0..readers.min(candidates.len()) {
+            let next = &next;
+            scope.spawn(move || {
+                let mut last = Instant::now();
+                loop {
+                    let at = next.fetch_add(1, Ordering::Relaxed);
+                    let Some(entry) = candidates.get(at) else {
+                        return;
+                    };
+                    if cancel.load(Ordering::Relaxed) {
+                        return;
+                    }
+                    let hit = matcher.find_in(fs, &dir.join(&*entry.name), cancel);
+                    read.fetch_add(1, Ordering::Relaxed);
+                    if hit.is_some() {
+                        let _ = tx.send(Found::Match(at, entry.clone()));
+                    } else if last.elapsed() >= STREAM_EVERY {
+                        let _ = tx.send(Found::Progress);
+                        last = Instant::now();
+                    }
+                }
+            });
+        }
+    });
+}
+
+/// Adds a match in its place in the folder; true once the readers are done.
+fn take(msg: Found, found: &mut Vec<(usize, Entry)>) -> bool {
     match msg {
-        Found::Match(entry) => {
-            found.push(entry);
+        Found::Match(at, entry) => {
+            let place = found.partition_point(|(i, _)| *i < at);
+            found.insert(place, (at, entry));
             false
         }
         Found::Progress => false,
@@ -906,31 +963,12 @@ const fn type_term(t: TypeFilter) -> &'static str {
     }
 }
 
-/// A page with lines of text: the outline and the lines drawn on top of each other.
-fn contents_icon(color: gpui::Rgba) -> impl IntoElement {
-    let layer = |icon: Icon| {
-        svg()
-            .absolute()
-            .top_0()
-            .left_0()
-            .path(icon.path())
-            .size(theme::ICON)
-            .text_color(color)
-    };
-    div()
-        .relative()
-        .flex_none()
-        .size(theme::ICON)
-        .child(layer(Icon::PageLine))
-        .child(layer(Icon::FtText))
-}
-
 /// Down chevron of a closed dropdown.
 fn chevron() -> impl IntoElement {
     svg()
         .path(Icon::ChevronRight.path())
         .flex_none()
-        .size(theme::ICON_SM)
+        .size(theme::icon_sm())
         .text_color(theme::text_muted())
         .with_transformation(gpui::Transformation::rotate(gpui::radians(
             std::f32::consts::FRAC_PI_2,
@@ -941,11 +979,11 @@ fn chevron() -> impl IntoElement {
 fn switch_look(on: bool, usable: bool) -> impl IntoElement {
     div()
         .flex_none()
-        .w(px(40.))
-        .h(px(20.))
+        .w(crate::theme::scaled_px(40.))
+        .h(crate::theme::scaled_px(20.))
         .flex()
         .items_center()
-        .px(px(3.))
+        .px(crate::theme::scaled_px(3.))
         .rounded(theme::R_FULL)
         .border_1()
         .border_color(if on {
@@ -958,10 +996,10 @@ fn switch_look(on: bool, usable: bool) -> impl IntoElement {
         } else {
             theme::wash_strong()
         })
-        .when(!usable, |d| d.opacity(0.6))
+        .when(!usable, |d| d.opacity(0.4))
         .child(
             div()
-                .size(px(14.))
+                .size(crate::theme::scaled_px(14.))
                 .rounded(theme::R_FULL)
                 .ml(px(if on { 18. } else { 0. }))
                 .bg(if on {
@@ -970,6 +1008,18 @@ fn switch_look(on: bool, usable: bool) -> impl IntoElement {
                     theme::text_muted()
                 }),
         )
+}
+
+#[cfg(test)]
+impl Explorer {
+    /// The search panel's bounds and `facet`'s button, as last drawn.
+    pub(crate) fn panel_geometry_for_test(
+        &self,
+        facet: Facet,
+    ) -> (Option<Bounds<Pixels>>, Option<Bounds<Pixels>>) {
+        let g = self.panel_geometry.borrow();
+        (g.panel, g.buttons[facet_slot(facet)])
+    }
 }
 
 #[cfg(test)]

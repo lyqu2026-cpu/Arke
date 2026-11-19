@@ -2,14 +2,15 @@
 //! just finished, opening a list. State lives in `op_center.rs` (global, shared by all tabs); this
 //! only draws.
 
+use std::cell::Cell;
 use std::rc::Rc;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
+use std::time::Duration;
 
 use gpui::{
-    AnimationExt, AnyElement, Bounds, ClickEvent, Context, Hsla, MouseButton, MouseDownEvent,
-    PathBuilder, Pixels, Point, Window, anchored, canvas, deferred, div, point, prelude::*, px,
-    svg,
+    AnimationExt, AnyElement, ClickEvent, Context, MouseButton, MouseDownEvent, SharedString,
+    Transformation, Window, anchored, deferred, div, point, prelude::*, px, radians, svg,
 };
 use rust_i18n::t;
 
@@ -21,12 +22,68 @@ use crate::shell::OpProgress;
 use crate::theme;
 use crate::workspace::TooltipBelowExt as _;
 
-const PANEL_W: Pixels = px(380.);
-const PANEL_MAX_H: Pixels = px(440.);
+fn panel_w() -> gpui::Pixels {
+    crate::theme::scaled_px(300.)
+}
+fn panel_max_h() -> gpui::Pixels {
+    crate::theme::scaled_px(440.)
+}
 /// Length of the spinning arc while the total is unknown (in turns)
 const SPINNER_SWEEP: f32 = 0.25;
 /// Time for one full turn (ms)
 const SPINNER_PERIOD_MS: u128 = 1200;
+/// Time between ring frames while it moves: about 30 fps. Each frame redraws the whole window, so
+/// the ring doesn't follow the display's refresh rate.
+const RING_FRAME: Duration = Duration::from_millis(33);
+/// Share of the gap to the real progress the ring covers each frame
+const RING_EASE: f32 = 0.35;
+
+/// Progress ring state of one Explorer: where the ring is drawn now, and whether its next frame is
+/// already scheduled.
+#[derive(Default)]
+pub(crate) struct RingState {
+    shown: Cell<f32>,
+    frame_pending: Cell<bool>,
+}
+
+impl RingState {
+    /// Where to draw the ring for `fraction` (`None`: total unknown, spinning): start and length
+    /// in turns, and whether it is still moving (so it needs another frame).
+    fn step(&self, fraction: Option<f32>, motion: bool, now_ms: u128) -> (f32, f32, bool) {
+        if let Some(fraction) = fraction {
+            // Draw a small arc even at the start so it visibly moves.
+            let target = fraction.clamp(0.04, 1.);
+            let current = self.shown.get();
+            // A new job (progress dropped) jumps straight there; otherwise ease toward it.
+            let next = if current <= 0. || target < current || !motion {
+                target
+            } else {
+                current + (target - current) * RING_EASE
+            };
+            let moving = (target - next).abs() > 0.002;
+            self.shown.set(if moving { next } else { target });
+            (0., self.shown.get(), moving)
+        } else {
+            self.shown.set(0.);
+            let turn = (now_ms % SPINNER_PERIOD_MS) as f32 / SPINNER_PERIOD_MS as f32;
+            (turn, SPINNER_SWEEP, motion)
+        }
+    }
+
+    /// Redraws the Explorer after [`RING_FRAME`], once however often it is asked.
+    fn schedule_frame(self: &Rc<Self>, cx: &mut Context<Explorer>) {
+        if self.frame_pending.replace(true) {
+            return;
+        }
+        let ring = Rc::clone(self);
+        cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(RING_FRAME).await;
+            ring.frame_pending.set(false);
+            this.update(cx, |_, cx| cx.notify()).ok();
+        })
+        .detach();
+    }
+}
 
 /// One list row, copied out of the global state so events can be attached while drawing.
 struct Row {
@@ -49,6 +106,19 @@ struct Row {
 }
 
 impl Explorer {
+    /// The ring's start and length for this frame (`overall`: progress, `None` while unknown),
+    /// scheduling the next frame while it moves.
+    fn ring_frame(&self, overall: Option<f32>, cx: &mut Context<Self>) -> (f32, f32) {
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_millis());
+        let (start, sweep, moving) = self.ring.step(overall, crate::motion::enabled(), now_ms);
+        if moving {
+            self.ring.schedule_frame(cx);
+        }
+        (start, sweep)
+    }
+
     /// Top bar button plus its open list; takes no space when there are no jobs.
     pub(super) fn render_op_center(
         &self,
@@ -110,8 +180,8 @@ impl Explorer {
             .rev()
             .filter(|job| job.running())
             .find_map(crate::op_center::Job::speed_text);
-        let ring_shown = Rc::clone(&self.ring_shown);
-        let button = button(busy, overall, unseen, open, tip, speed, ring_shown, cx);
+        let ring = busy.then(|| self.ring_frame(overall, cx));
+        let button = button(ring, unseen, open, tip, speed, cx);
         if !open {
             return Some(button.into_any_element());
         }
@@ -138,7 +208,7 @@ impl Explorer {
         let flyout = deferred(
             anchored()
                 .anchor(gpui::Anchor::TopRight)
-                .snap_to_window_with_margin(theme::S_8)
+                .snap_to_window_with_margin(theme::s_8())
                 .child(panel),
         )
         .with_priority(2);
@@ -151,7 +221,7 @@ impl Explorer {
                 .child(
                     div()
                         .absolute()
-                        .top(theme::H_CTL + theme::S_4)
+                        .top(theme::h_ctl() + theme::s_4())
                         .right_0()
                         .child(flyout),
                 )
@@ -160,51 +230,46 @@ impl Explorer {
     }
 }
 
-/// Top bar button: a ring while running, a check when done, and a dot if something finished while
-/// the list was closed.
-#[allow(
-    clippy::too_many_arguments,
-    reason = "the button shows each part of the progress state"
-)]
+/// Top bar button: a ring while running (`ring`: its start and length in turns), a check when
+/// done, and a dot if something finished while the list was closed.
 fn button(
-    busy: bool,
-    overall: Option<f32>,
+    ring: Option<(f32, f32)>,
     unseen: Option<bool>,
     open: bool,
     tip: String,
     speed: Option<String>,
-    ring_shown: std::rc::Rc<std::cell::Cell<f32>>,
     cx: &mut Context<Explorer>,
 ) -> gpui::Stateful<gpui::Div> {
+    let busy = ring.is_some();
     div()
         .id("op-center")
         .a11y_button(tip.clone())
         .aria_expanded(open)
         .relative()
-        .h(theme::H_CTL)
-        .min_w(theme::H_CTL)
-        .px(if speed.is_some() { theme::S_8 } else { px(0.) })
-        .gap(theme::S_6)
+        .h(theme::h_ctl())
+        .min_w(theme::h_ctl())
+        .px(if speed.is_some() { theme::s_8() } else { px(0.) })
+        .gap(theme::s_6())
         .flex()
         .flex_none()
         .items_center()
         .justify_center()
-        .rounded(theme::R_8)
+        .rounded(theme::r_8())
         .cursor_pointer()
         .when(open, |d| d.bg(theme::wash_strong()))
         .hover(|s| s.bg(theme::wash_strong()))
         .children(speed.filter(|_| busy).map(|speed| {
             div()
-                .text_size(theme::FS_12)
+                .text_size(theme::fs_12())
                 .text_color(theme::text_muted())
                 .child(speed)
         }))
-        .child(if busy {
-            ring(overall, ring_shown).into_any_element()
+        .child(if let Some((start, sweep)) = ring {
+            self::ring(start, sweep).into_any_element()
         } else {
             svg()
-                .path(Icon::Check.path())
-                .size(theme::ICON)
+                .path(Icon::History.path())
+                .size(theme::icon())
                 .text_color(theme::text_muted())
                 .into_any_element()
         })
@@ -212,9 +277,9 @@ fn button(
         .children(unseen.filter(|_| !open).map(|failed| {
             div()
                 .absolute()
-                .top(theme::S_4)
-                .right(theme::S_4)
-                .size(theme::S_6)
+                .top(theme::s_4())
+                .right(theme::s_4())
+                .size(theme::s_6())
                 .rounded(theme::R_FULL)
                 .bg(if failed {
                     theme::danger()
@@ -244,24 +309,24 @@ fn panel(rows: Vec<Row>, cx: &mut Context<Explorer>) -> impl IntoElement + use<>
         .id("op-center-panel")
         .a11y(gpui::Role::List, t!("ops.center_title"))
         .occlude()
-        .w(PANEL_W)
-        .max_h(PANEL_MAX_H)
+        .w(panel_w())
+        .max_h(panel_max_h())
         .overflow_y_scroll()
-        .p(theme::S_8)
+        .p(theme::s_8())
         .flex()
         .flex_col()
-        .gap(theme::S_2)
-        .rounded(theme::R_12)
+        .gap(theme::s_2())
+        .rounded(theme::r_12())
         .bg(theme::overlay())
         .shadow(theme::elev_3())
-        .text_size(theme::FS_14)
+        .text_size(theme::fs_14())
         .text_color(theme::text())
         .child(
             div()
                 .flex()
                 .items_center()
-                .px(theme::S_8)
-                .h(theme::H_CTL)
+                .px(theme::s_8())
+                .h(theme::h_ctl())
                 .child(
                     div()
                         .flex_1()
@@ -274,10 +339,10 @@ fn panel(rows: Vec<Row>, cx: &mut Context<Explorer>) -> impl IntoElement + use<>
                         div()
                             .id("op-center-clear")
                             .a11y_button(t!("ops.center_clear"))
-                            .px(theme::S_6)
-                            .rounded(theme::R_4)
+                            .px(theme::s_6())
+                            .rounded(theme::r_4())
                             .cursor_pointer()
-                            .text_size(theme::FS_12)
+                            .text_size(theme::fs_12())
                             .text_color(theme::text_muted())
                             .hover(|s| s.bg(theme::wash_strong()).text_color(theme::text()))
                             .child(t!("ops.center_clear").into_owned())
@@ -315,7 +380,7 @@ fn job_row(row: Row, cx: &mut Context<Explorer>) -> AnyElement {
         JobState::Done { .. } => Some(
             svg()
                 .path(Icon::Check.path())
-                .size(theme::ICON)
+                .size(theme::icon())
                 .flex_none()
                 .text_color(theme::text_subtle())
                 .into_any_element(),
@@ -327,22 +392,22 @@ fn job_row(row: Row, cx: &mut Context<Explorer>) -> AnyElement {
         .a11y_lazy(gpui::Role::ListItem, || {
             crate::a11y::item_label(&row.title, &[&row.detail])
         })
-        .px(theme::S_8)
-        .py(theme::S_8)
+        .px(theme::s_8())
+        .py(theme::s_8())
         .flex()
         .flex_col()
-        .gap(theme::S_4)
-        .rounded(theme::R_8)
+        .gap(theme::s_4())
+        .rounded(theme::r_8())
         .hover(|s| s.bg(theme::wash()))
         .child(
             div()
                 .flex()
                 .items_center()
-                .gap(theme::S_8)
+                .gap(theme::s_8())
                 .child(
                     svg()
                         .path(row.icon.path())
-                        .size(theme::ICON)
+                        .size(theme::icon())
                         .flex_none()
                         .text_color(if failed {
                             theme::danger()
@@ -355,8 +420,8 @@ fn job_row(row: Row, cx: &mut Context<Explorer>) -> AnyElement {
         )
         .child(
             div()
-                .pl(theme::ICON + theme::S_8)
-                .text_size(theme::FS_12)
+                .pl(theme::icon() + theme::s_8())
+                .text_size(theme::fs_12())
                 .line_clamp(3)
                 .text_color(if failed {
                     theme::danger()
@@ -367,11 +432,14 @@ fn job_row(row: Row, cx: &mut Context<Explorer>) -> AnyElement {
         )
         .when(running, |d| {
             d.child(
-                div().pl(theme::ICON + theme::S_8).pt(theme::S_2).child(
-                    div()
+                div()
+                    .pl(theme::icon() + theme::s_8())
+                    .pt(theme::s_2())
+                    .child(
+                        div()
                         .id("op-center-progress")
                         .a11y_progress(row.fraction)
-                        .h(theme::S_4)
+                        .h(theme::s_4())
                         .w_full()
                         .rounded(theme::R_FULL)
                         .bg(theme::line())
@@ -386,7 +454,7 @@ fn job_row(row: Row, cx: &mut Context<Explorer>) -> AnyElement {
                                     .w(gpui::relative(row.fraction.unwrap_or(0.3))),
                             )
                         }),
-                ),
+                    ),
             )
         })
         .into_any_element()
@@ -399,10 +467,10 @@ fn cancel_button(row: &Row, cx: &mut Context<Explorer>) -> AnyElement {
         .id(("op-center-cancel", usize::try_from(row.id).unwrap_or(0)))
         .a11y_button(t!("toast.cancel"))
         .flex_none()
-        .px(theme::S_6)
-        .rounded(theme::R_4)
+        .px(theme::s_6())
+        .rounded(theme::r_4())
         .cursor_pointer()
-        .text_size(theme::FS_12)
+        .text_size(theme::fs_12())
         .text_color(theme::text_muted())
         .hover(|s| s.bg(theme::wash_strong()).text_color(theme::text()))
         .child(t!("toast.cancel").into_owned())
@@ -421,10 +489,10 @@ fn retry_button(row: u64, cx: &mut Context<Explorer>) -> AnyElement {
         .id(("op-center-retry", usize::try_from(row).unwrap_or(0)))
         .a11y_button(t!("toast.retry"))
         .flex_none()
-        .px(theme::S_6)
-        .rounded(theme::R_4)
+        .px(theme::s_6())
+        .rounded(theme::r_4())
         .cursor_pointer()
-        .text_size(theme::FS_12)
+        .text_size(theme::fs_12())
         .text_color(theme::text_muted())
         .hover(|s| s.bg(theme::wash_strong()).text_color(theme::text()))
         .child(t!("toast.retry").into_owned())
@@ -442,10 +510,10 @@ fn undo_button(row: u64, undo: u64, cx: &mut Context<Explorer>) -> AnyElement {
         .id(("op-center-undo", usize::try_from(row).unwrap_or(0)))
         .a11y_button(t!("toast.undo"))
         .flex_none()
-        .px(theme::S_6)
-        .rounded(theme::R_4)
+        .px(theme::s_6())
+        .rounded(theme::r_4())
         .cursor_pointer()
-        .text_size(theme::FS_12)
+        .text_size(theme::fs_12())
         .text_color(theme::text_muted())
         .hover(|s| s.bg(theme::wash_strong()).text_color(theme::text()))
         .child(t!("toast.undo").into_owned())
@@ -461,10 +529,10 @@ fn redo_button(row: u64, redo: u64, cx: &mut Context<Explorer>) -> AnyElement {
         .id(("op-center-redo", usize::try_from(row).unwrap_or(0)))
         .a11y_button(t!("toast.redo"))
         .flex_none()
-        .px(theme::S_6)
-        .rounded(theme::R_4)
+        .px(theme::s_6())
+        .rounded(theme::r_4())
         .cursor_pointer()
-        .text_size(theme::FS_12)
+        .text_size(theme::fs_12())
         .text_color(theme::text_muted())
         .hover(|s| s.bg(theme::wash_strong()).text_color(theme::text()))
         .child(t!("toast.redo").into_owned())
@@ -481,10 +549,10 @@ fn pause_button(paused: bool, cx: &mut Context<Explorer>) -> AnyElement {
         .id("op-center-pause")
         .a11y_toggle(t!("ops.queue_pause"), paused)
         .aria_description(t!("ops.queue_pause_tip").into_owned())
-        .px(theme::S_6)
-        .rounded(theme::R_4)
+        .px(theme::s_6())
+        .rounded(theme::r_4())
         .cursor_pointer()
-        .text_size(theme::FS_12)
+        .text_size(theme::fs_12())
         .text_color(if paused {
             theme::text()
         } else {
@@ -505,75 +573,66 @@ fn pause_button(paused: bool, cx: &mut Context<Explorer>) -> AnyElement {
 }
 
 /// Ring: a thin track with the done portion on top, or a short spinning arc while the total is
-/// unknown. Progress updates every 200 ms; the ring eases toward the target each frame so it
-/// doesn't step.
-fn ring(fraction: Option<f32>, shown: std::rc::Rc<std::cell::Cell<f32>>) -> impl IntoElement {
-    canvas(
-        |bounds, _, _| bounds,
-        move |_, bounds: Bounds<Pixels>, window, _| {
-            let center = bounds.center();
-            let radius = bounds.size.width.min(bounds.size.height) / 2. - px(1.);
-            let track: Hsla = theme::line_strong().into();
-            let fill: Hsla = theme::signal().into();
-            if let Some(path) = arc(center, radius, 0., 1.) {
-                window.paint_path(path, track);
-            }
-            let (start, sweep) = if let Some(fraction) = fraction {
-                // Draw a small arc even at the start so it visibly moves.
-                let target = fraction.clamp(0.04, 1.);
-                let current = shown.get();
-                // A new job (progress dropped) jumps straight there; otherwise cover 20% of the gap
-                // each frame.
-                let next = if current <= 0. || target < current || !crate::motion::enabled() {
-                    target
-                } else {
-                    current + (target - current) * 0.2
-                };
-                shown.set(next);
-                if (target - next).abs() > 0.002 {
-                    window.request_animation_frame();
-                }
-                (0., next)
-            } else {
-                shown.set(0.);
-                if crate::motion::enabled() {
-                    window.request_animation_frame();
-                }
-                let ms = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .map_or(0, |d| d.as_millis());
-                let turn = (ms % SPINNER_PERIOD_MS) as f32 / SPINNER_PERIOD_MS as f32;
-                (turn, SPINNER_SWEEP)
-            };
-            if let Some(path) = arc(center, radius, start, sweep) {
-                window.paint_path(path, fill);
-            }
-        },
-    )
-    .size(theme::ICON)
+/// unknown. Both are SVG layers (see `assets::ring_arc`), drawn as sprites: vector paths would
+/// need a window-sized multisampled texture each frame.
+fn ring(start: f32, sweep: f32) -> impl IntoElement {
+    let layer = |path: SharedString| {
+        svg()
+            .absolute()
+            .top_0()
+            .left_0()
+            .size(theme::icon())
+            .path(path)
+    };
+    div()
+        .relative()
+        .flex_none()
+        .size(theme::icon())
+        .child(layer(crate::assets::RING_TRACK.into()).text_color(theme::line_strong()))
+        .child(
+            layer(crate::assets::ring_arc(sweep).into())
+                .text_color(theme::signal())
+                .with_transformation(Transformation::rotate(radians(
+                    start * std::f32::consts::TAU,
+                ))),
+        )
 }
 
-/// Arc from turn `start` with length `sweep`, clockwise from 12 o'clock, built from short segments.
-fn arc(
-    center: Point<Pixels>,
-    radius: Pixels,
-    start: f32,
-    sweep: f32,
-) -> Option<gpui::Path<Pixels>> {
-    let steps = ((sweep * 48.).ceil() as usize).max(2);
-    let mut builder = PathBuilder::stroke(px(2.));
-    for step in 0..=steps {
-        let turn = start + sweep * step as f32 / steps as f32;
-        let angle = turn * std::f32::consts::TAU - std::f32::consts::FRAC_PI_2;
-        let at = point(
-            center.x + radius * angle.cos(),
-            center.y + radius * angle.sin(),
-        );
-        if step == 0 {
-            builder.move_to(at);
-        } else {
-            builder.line_to(at);
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_ring_eases_toward_progress_and_then_rests() {
+        let ring = RingState::default();
+        // A new job starts where its progress is.
+        assert_eq!(ring.step(Some(0.5), true, 0), (0., 0.5, false));
+        // Progress moves on: the ring follows over a few frames, then stops asking for them.
+        let (_, first, moving) = ring.step(Some(0.9), true, 0);
+        assert!(moving && first > 0.5 && first < 0.9, "{first}");
+        let mut frames = 1;
+        while ring.step(Some(0.9), true, 0).2 {
+            frames += 1;
+            assert!(frames < 30, "the ring never settles");
         }
+        assert_eq!(ring.step(Some(0.9), true, 0), (0., 0.9, false));
     }
-    builder.build().ok()
+
+    #[test]
+    fn without_motion_the_ring_jumps_and_never_animates() {
+        let ring = RingState::default();
+        ring.step(Some(0.2), false, 0);
+        assert_eq!(ring.step(Some(0.7), false, 0), (0., 0.7, false));
+        assert!(!ring.step(None, false, 300).2, "the spinner stands still");
+    }
+
+    #[test]
+    fn the_spinner_turns_with_time() {
+        let ring = RingState::default();
+        let (at_0, sweep, moving) = ring.step(None, true, 0);
+        assert!(moving);
+        assert_eq!(sweep, SPINNER_SWEEP);
+        let (quarter, ..) = ring.step(None, true, SPINNER_PERIOD_MS / 4);
+        assert!((quarter - at_0 - 0.25).abs() < 1e-6, "{quarter}");
+    }
 }

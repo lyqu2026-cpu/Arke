@@ -24,15 +24,15 @@ use windows::Win32::System::Com::{CLSCTX_INPROC_SERVER, CoCreateInstance, IDataO
 use windows::Win32::UI::Controls::{IImageList, ILD_TRANSPARENT};
 use windows::Win32::UI::Shell::{
     CLSID_DragDropHelper, DSH_ALLOWDROPDESCRIPTIONTEXT, IDragSourceHelper, IDragSourceHelper2,
-    SHDRAGIMAGE, SHFILEINFOW, SHGFI_SYSICONINDEX, SHGFI_USEFILEATTRIBUTES, SHGetFileInfoW,
-    SHGetImageList, SHIL_EXTRALARGE, SHIL_JUMBO,
+    SHDRAGIMAGE, SHFILEINFOW, SHGFI_SYSICONINDEX, SHGFI_TYPENAME, SHGFI_USEFILEATTRIBUTES,
+    SHGetFileInfoW, SHGetImageList, SHIL_EXTRALARGE, SHIL_JUMBO, SHIL_LARGE,
 };
 use windows::Win32::UI::WindowsAndMessaging::{DestroyIcon, GetIconInfo, ICONINFO};
 use windows::core::{Interface, PCWSTR, w};
 
 use crate::shell::DragImage;
 use crate::win_fileops::{Com, wide};
-use crate::win_icons::{bitmap_pixels, file_icon};
+use crate::win_icons::{file_icon, icon_pixels};
 
 /// Longest side of the image, about what Explorer uses.
 const SIDE: u32 = 96;
@@ -40,8 +40,6 @@ const SIDE: u32 = 96;
 const BADGE_H: u32 = 22;
 const BADGE_PAD: u32 = 7;
 const BADGE_OVERHANG: u32 = 6;
-/// Side of the SHIL_EXTRALARGE icons.
-const EXTRALARGE: u32 = 48;
 
 /// Builds the drag image. Call from a background thread.
 pub(crate) fn compose(
@@ -159,32 +157,260 @@ fn type_icon(path: &Path, is_dir: bool) -> Option<Thumbnail> {
             },
         )
     };
-    let name = wide(&name);
     let attributes = if is_dir {
         FILE_ATTRIBUTE_DIRECTORY
     } else {
         FILE_ATTRIBUTE_NORMAL
     };
+    index_icon(icon_index(&name, attributes.0)?)
+}
+
+/// Windows' icon for files of type `ext` (no dot) as its file association gives it, or `None`
+/// when no program registered one and Windows would show its blank document: the theme's icon
+/// is better then. Like [`type_icon`], only the extension is looked at (no file read, no
+/// per-file icon handler loaded), so it's the same for every file of that type.
+pub(crate) fn registered_type_icon(ext: &str) -> Option<Thumbnail> {
+    let _com = Com::init().ok()?;
+    let index = icon_index(std::ffi::OsStr::new(&format!("file.{ext}")), 0x80)?;
+    // A type nothing registered: Windows' blank document.
+    let blank = icon_index(std::ffi::OsStr::new("file.arke-unregistered-type"), 0x80)?;
+    if index == blank {
+        return None;
+    }
+    index_icon(index)
+}
+
+/// Windows' type name for files with extension `ext` (no dot), as File Explorer's Type column
+/// has it ("AutoCAD Drawing"), but only for an extension some program registered: for any other
+/// Windows makes up "EXT File" in its own display language, which would replace Arke's translated
+/// one. Only the extension is looked at (a dummy name; no file is read), so network shares stay
+/// cheap. Background thread.
+pub(crate) fn registered_type_name(ext: &str) -> Option<String> {
+    type_name_if_registered(ext, extension_is_registered, shell_type_name)
+}
+
+/// `name(ext)` when `registered(ext)`.
+fn type_name_if_registered(
+    ext: &str,
+    registered: impl Fn(&str) -> bool,
+    name: impl Fn(&str) -> Option<String>,
+) -> Option<String> {
+    if registered(ext) { name(ext) } else { None }
+}
+
+/// Whether a program registered files with extension `ext`: a ProgID under `HKCR\.ext`, an entry
+/// in its `OpenWithProgids`, or a choice the user made.
+fn extension_is_registered(ext: &str) -> bool {
+    registry::classes_default(&format!(".{ext}")).is_some_and(|prog_id| !prog_id.is_empty())
+        || registry::user_choice(ext).is_some()
+        || registry::classes_key_exists(&format!(r".{ext}\OpenWithProgids"))
+}
+
+/// Windows' name for the type of `ext`, from the shell.
+fn shell_type_name(ext: &str) -> Option<String> {
+    thread_local! {
+        /// COM for the thread's life: the shell may load handlers that need an apartment.
+        static COM: Option<Com> = Com::init().ok();
+    }
+    COM.with(|_| ());
+    let name = wide(std::ffi::OsStr::new(&format!("x.{ext}")));
     let mut info = SHFILEINFOW::default();
     // SAFETY: name is NUL-terminated; info is a correctly sized out struct. With
     // USEFILEATTRIBUTES the file is not accessed.
     let ok = unsafe {
         SHGetFileInfoW(
             PCWSTR(name.as_ptr()),
-            attributes,
+            windows::Win32::Storage::FileSystem::FILE_FLAGS_AND_ATTRIBUTES(0x80),
             Some(&raw mut info),
             size_of::<SHFILEINFOW>() as u32,
-            SHGFI_SYSICONINDEX | SHGFI_USEFILEATTRIBUTES,
+            SHGFI_TYPENAME | SHGFI_USEFILEATTRIBUTES,
         )
     };
     if ok == 0 {
         return None;
     }
-    // In the jumbo (256) list, types without a large icon get a 48x48 image in the top-left
-    // corner with the rest transparent; use the 48 px list for those.
-    list_icon(SHIL_JUMBO, info.iIcon)
-        .filter(|icon| !only_top_left(icon, EXTRALARGE))
-        .or_else(|| list_icon(SHIL_EXTRALARGE, info.iIcon))
+    let len = info
+        .szTypeName
+        .iter()
+        .position(|&c| c == 0)
+        .unwrap_or(info.szTypeName.len());
+    Some(String::from_utf16_lossy(&info.szTypeName[..len]))
+}
+
+/// The `DefaultIcon` registered for files of type `ext` (no dot): the default value of
+/// `HKCR\<ProgId>\DefaultIcon`, with the ProgId the user chose for the extension, else the one
+/// from `HKCR\.<ext>`. Read only. Background thread.
+pub(crate) fn registered_default_icon(ext: &str) -> Option<String> {
+    let prog_id = registry::user_choice(ext)
+        .or_else(|| registry::classes_default(&format!(".{ext}")))
+        .filter(|id| !id.is_empty())?;
+    registry::classes_default(&format!(r"{prog_id}\DefaultIcon"))
+}
+
+/// Read-only registry access for the type lookups.
+mod registry {
+    use windows::Win32::System::Registry::{
+        HKEY, HKEY_CLASSES_ROOT, HKEY_CURRENT_USER, KEY_READ, RRF_RT_REG_EXPAND_SZ, RRF_RT_REG_SZ,
+        RegCloseKey, RegGetValueW, RegOpenKeyExW,
+    };
+    use windows::core::PCWSTR;
+
+    use crate::win_fileops::wide;
+
+    /// Text of `value` (`None`: the default value) of `key` under `root`.
+    fn string(root: HKEY, key: &str, value: Option<&str>) -> Option<String> {
+        let key = wide(std::ffi::OsStr::new(key));
+        let value = value.map(|v| wide(std::ffi::OsStr::new(v)));
+        let mut buf = vec![0u16; 520];
+        let mut bytes = u32::try_from(buf.len() * 2).ok()?;
+        // SAFETY: key and value are NUL-terminated; buf has `bytes` writable bytes; a string
+        // value is read and nothing is written to the registry.
+        let code = unsafe {
+            RegGetValueW(
+                root,
+                PCWSTR(key.as_ptr()),
+                value
+                    .as_ref()
+                    .map_or(PCWSTR::null(), |v| PCWSTR(v.as_ptr())),
+                RRF_RT_REG_SZ | RRF_RT_REG_EXPAND_SZ,
+                None,
+                Some(buf.as_mut_ptr().cast()),
+                Some(&raw mut bytes),
+            )
+        };
+        if code.0 != 0 {
+            return None;
+        }
+        let len = (bytes as usize / 2).min(buf.len());
+        let text = String::from_utf16_lossy(&buf[..len]);
+        Some(text.trim_end_matches('\0').to_owned())
+    }
+
+    /// Default value (text) of `HKEY_CLASSES_ROOT\<key>`.
+    pub(super) fn classes_default(key: &str) -> Option<String> {
+        string(HKEY_CLASSES_ROOT, key, None)
+    }
+
+    /// The ProgID the user chose to open files with extension `ext`.
+    pub(super) fn user_choice(ext: &str) -> Option<String> {
+        let key = format!(
+            r"Software\Microsoft\Windows\CurrentVersion\Explorer\FileExts\.{ext}\UserChoice"
+        );
+        string(HKEY_CURRENT_USER, &key, Some("ProgId")).filter(|id| !id.is_empty())
+    }
+
+    /// Whether `HKEY_CLASSES_ROOT\<key>` exists.
+    pub(super) fn classes_key_exists(key: &str) -> bool {
+        let key = wide(std::ffi::OsStr::new(key));
+        let mut handle = HKEY::default();
+        // SAFETY: key is NUL-terminated; handle is a valid out pointer; opened for reading only
+        // and closed right away.
+        let code = unsafe {
+            RegOpenKeyExW(
+                HKEY_CLASSES_ROOT,
+                PCWSTR(key.as_ptr()),
+                None,
+                KEY_READ,
+                &raw mut handle,
+            )
+        };
+        if code.0 != 0 {
+            return false;
+        }
+        // SAFETY: handle was just opened.
+        let _ = unsafe { RegCloseKey(handle) };
+        true
+    }
+}
+
+/// Index in the system image list of the icon for `name` with `attributes`, from the name's
+/// extension only (`SHGFI_USEFILEATTRIBUTES`: the file isn't accessed).
+fn icon_index(name: &std::ffi::OsStr, attributes: u32) -> Option<i32> {
+    let name = wide(name);
+    let mut info = SHFILEINFOW::default();
+    // SAFETY: name is NUL-terminated; info is a correctly sized out struct. With
+    // USEFILEATTRIBUTES the file is not accessed.
+    let ok = unsafe {
+        SHGetFileInfoW(
+            PCWSTR(name.as_ptr()),
+            windows::Win32::Storage::FileSystem::FILE_FLAGS_AND_ATTRIBUTES(attributes),
+            Some(&raw mut info),
+            size_of::<SHFILEINFOW>() as u32,
+            SHGFI_SYSICONINDEX | SHGFI_USEFILEATTRIBUTES,
+        )
+    };
+    (ok != 0).then_some(info.iIcon)
+}
+
+/// The system image list's icon at `index`, as large as Windows has it.
+fn index_icon(index: i32) -> Option<Thumbnail> {
+    pick_icon(
+        [SHIL_JUMBO, SHIL_EXTRALARGE, SHIL_LARGE]
+            .into_iter()
+            .map(|list| list_icon(list, index)),
+    )
+}
+
+/// The first of `icons` (largest list first) whose picture fills at least [`FILLS`] of its
+/// side. A type whose icon exists only at small sizes gets that icon placed in a corner (or the
+/// middle) of the larger lists' bitmaps, and drawn from there at list size it shrinks to a dot,
+/// so those are skipped. When none fills its bitmap, the one with the largest picture, cropped
+/// to it.
+fn pick_icon(icons: impl IntoIterator<Item = Option<Thumbnail>>) -> Option<Thumbnail> {
+    let mut best: Option<(u32, Thumbnail)> = None;
+    for icon in icons.into_iter().flatten() {
+        let Some((x, y, w, h)) = content_box(&icon) else {
+            continue;
+        };
+        let side = w.max(h);
+        if side * 100 >= icon.width.max(icon.height) * FILLS {
+            return Some(icon);
+        }
+        if best.as_ref().is_none_or(|(most, _)| side > *most) {
+            best = Some((side, crop(&icon, x, y, w, h)));
+        }
+    }
+    best.map(|(_, icon)| icon)
+}
+
+/// How much of its bitmap's side an icon's picture must cover, in percent, to be used as is.
+const FILLS: u32 = 60;
+
+/// The box (x, y, width, height) around the visible pixels, if any.
+fn content_box(image: &Thumbnail) -> Option<(u32, u32, u32, u32)> {
+    let width = image.width as usize;
+    let mut bounds: Option<(usize, usize, usize, usize)> = None;
+    for (i, p) in image.rgba.as_chunks::<4>().0.iter().enumerate() {
+        if p[3] == 0 {
+            continue;
+        }
+        let (x, y) = (i % width, i / width);
+        bounds = Some(match bounds {
+            None => (x, y, x, y),
+            Some((x0, y0, x1, y1)) => (x0.min(x), y0.min(y), x1.max(x), y1.max(y)),
+        });
+    }
+    let (x0, y0, x1, y1) = bounds?;
+    Some((
+        x0 as u32,
+        y0 as u32,
+        (x1 - x0 + 1) as u32,
+        (y1 - y0 + 1) as u32,
+    ))
+}
+
+/// The part of `image` in the given box.
+fn crop(image: &Thumbnail, x: u32, y: u32, w: u32, h: u32) -> Thumbnail {
+    let mut rgba = Vec::with_capacity((w * h * 4) as usize);
+    for row in y..y + h {
+        let start = ((row * image.width + x) * 4) as usize;
+        rgba.extend_from_slice(&image.rgba[start..start + (w * 4) as usize]);
+    }
+    Thumbnail {
+        width: w,
+        height: h,
+        rgba,
+    }
 }
 
 fn list_icon(list: u32, index: i32) -> Option<Thumbnail> {
@@ -195,7 +421,10 @@ fn list_icon(list: u32, index: i32) -> Option<Thumbnail> {
         let icon = images.GetIcon(index, ILD_TRANSPARENT.0).ok()?;
         let mut parts = ICONINFO::default();
         let got = GetIconInfo(icon, &raw mut parts);
-        let pixels = got.is_ok().then(|| bitmap_pixels(parts.hbmColor)).flatten();
+        let pixels = got
+            .is_ok()
+            .then(|| icon_pixels(parts.hbmColor, parts.hbmMask))
+            .flatten();
         if got.is_ok() {
             let _ = DeleteObject(HGDIOBJ(parts.hbmColor.0));
             let _ = DeleteObject(HGDIOBJ(parts.hbmMask.0));
@@ -203,21 +432,6 @@ fn list_icon(list: u32, index: i32) -> Option<Thumbnail> {
         let _ = DestroyIcon(icon);
         pixels
     }
-}
-
-/// Whether only the top-left `side`x`side` area has visible pixels.
-fn only_top_left(image: &Thumbnail, side: u32) -> bool {
-    if image.width <= side || image.height <= side {
-        return false;
-    }
-    let width = image.width as usize;
-    image
-        .rgba
-        .as_chunks::<4>()
-        .0
-        .iter()
-        .enumerate()
-        .all(|(i, p)| p[3] == 0 || ((i % width) < side as usize && (i / width) < side as usize))
 }
 
 /// Shrinks to fit [`SIDE`]; smaller images are not enlarged.
@@ -428,6 +642,19 @@ fn pill(width: u32, height: u32, bgr: &[u8]) -> Thumbnail {
 mod tests {
     use super::*;
 
+    /// Windows' made-up "EXT File" name (in its own language) is never asked for an extension
+    /// nothing registered.
+    #[test]
+    fn type_names_come_only_from_registered_extensions() {
+        let name = |ext: &str| Some(format!("Windows name of {ext}"));
+        let registered = |ext: &str| ext == "dwg";
+        assert_eq!(
+            type_name_if_registered("dwg", registered, name).as_deref(),
+            Some("Windows name of dwg")
+        );
+        assert_eq!(type_name_if_registered("bak", registered, name), None);
+    }
+
     fn solid(width: u32, height: u32, rgba: [u8; 4]) -> Thumbnail {
         Thumbnail {
             width,
@@ -532,5 +759,54 @@ mod tests {
         )
         .unwrap();
         assert!(folder.bgra.as_chunks::<4>().0.iter().any(|p| p[3] != 0));
+    }
+
+    fn square(side: u32, boxed: (u32, u32, u32, u32)) -> Thumbnail {
+        let (bx, by, bw, bh) = boxed;
+        let mut rgba = vec![0u8; (side * side * 4) as usize];
+        for y in by..by + bh {
+            for x in bx..bx + bw {
+                let i = ((y * side + x) * 4) as usize;
+                rgba[i..i + 4].copy_from_slice(&[0, 160, 0, 255]);
+            }
+        }
+        Thumbnail {
+            width: side,
+            height: side,
+            rgba,
+        }
+    }
+
+    #[test]
+    fn an_icon_that_fills_the_largest_list_is_used_as_is() {
+        let jumbo = square(256, (0, 0, 256, 256));
+        let picked = pick_icon([Some(jumbo.clone()), Some(square(48, (0, 0, 48, 48)))]);
+        assert_eq!(picked, Some(jumbo));
+    }
+
+    #[test]
+    fn a_small_icon_in_a_big_bitmap_falls_through_to_a_list_it_fills() {
+        // 32 px in a corner of the jumbo bitmap, and centred in it, the way the lists place an
+        // icon that has no large size: both draw as a dot at list size.
+        let xl = square(48, (2, 2, 44, 44));
+        for small in [square(256, (0, 0, 32, 32)), square(256, (112, 112, 32, 32))] {
+            assert_eq!(pick_icon([Some(small), Some(xl.clone())]), Some(xl.clone()));
+        }
+        // A list with nothing for the type is skipped.
+        assert_eq!(pick_icon([None, Some(xl.clone())]), Some(xl));
+    }
+
+    #[test]
+    fn when_no_list_fills_its_bitmap_the_picture_is_cropped_to_fit() {
+        let picked = pick_icon([
+            Some(square(256, (100, 100, 16, 16))),
+            Some(square(48, (10, 12, 20, 24))),
+            Some(square(32, (1, 1, 8, 8))),
+        ])
+        .unwrap();
+        assert_eq!((picked.width, picked.height), (20, 24));
+        assert!(picked.rgba.as_chunks::<4>().0.iter().all(|p| p[3] == 255));
+        // Nothing visible at all: nothing to show.
+        assert_eq!(pick_icon([Some(square(48, (0, 0, 0, 0)))]), None);
     }
 }

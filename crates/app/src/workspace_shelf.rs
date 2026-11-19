@@ -100,7 +100,7 @@ impl Workspace {
     }
 
     /// Shows or hides the items; opening rechecks which ones still exist.
-    fn toggle_shelf(&mut self, cx: &mut Context<Self>) {
+    pub(super) fn toggle_shelf(&mut self, cx: &mut Context<Self>) {
         self.shelf_open = !self.shelf_open;
         if self.shelf_open {
             let fs = Arc::clone(&self.services.fs);
@@ -148,19 +148,19 @@ impl Workspace {
             .a11y(gpui::Role::Button, t!("shelf.title"))
             .aria_expanded(open)
             .relative()
-            .h(theme::H_ROW)
+            .h(theme::h_row())
             .flex()
             .flex_none()
             .items_center()
-            .gap(theme::S_4)
-            .pl(theme::S_4)
-            .pr(theme::S_8)
-            .rounded(theme::R_8)
+            .gap(theme::s_4())
+            .pl(theme::s_4())
+            .pr(theme::s_8())
+            .rounded(theme::r_8())
             .cursor_pointer()
             .hover(|s| s.bg(theme::wash()))
             .child(
                 div()
-                    .size(theme::S_20)
+                    .size(theme::s_20())
                     .flex()
                     .flex_none()
                     .items_center()
@@ -168,7 +168,7 @@ impl Workspace {
                     .child(
                         svg()
                             .path(Icon::ChevronRight.path())
-                            .size(theme::ICON_SM)
+                            .size(theme::icon_sm())
                             .text_color(theme::text_subtle())
                             .when(open, |s| {
                                 s.with_transformation(gpui::Transformation::rotate(
@@ -180,7 +180,7 @@ impl Workspace {
             .child(
                 svg()
                     .path(Icon::Shelf.path())
-                    .size(theme::ICON)
+                    .size(theme::icon())
                     .flex_none()
                     .text_color(theme::text_muted()),
             )
@@ -189,14 +189,14 @@ impl Workspace {
                     .flex_1()
                     .min_w_0()
                     .truncate()
-                    .pl(theme::S_4)
+                    .pl(theme::s_4())
                     .child(t!("shelf.title").into_owned()),
             )
             .when(!held.is_empty(), |d| {
                 d.child(
                     div()
                         .flex_none()
-                        .text_size(theme::FS_12)
+                        .text_size(theme::fs_12())
                         .text_color(theme::text_subtle())
                         .child(arke_core::format::format_count(held.len())),
                 )
@@ -233,8 +233,14 @@ impl Workspace {
                 this.add_to_shelf_from_drop(items, cx);
             }))
             .on_drop(cx.listener(|this, paths: &ExternalPaths, _, cx| {
-                // Windows doesn't say which are folders; the recheck finds out.
-                let items = paths.paths().iter().map(|p| (p.clone(), false)).collect();
+                // Virtual files aren't anywhere the shelf could point to.
+                if crate::win_virtual_drop::is_virtual(paths.paths()) {
+                    return;
+                }
+                // Windows doesn't say which are folders; the recheck finds out. Files a source
+                // extracted to the temp folder for this drop are gone once it returns.
+                let (paths, _) = crate::explorer::hold_temp_drop(paths.paths().to_vec());
+                let items = paths.into_iter().map(|p| (p, false)).collect();
                 this.add_to_shelf_from_drop(items, cx);
             }));
         // The whole shelf drags out from its row.
@@ -262,13 +268,13 @@ impl Workspace {
         if held.is_empty() {
             out.push(
                 div()
-                    .h(theme::H_ROW)
+                    .h(theme::h_row())
                     .flex()
                     .flex_none()
                     .items_center()
-                    .pl(theme::S_4 + theme::S_20 + theme::S_4)
-                    .pr(theme::S_8)
-                    .text_size(theme::FS_12)
+                    .pl(theme::s_4() + theme::s_20() + theme::s_4())
+                    .pr(theme::s_8())
+                    .text_size(theme::fs_12())
                     .text_color(theme::text_subtle())
                     .child(t!("shelf.empty").into_owned())
                     .into_any_element(),
@@ -283,7 +289,11 @@ impl Workspace {
     }
 
     /// Files dropped on the Shelf row: add them and say so on the active tab.
-    fn add_to_shelf_from_drop(&mut self, items: Vec<(PathBuf, bool)>, cx: &mut Context<Self>) {
+    pub(super) fn add_to_shelf_from_drop(
+        &mut self,
+        items: Vec<(PathBuf, bool)>,
+        cx: &mut Context<Self>,
+    ) {
         let unknown = items.iter().any(|(_, is_dir)| !is_dir);
         self.active_view()
             .update(cx, |e, cx| e.add_dropped_to_shelf(items, cx));
@@ -339,26 +349,26 @@ impl Workspace {
                 crate::a11y::item_label(name, &[folder.as_str(), state.as_str()])
             })
             .group(group.clone())
-            .h(theme::H_ROW)
+            .h(theme::h_row())
             .flex()
             .flex_none()
             .items_center()
-            .gap(theme::S_8)
+            .gap(theme::s_8())
             // Lines up under the Shelf label, like a tree child.
-            .pl(theme::S_4 + theme::S_20 + theme::S_4)
-            .pr(theme::S_4)
-            .rounded(theme::R_8)
+            .pl(theme::s_4() + theme::s_20() + theme::s_4())
+            .pr(theme::s_4())
+            .rounded(theme::r_8())
             .cursor_pointer()
             .hover(|s| s.bg(theme::wash()))
             .when(missing, |d| d.opacity(0.5))
-            .child(kind_icon(item_kind(item), theme::ICON))
+            .child(kind_icon(item_kind(item), theme::icon()))
             .child(
                 div()
                     .flex_1()
                     .min_w_0()
                     .flex()
                     .items_baseline()
-                    .gap(theme::S_6)
+                    .gap(theme::s_6())
                     .overflow_hidden()
                     .whitespace_nowrap()
                     .child(
@@ -374,7 +384,7 @@ impl Workspace {
                             .flex_shrink(2.)
                             .min_w_0()
                             .truncate()
-                            .text_size(theme::FS_12)
+                            .text_size(theme::fs_12())
                             .text_color(theme::text_subtle())
                             .child(if missing {
                                 t!("shelf.missing_short").into_owned()
@@ -387,19 +397,19 @@ impl Workspace {
                 div()
                     .id(("shelf-remove", ix))
                     .a11y_button(t!("shelf.remove"))
-                    .size(theme::S_20)
+                    .size(theme::s_20())
                     .flex()
                     .flex_none()
                     .items_center()
                     .justify_center()
-                    .rounded(theme::R_4)
+                    .rounded(theme::r_4())
                     .invisible()
                     .group_hover(group, gpui::Styled::visible)
                     .hover(|s| s.bg(theme::wash_strong()))
                     .child(
                         svg()
                             .path(Icon::Close.path())
-                            .size(theme::ICON_SM)
+                            .size(theme::icon_sm())
                             .text_color(theme::text_muted()),
                     )
                     .tooltip(tooltip_text(t!("shelf.remove").into_owned()))
@@ -446,13 +456,13 @@ impl Workspace {
                 .id(id)
                 .a11y_button(label.clone())
                 .a11y_disabled(!enabled)
-                .h(theme::S_24)
-                .px(theme::S_8)
+                .h(theme::s_24())
+                .px(theme::s_8())
                 .flex()
                 .flex_none()
                 .items_center()
-                .rounded(theme::R_4)
-                .text_size(theme::FS_12)
+                .rounded(theme::r_4())
+                .text_size(theme::fs_12())
                 .when(enabled, |d| {
                     d.cursor_pointer()
                         .text_color(theme::text_muted())
@@ -472,9 +482,9 @@ impl Workspace {
             .flex_none()
             .flex_wrap()
             .items_center()
-            .gap(theme::S_2)
-            .pl(theme::S_4 + theme::S_20)
-            .pb(theme::S_4)
+            .gap(theme::s_2())
+            .pl(theme::s_4() + theme::s_20())
+            .pb(theme::s_4())
             .child(
                 button(
                     "shelf-copy-here",

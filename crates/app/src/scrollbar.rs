@@ -13,19 +13,24 @@ use std::rc::Rc;
 use std::time::Instant;
 
 use gpui::{
-    Along as _, Axis, Bounds, DispatchPhase, Hsla, IntoElement, MouseButton, MouseDownEvent,
-    MouseMoveEvent, MouseUpEvent, Pixels, ScrollHandle, Styled, canvas, point, px,
+    Along as _, Axis, Bounds, DispatchPhase, Div, Hsla, InteractiveElement as _, IntoElement,
+    MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, ParentElement as _, Pixels,
+    ScrollEvent, ScrollHandle, Stateful, Styled, canvas, div, point, px,
 };
 
 use crate::theme;
 
 /// Hover-sensitive width (the thumb is drawn at its right edge)
-const TRACK_W: Pixels = px(12.);
+fn track_w() -> gpui::Pixels {
+    crate::theme::scaled_px(12.)
+}
 /// Thumb width: thin and widened
 const THUMB_THIN: f32 = 2.;
 const THUMB_WIDE: f32 = 6.;
 /// Shortest thumb, along the track.
-const THUMB_MIN_H: Pixels = px(24.);
+fn thumb_min_h() -> gpui::Pixels {
+    crate::theme::scaled_px(24.)
+}
 /// Grow and shrink duration (seconds)
 const GROW_SECS: f32 = crate::motion::FAST.as_secs_f32();
 
@@ -83,7 +88,7 @@ fn thumb(
     }
     let room = track.size.along(axis);
     let length = (room * (viewport / (viewport + max)))
-        .max(THUMB_MIN_H)
+        .max(thumb_min_h())
         .min(room);
     let progress = (-handle.offset().along(axis) / max).clamp(0., 1.);
     let start = track.origin.along(axis) + (room - length) * progress;
@@ -115,7 +120,7 @@ pub(crate) fn scrollbar(handle: ScrollHandle, drag: ScrollbarDrag) -> impl IntoE
         .top_0()
         .bottom_0()
         .right_0()
-        .w(TRACK_W)
+        .w(track_w())
 }
 
 /// Sideways scrollbar along the bottom of a list whose rows are wider than it (Details columns),
@@ -125,9 +130,50 @@ pub(crate) fn hscrollbar(handle: ScrollHandle, drag: ScrollbarDrag) -> impl Into
     bar(handle, drag, Axis::Horizontal)
         .absolute()
         .left_0()
-        .right(TRACK_W)
+        .right(track_w())
         .bottom_0()
-        .h(TRACK_W)
+        .h(track_w())
+}
+
+/// A scroll area inside a scrolling page (the report text in Settings), with its scrollbar.
+///
+/// GPUI hands a wheel event to every scroll area under the pointer, so the page would move along
+/// with the inner area. Here the wheel stops at the inner area while it still moves, and reaches the
+/// page only once the inner area is at its end, like a browser. `inner` must track `handle`.
+pub(crate) fn nested(inner: Stateful<Div>, handle: &ScrollHandle, drag: ScrollbarDrag) -> Div {
+    // The inner offset before this event, recorded in the capture phase, which runs before any
+    // scroll area applies the event.
+    let before = Rc::new(Cell::new(px(0.)));
+    let clamped = |h: &ScrollHandle| h.offset().y.clamp(-h.max_offset().y, px(0.));
+    let (h, b) = (handle.clone(), Rc::clone(&before));
+    let record = canvas(
+        |_, _, _| {},
+        move |_, (), window, _| {
+            let (h, b) = (h.clone(), Rc::clone(&b));
+            window.on_mouse_event(move |_: &ScrollEvent, phase, _, _| {
+                if phase == DispatchPhase::Capture {
+                    b.set(clamped(&h));
+                }
+            });
+        },
+    )
+    // No hitbox, so it doesn't take the pointer from the text.
+    .absolute()
+    .size_full();
+    let h = handle.clone();
+    // Runs after the area has applied the event: a div adds this listener before its own scroll
+    // handler, and GPUI runs bubble listeners last-added first.
+    let inner = inner.on_scroll(move |e: &ScrollEvent, _, cx| {
+        // Sideways swipes stay with the window (back and forward).
+        if e.delta.pixel_delta(px(1.)).y != px(0.) && clamped(&h) != before.get() {
+            cx.stop_propagation();
+        }
+    });
+    div()
+        .relative()
+        .child(inner)
+        .child(record)
+        .child(scrollbar(handle.clone(), drag))
 }
 
 /// The thumb as drawn `width` thick, its hit area across the track, and the rail behind it, for a
@@ -149,7 +195,10 @@ fn parts(
                 ),
                 Bounds::new(
                     point(right - px(THUMB_WIDE) - px(2.), track.origin.y),
-                    gpui::size(px(THUMB_WIDE) + px(4.), track.size.height),
+                    gpui::size(
+                        px(THUMB_WIDE) + crate::theme::scaled_px(4.),
+                        track.size.height,
+                    ),
                 ),
             )
         }
@@ -163,7 +212,10 @@ fn parts(
                 ),
                 Bounds::new(
                     point(track.origin.x, bottom - px(THUMB_WIDE) - px(2.)),
-                    gpui::size(track.size.width, px(THUMB_WIDE) + px(4.)),
+                    gpui::size(
+                        track.size.width,
+                        px(THUMB_WIDE) + crate::theme::scaled_px(4.),
+                    ),
                 ),
             )
         }

@@ -22,6 +22,7 @@ struct State {
     dirs: HashMap<PathBuf, Vec<Entry>>,
     delays: HashMap<PathBuf, Duration>,
     hung: HashSet<PathBuf>,
+    crashing: HashSet<PathBuf>,
     contents: HashMap<PathBuf, Vec<u8>>,
     links: HashMap<PathBuf, PathBuf>,
     watchers: Vec<(PathBuf, Weak<WatchCallback>)>,
@@ -115,6 +116,17 @@ impl FakeFs {
         }
     }
 
+    /// Removes the folder `path` with everything in it; no watch event.
+    pub fn remove_dir(&self, path: &Path) {
+        let mut state = self.state.lock();
+        if let (Some(parent), Some(name)) = (path.parent(), path.file_name())
+            && let Some(list) = state.dirs.get_mut(parent)
+        {
+            list.retain(|e| *e.name != *name.to_string_lossy());
+        }
+        state.dirs.retain(|dir, _| !dir.starts_with(path));
+    }
+
     /// Sets file content for `read`. `hang` works on file paths too.
     pub fn set_content(&self, path: impl Into<PathBuf>, bytes: Vec<u8>) {
         self.state.lock().contents.insert(path.into(), bytes);
@@ -128,6 +140,11 @@ impl FakeFs {
     /// Makes `read_dir` on `path` block until [`Self::release`].
     pub fn hang(&self, path: impl Into<PathBuf>) {
         self.state.lock().hung.insert(path.into());
+    }
+
+    /// Makes reads of `path` panic, as a bug on a worker thread would.
+    pub fn crash(&self, path: impl Into<PathBuf>) {
+        self.state.lock().crashing.insert(path.into());
     }
 
     /// Unblocks reads hung on `path` by [`Self::hang`].
@@ -189,7 +206,10 @@ impl FakeFs {
             while state.hung.contains(path) {
                 self.released.wait(&mut state);
             }
-            state.delays.get(path).copied()
+            let crash = state.crashing.contains(path);
+            drop(state);
+            assert!(!crash, "fake read of {} panicked", path.display());
+            self.state.lock().delays.get(path).copied()
         };
         if let Some(delay) = delay {
             std::thread::sleep(delay);
