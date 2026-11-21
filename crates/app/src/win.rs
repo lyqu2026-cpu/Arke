@@ -1703,15 +1703,14 @@ fn open_namespace_item(parsing: &str) -> bool {
             return false;
         }
         // SAFETY: standard COM activation of the shell's dispatch object (Shell.Application).
-        let dispatch: IShellDispatch2 =
-            match unsafe { CoCreateInstance(&ShellApp, None, CLSCTX_INPROC_SERVER) } {
-                Ok(dispatch) => dispatch,
-                Err(_) => {
-                    // SAFETY: var owns the array; clear it.
-                    let _ = unsafe { VariantClear(&raw mut var) };
-                    return false;
-                }
-            };
+        let activated = unsafe {
+            CoCreateInstance::<_, IShellDispatch2>(&ShellApp, None, CLSCTX_INPROC_SERVER)
+        };
+        let Ok(dispatch) = activated else {
+            // SAFETY: var owns the array; clear it.
+            let _ = unsafe { VariantClear(&raw mut var) };
+            return false;
+        };
         // SAFETY: var holds the item's PIDL as bytes; Open does not take ownership of it.
         let ok = unsafe { dispatch.Open(&var) }.is_ok();
         // SAFETY: var owns the array; clear it.
