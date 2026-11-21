@@ -1624,17 +1624,23 @@ pub(crate) fn restore_window(hwnd: isize) {
     let _ = unsafe { ShowWindowAsync(HWND(hwnd as *mut _), SW_RESTORE) };
 }
 
-/// Starts `explorer.exe` with `target` (a path or `shell:::{CLSID}`) for something Arke can't show.
+/// Hands `target` (a path or `shell:::{CLSID}`) to Explorer for something Arke can't show.
 /// Launching explorer.exe directly never goes through the folder verb, so nothing loops. Runs
 /// before any other initialization (the folder handler path of `arke.exe`).
 pub(crate) fn open_in_explorer(target: &str) -> bool {
     use windows::Win32::UI::Shell::SEE_MASK_FLAG_NO_UI;
     use windows::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
+    // SAFETY: initializes STA on this thread; both handoffs below need COM. The process ends soon
+    // after, so there is no matching CoUninitialize.
+    let _ = unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE) };
+    // A namespace name below a root (a phone's storage under This PC) does not survive
+    // explorer.exe's command-line parsing: it silently opens the default folder instead.
+    // Open those through the shell by PIDL, which always resolves.
+    if target.starts_with("::") && open_namespace_item(target) {
+        return true;
+    }
     let file = wide(std::ffi::OsStr::new("explorer.exe"));
     let params = wide(std::ffi::OsStr::new(&format!("\"{target}\"")));
-    // SAFETY: initializes STA on this thread; ShellExecuteEx needs COM. The process ends soon after,
-    // so there is no matching CoUninitialize.
-    let _ = unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE) };
     let mut info = SHELLEXECUTEINFOW {
         cbSize: size_of::<SHELLEXECUTEINFOW>() as u32,
         fMask: SEE_MASK_NOASYNC | SEE_MASK_FLAG_NO_UI,
@@ -1645,6 +1651,76 @@ pub(crate) fn open_in_explorer(target: &str) -> bool {
     };
     // SAFETY: the string pointers in info stay valid for the call.
     unsafe { ShellExecuteExW(&raw mut info) }.is_ok()
+}
+
+/// Opens the shell item named by `parsing` (a `::{CLSID}\...` parsing name) in an Explorer
+/// window, by PIDL: `SHParseDisplayName` resolves the name the way the shell itself does, and
+/// `IShellDispatch::Open` shows it. The window is the shell's, so it outlives this process.
+fn open_namespace_item(parsing: &str) -> bool {
+    use windows::Win32::System::Com::{CLSCTX_INPROC_SERVER, CoCreateInstance};
+    use windows::Win32::System::Ole::{
+        SafeArrayAccessData, SafeArrayCreateVector, SafeArrayDestroy, SafeArrayUnaccessData,
+    };
+    use windows::Win32::System::Variant::{VARIANT, VT_ARRAY, VT_UI1, VariantClear};
+    use windows::Win32::UI::Shell::Common::ITEMIDLIST;
+    use windows::Win32::UI::Shell::{
+        ILGetSize, IShellDispatch2, SHParseDisplayName, Shell as ShellApp,
+    };
+
+    let name = wide(std::ffi::OsStr::new(parsing));
+    let mut pidl: *mut ITEMIDLIST = std::ptr::null_mut();
+    // SAFETY: name is NUL-terminated; pidl is an out variable, owned by the caller on success.
+    if unsafe { SHParseDisplayName(PCWSTR(name.as_ptr()), None, &raw mut pidl, 0, None) }.is_err() {
+        return false;
+    }
+    // SAFETY: pidl is a valid, zero-terminated list from SHParseDisplayName.
+    let size = unsafe { ILGetSize(Some(pidl.cast_const())) };
+    let opened = (|| {
+        // SAFETY: creates a byte array of `size` elements; null on failure.
+        let array = unsafe { SafeArrayCreateVector(VT_UI1, 0, size) };
+        if array.is_null() {
+            return false;
+        }
+        let mut var = VARIANT::default();
+        // SAFETY: var is zeroed (VT_EMPTY); the array is filled with the PIDL's bytes and handed
+        // to var, which owns it from here (VariantClear frees it).
+        let filled = unsafe {
+            let mut data: *mut core::ffi::c_void = std::ptr::null_mut();
+            if SafeArrayAccessData(array, &raw mut data).is_err() {
+                false
+            } else {
+                std::ptr::copy_nonoverlapping(pidl.cast::<u8>(), data.cast::<u8>(), size as usize);
+                let _ = SafeArrayUnaccessData(array);
+                let inner = &mut *var.Anonymous.Anonymous;
+                inner.vt = VT_ARRAY | VT_UI1;
+                inner.Anonymous.parray = array;
+                true
+            }
+        };
+        if !filled {
+            // SAFETY: the array was created above and var never took it.
+            let _ = unsafe { SafeArrayDestroy(array) };
+            return false;
+        }
+        // SAFETY: standard COM activation of the shell's dispatch object (Shell.Application).
+        let dispatch: IShellDispatch2 =
+            match unsafe { CoCreateInstance(&ShellApp, None, CLSCTX_INPROC_SERVER) } {
+                Ok(dispatch) => dispatch,
+                Err(_) => {
+                    // SAFETY: var owns the array; clear it.
+                    let _ = unsafe { VariantClear(&raw mut var) };
+                    return false;
+                }
+            };
+        // SAFETY: var holds the item's PIDL as bytes; Open does not take ownership of it.
+        let ok = unsafe { dispatch.Open(&var) }.is_ok();
+        // SAFETY: var owns the array; clear it.
+        let _ = unsafe { VariantClear(&raw mut var) };
+        ok
+    })();
+    // SAFETY: pidl came from SHParseDisplayName (CoTaskMemAlloc); freed once, after use.
+    unsafe { CoTaskMemFree(Some(pidl.cast_const().cast())) };
+    opened
 }
 
 /// Brings Arke's window to the foreground when another program owns it, without synthesized key

@@ -103,8 +103,9 @@ pub fn route_argument(arg: &str) -> Route {
             || {
                 // A bare namespace root goes as `shell:::{CLSID}`; a name below one (a phone
                 // under This PC, a Control Panel page) goes as the raw parsing name, which
-                // `explorer.exe` resolves itself: the `shell:` form doesn't resolve device
-                // paths, and Explorer silently falls back to its default folder instead.
+                // the shell resolves by PIDL (`open_in_explorer`): neither the `shell:` form
+                // nor explorer.exe's command line resolves device paths — Explorer silently
+                // falls back to its default folder instead.
                 if parsing.trim_end_matches('\\').contains('\\') {
                     Route::Explorer(parsing.to_owned())
                 } else {
@@ -450,8 +451,9 @@ mod tests {
             route_argument(r"C:\Temp\a.zip\inner"),
             explorer(r"C:\Temp\a.zip\inner")
         );
-        // A phone under This PC (MTP): the raw parsing name, no `shell:` prefix (Explorer
-        // can't resolve the `shell:` form of a device path and opens its default folder).
+        // A phone under This PC (MTP): the raw parsing name, no `shell:` prefix (neither
+        // the `shell:` form nor explorer.exe's command line resolves a device path; the
+        // shell opens it by PIDL instead).
         let phone = r"::{20D04FE0-3AEA-1069-A2D8-08002B30309D}\\\?\usb#vid_04e8&pid_6860#r58m#{6ac27878-a6fa-4155-ba85-f98f491d4f33}";
         assert_eq!(route_argument(phone), explorer(phone));
         assert_eq!(route_argument(&format!("shell:{phone}")), explorer(phone));
