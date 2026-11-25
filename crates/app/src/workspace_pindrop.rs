@@ -259,12 +259,17 @@ impl Workspace {
     /// while something that can be added is over it.
     pub(super) fn tiles_hover<T: PinDrag>(&mut self, e: &DragMoveEvent<T>, cx: &mut Context<Self>) {
         let over = e.bounds.contains(&e.event.position) && e.drag(cx).edges(self, cx).is_some();
-        let state = cx.default_global::<PinDrop>();
-        if state.over_tiles != over {
+        let carries_file = over && e.drag(cx).carries_file(cx);
+        let changed = {
+            let state = cx.default_global::<PinDrop>();
+            let changed = state.over_tiles != over;
             state.over_tiles = over;
+            state.carries_file = carries_file;
+            changed
+        };
+        if changed {
             cx.notify();
         }
-        state.carries_file = over && e.drag(cx).carries_file(cx);
     }
 
     /// Adds `paths` at `slot`, in order.
