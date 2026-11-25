@@ -337,7 +337,6 @@ fn on_device_change(wparam: WPARAM, lparam: LPARAM) {
                 match kind {
                     DBT_DEVICEARRIVAL => {
                         watcher.watch(letter);
-                        let _ = watcher.events.send(DriveEvent::Arrived(root(letter)));
                     }
                     DBT_DEVICEREMOVECOMPLETE => watcher.apply(letter, DevEvent::Removed),
                     _ => {}

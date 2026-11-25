@@ -195,7 +195,11 @@ const fn menu_glyph(action: &SidebarAction) -> Option<Icon> {
         A::TogglePin(_) | A::SetRecyclePinned(_) | A::TogglePinTab(_) => Icon::Pin,
         A::MoveToList(_) => Icon::ViewList,
         A::MoveToTiles(_) => Icon::ViewGrid,
-        A::RenamePlace(_) | A::RenameFavorite(_) => Icon::Rename,
+        A::OpenFavorite(_) => Icon::Open,
+        A::MoveToGroup(..) | A::MoveToUngrouped(_) | A::NewGroupWith(_) => Icon::Folder,
+        A::RenamePlace(_) | A::RenameFavorite(_) | A::RenameGroup(_) => Icon::Rename,
+        A::DeleteGroup(_) => Icon::Close,
+        A::MoveGroupUp(_) | A::MoveGroupDown(_) => Icon::Sort,
         A::OpenTerminal(_) => Icon::Terminal,
         A::OpenInExplorer(_) => Icon::Explorer,
         A::CopyPath(_) => Icon::CopyPath,
@@ -281,12 +285,20 @@ const fn menu_group(action: &SidebarAction) -> u8 {
         A::OpenInNewTab(_)
         | A::OpenRecycleInNewTab
         | A::OpenFile(_)
+        | A::OpenFavorite(_)
         | A::RevealFile(_)
         | A::ShelfReveal(_) => 0,
         A::TogglePin(_)
         | A::SetRecyclePinned(_)
         | A::MoveToList(_)
         | A::MoveToTiles(_)
+        | A::MoveToGroup(..)
+        | A::MoveToUngrouped(_)
+        | A::NewGroupWith(_)
+        | A::RenameGroup(_)
+        | A::DeleteGroup(_)
+        | A::MoveGroupUp(_)
+        | A::MoveGroupDown(_)
         | A::RenamePlace(_)
         | A::RenameFavorite(_) => 1,
         A::DisconnectDrive(_)
@@ -1722,7 +1734,6 @@ impl Workspace {
         let settings = &SettingsStore::global(cx).read(cx).settings;
         let pinned = settings.pinned.clone();
         let groups = settings.favorite_groups.clone();
-        let names = settings.place_names.clone();
         let recycle_pinned = settings.recycle_pinned;
         let own_names = settings.favorite_names.clone();
         let collapsed = settings.is_collapsed(SidebarSection::Favorites);
@@ -5304,16 +5315,6 @@ pub(crate) fn leave_drive_everywhere(drive: &Path, cx: &mut App) {
     for window in cx.windows() {
         if let Some(workspace) = window.downcast::<Workspace>() {
             let _ = workspace.update(cx, |ws, _, cx| ws.leave_drive(drive, cx));
-        }
-    }
-}
-
-/// A drive arrived or left: every window re-enumerates its places, so the sidebar lists the new
-/// drive (or drops the gone one) at once instead of waiting for a new tab.
-pub(crate) fn reload_places_everywhere(cx: &mut App) {
-    for window in cx.windows() {
-        if let Some(workspace) = window.downcast::<Workspace>() {
-            let _ = workspace.update(cx, |ws, _, cx| ws.reload_all_places(cx));
         }
     }
 }
