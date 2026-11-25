@@ -195,16 +195,14 @@ const fn menu_glyph(action: &SidebarAction) -> Option<Icon> {
         A::TogglePin(_) | A::SetRecyclePinned(_) | A::TogglePinTab(_) => Icon::Pin,
         A::MoveToList(_) => Icon::ViewList,
         A::MoveToTiles(_) => Icon::ViewGrid,
-        A::OpenFavorite(_) => Icon::Open,
+        A::OpenFavorite(_) | A::OpenFile(_) => Icon::Open,
         A::MoveToGroup(..) | A::MoveToUngrouped(_) | A::NewGroupWith(_) => Icon::Folder,
         A::RenamePlace(_) | A::RenameFavorite(_) | A::RenameGroup(_) => Icon::Rename,
-        A::DeleteGroup(_) => Icon::Close,
         A::MoveGroupUp(_) | A::MoveGroupDown(_) => Icon::Sort,
         A::OpenTerminal(_) => Icon::Terminal,
         A::OpenInExplorer(_) => Icon::Explorer,
         A::CopyPath(_) => Icon::CopyPath,
         A::Properties(..) => Icon::Info,
-        A::OpenFile(_) => Icon::Open,
         A::RevealFile(_) | A::ShelfReveal(_) | A::HistoryJump { .. } | A::TimelineStep { .. } => {
             Icon::Folder
         }
@@ -215,7 +213,8 @@ const fn menu_glyph(action: &SidebarAction) -> Option<Icon> {
         A::MapDrive => Icon::NetDrive,
         A::ToggleSearchNetwork(_) => Icon::Search,
         A::RequireSecure(_) => Icon::Globe,
-        A::ForgetShare(_)
+        A::DeleteGroup(_)
+        | A::ForgetShare(_)
         | A::ForgetRemote(_)
         | A::ShelfRemove(_)
         | A::ShelfClear
@@ -1776,27 +1775,24 @@ impl Workspace {
                 .get(&crate::place_names::key(path))
                 .cloned()
                 .unwrap_or_else(|| favorite_default(&place_names, &places, path));
-            match favorite_kind(path) {
-                Some(kind) => {
-                    pinned_rows.push(self.favorite_file_row(path, label.clone(), kind, cx));
-                }
-                None => {
-                    let icon = places
-                        .iter()
-                        .find(|p| p.path == *path)
-                        .map(|p| place_icon(p.kind));
-                    self.render_tree(
-                        path,
-                        label.clone(),
-                        None,
-                        icon,
-                        0,
-                        current,
-                        true,
-                        &mut pinned_rows,
-                        cx,
-                    );
-                }
+            if let Some(kind) = favorite_kind(path) {
+                pinned_rows.push(self.favorite_file_row(path, label.clone(), kind, cx));
+            } else {
+                let icon = places
+                    .iter()
+                    .find(|p| p.path == *path)
+                    .map(|p| place_icon(p.kind));
+                self.render_tree(
+                    path,
+                    label.clone(),
+                    None,
+                    icon,
+                    0,
+                    current,
+                    true,
+                    &mut pinned_rows,
+                    cx,
+                );
             }
             // The list row itself (not its expanded children) is draggable: reorder or drop onto tiles.
             let row = pinned_rows.remove(row_at);
@@ -1820,27 +1816,24 @@ impl Workspace {
                     .get(&crate::place_names::key(path))
                     .cloned()
                     .unwrap_or_else(|| favorite_default(&place_names, &places, path));
-                match favorite_kind(path) {
-                    Some(kind) => {
-                        group_rows.push(self.favorite_file_row(path, label.clone(), kind, cx));
-                    }
-                    None => {
-                        let icon = places
-                            .iter()
-                            .find(|p| p.path == *path)
-                            .map(|p| place_icon(p.kind));
-                        self.render_tree(
-                            path,
-                            label.clone(),
-                            None,
-                            icon,
-                            0,
-                            current,
-                            true,
-                            &mut group_rows,
-                            cx,
-                        );
-                    }
+                if let Some(kind) = favorite_kind(path) {
+                    group_rows.push(self.favorite_file_row(path, label.clone(), kind, cx));
+                } else {
+                    let icon = places
+                        .iter()
+                        .find(|p| p.path == *path)
+                        .map(|p| place_icon(p.kind));
+                    self.render_tree(
+                        path,
+                        label.clone(),
+                        None,
+                        icon,
+                        0,
+                        current,
+                        true,
+                        &mut group_rows,
+                        cx,
+                    );
                 }
                 let row = group_rows.remove(row_at);
                 group_rows.insert(
