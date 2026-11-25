@@ -8961,102 +8961,202 @@ menu.add_to_bookmarks:
   en: Add to bookmarks
   zh-TW: 加入書籤
   zh-CN: 加入书签
+  de: Zu Lesezeichen hinzufügen
+  es: Añadir a marcadores
+  pt-BR: Adicionar aos favoritos
+  ja: ブックマークに追加
 bookmarks.title:
   en: Bookmarks
   zh-TW: 書籤
   zh-CN: 书签
+  de: Lesezeichen
+  es: Marcadores
+  pt-BR: Favoritos
+  ja: ブックマーク
 bookmarks.tip:
   en: "Bookmark the folders and files you keep coming back to. Right-click the header for more options."
   zh-TW: "把常去的資料夾和檔案加到書籤。右鍵點標題有更多選項。"
   zh-CN: "把常去的文件夹和文件加到书签。右键点标题有更多选项。"
+  de: "Lesezeichen für Ordner und Dateien, zu denen du immer wieder zurückkehrst. Rechtsklick auf die Überschrift zeigt weitere Optionen."
+  es: "Marca las carpetas y archivos a los que vuelves siempre. Haz clic derecho en el encabezado para ver más opciones."
+  pt-BR: "Adicione aos favoritos as pastas e arquivos que você sempre visita. Clique com o botão direito no cabeçalho para mais opções."
+  ja: "よく使うフォルダーとファイルをブックマークします。ヘッダーを右クリックすると、さらにオプションが表示されます。"
 bookmarks.empty:
   en: "No bookmarks yet"
   zh-TW: "還沒有書籤"
   zh-CN: "还没有书签"
+  de: Noch keine Lesezeichen
+  es: Aún no hay marcadores
+  pt-BR: Ainda não há favoritos
+  ja: ブックマークはまだありません
 bookmarks.add_current:
   en: "Bookmark this folder"
   zh-TW: "把這個資料夾加入書籤"
   zh-CN: "把这个文件夹加入书签"
+  de: Diesen Ordner als Lesezeichen speichern
+  es: Marcar esta carpeta
+  pt-BR: Adicionar esta pasta aos favoritos
+  ja: このフォルダーをブックマークする
 bookmarks.new_group:
   en: "New group"
   zh-TW: "新增群組"
   zh-CN: "新建分组"
+  de: Neue Gruppe
+  es: Nuevo grupo
+  pt-BR: Novo grupo
+  ja: 新しいグループ
 bookmarks.open:
   en: Open
   zh-TW: 開啟
   zh-CN: 打开
+  de: Öffnen
+  es: Abrir
+  pt-BR: Abrir
+  ja: 開く
 bookmarks.rename:
   en: Rename
   zh-TW: 重新命名
   zh-CN: 重命名
+  de: Umbenennen
+  es: Cambiar nombre
+  pt-BR: Renomear
+  ja: 名前を変更
 bookmarks.delete:
   en: Delete
   zh-TW: 刪除
   zh-CN: 删除
+  de: Löschen
+  es: Eliminar
+  pt-BR: Excluir
+  ja: 削除
 bookmarks.rename_group:
   en: "Rename group"
   zh-TW: "重新命名群組"
   zh-CN: "重命名分组"
+  de: "Gruppe umbenennen"
+  es: "Cambiar nombre del grupo"
+  pt-BR: "Renomear grupo"
+  ja: "グループの名前を変更"
 bookmarks.delete_group:
   en: "Delete group"
   zh-TW: "刪除群組"
   zh-CN: "删除分组"
+  de: "Gruppe löschen"
+  es: "Eliminar grupo"
+  pt-BR: "Excluir grupo"
+  ja: "グループを削除"
 bookmarks.move_group_up:
   en: "Move group up"
   zh-TW: "群組上移"
   zh-CN: "分组上移"
+  de: "Gruppe nach oben verschieben"
+  es: "Mover grupo hacia arriba"
+  pt-BR: "Mover grupo para cima"
+  ja: "グループを上に移動"
 bookmarks.move_group_down:
   en: "Move group down"
   zh-TW: "群組下移"
   zh-CN: "分组下移"
+  de: "Gruppe nach unten verschieben"
+  es: "Mover grupo hacia abajo"
+  pt-BR: "Mover grupo para baixo"
+  ja: "グループを下に移動"
 bookmarks.move_to_group:
   en: "Move to %{name}"
   zh-TW: "移動到 %{name}"
   zh-CN: "移动到 %{name}"
+  de: "Nach %{name} verschieben"
+  es: "Mover a %{name}"
+  pt-BR: "Mover para %{name}"
+  ja: "%{name} に移動"
 bookmarks.move_to_ungrouped:
   en: "Move to Ungrouped"
   zh-TW: "移動到未分組"
   zh-CN: "移动到未分组"
+  de: "In „Ungruppiert“ verschieben"
+  es: "Mover a Sin grupo"
+  pt-BR: "Mover para Sem grupo"
+  ja: "未分類に移動"
 bookmarks.move_up:
   en: "Move up"
   zh-TW: 上移
   zh-CN: 上移
+  de: Nach oben verschieben
+  es: Mover hacia arriba
+  pt-BR: Mover para cima
+  ja: 上に移動
 bookmarks.move_down:
   en: "Move down"
   zh-TW: 下移
   zh-CN: 下移
+  de: Nach unten verschieben
+  es: Mover hacia abajo
+  pt-BR: Mover para baixo
+  ja: 下に移動
 bookmarks.missing:
   en: "No longer at %{path}"
   zh-TW: "已不在 %{path}"
   zh-CN: "已不在 %{path}"
+  de: "Nicht mehr unter %{path}"
+  es: "Ya no está en %{path}"
+  pt-BR: "Não está mais em %{path}"
+  ja: "%{path} にはもうありません"
 bookmarks.missing_short:
   en: Missing
   zh-TW: 找不到
   zh-CN: 找不到
+  de: Fehlt
+  es: No disponible
+  pt-BR: Ausente
+  ja: 見つかりません
 bookmarks.added_one:
   en: "Added 1 bookmark"
   zh-TW: "已加入 1 個書籤"
   zh-CN: "已加入 1 个书签"
+  de: "1 Lesezeichen hinzugefügt"
+  es: "Se añadió 1 marcador"
+  pt-BR: "1 favorito adicionado"
+  ja: "1 件のブックマークを追加しました"
 bookmarks.added_other:
   en: "Added %{count} bookmarks"
   zh-TW: "已加入 %{count} 個書籤"
   zh-CN: "已加入 %{count} 个书签"
+  de: "%{count} Lesezeichen hinzugefügt"
+  es: "Se añadieron %{count} marcadores"
+  pt-BR: "%{count} favoritos adicionados"
+  ja: "%{count} 件のブックマークを追加しました"
 bookmarks.already_one:
   en: "Already bookmarked"
   zh-TW: "已經在書籤中"
   zh-CN: "已经在书签中"
+  de: Bereits als Lesezeichen gespeichert
+  es: Ya está en marcadores
+  pt-BR: Já está nos favoritos
+  ja: すでにブックマーク済みです
 bookmarks.already_other:
   en: "All %{count} are already bookmarked"
   zh-TW: "這 %{count} 個項目都已經在書籤中"
   zh-CN: "这 %{count} 个项目都已经在书签中"
+  de: "Alle %{count} sind bereits Lesezeichen"
+  es: "Los %{count} ya están en marcadores"
+  pt-BR: "Todos os %{count} já estão nos favoritos"
+  ja: "%{count} 件すべてブックマーク済みです"
 bookmarks.name_empty:
   en: "Type a name first"
   zh-TW: "請先輸入名稱"
   zh-CN: "请先输入名称"
+  de: Zuerst einen Namen eingeben
+  es: Escribe un nombre primero
+  pt-BR: Digite um nome primeiro
+  ja: まず名前を入力してください
 bookmarks.name_taken:
   en: "That name is already used"
   zh-TW: "這個名稱已經有人用了"
   zh-CN: "这个名称已经被占用了"
+  de: Dieser Name ist bereits vergeben
+  es: Ese nombre ya está en uso
+  pt-BR: Esse nome já está em uso
+  ja: その名前はすでに使われています
 
 # ─── Screen reader names (read out, never shown)
 a11y.sidebar:

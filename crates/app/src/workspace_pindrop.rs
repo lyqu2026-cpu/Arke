@@ -38,6 +38,9 @@ struct PinDrop {
     at: Point<Pixels>,
     /// A drag that can add a favorite is over the tiles: they show the "Add to favorites" slot.
     over_tiles: bool,
+    /// The drag carries a file (fork: files can be favorites too): the insertion mark alone
+    /// doesn't say it is added, so the "Add to favorites" slot stays beside the mark.
+    carries_file: bool,
     /// The item the cursor is over and which side of it gets the insertion mark.
     mark: Option<Mark>,
 }
@@ -137,6 +140,11 @@ fn over_tiles(cx: &App) -> bool {
     cx.try_global::<PinDrop>().is_some_and(|s| s.over_tiles)
 }
 
+/// Whether the drag over the favorites carries a file (see `PinDrop::carries_file`).
+fn drag_carries_file(cx: &App) -> bool {
+    cx.try_global::<PinDrop>().is_some_and(|s| s.carries_file)
+}
+
 /// The drag card's line over the favorites (the tiles or the list): what dropping there does.
 pub(crate) fn action_label() -> SharedString {
     t!("sidebar.add_favorite").into_owned().into()
@@ -146,6 +154,12 @@ pub(crate) fn action_label() -> SharedString {
 /// otherwise whether only the item edges insert (`true`, folders that could also drop into it).
 pub(super) trait PinDrag: 'static {
     fn edges(&self, ws: &Workspace, cx: &App) -> Option<bool>;
+
+    /// Whether the drag carries a file (fork: files can be favorites too). Only the mark
+    /// doesn't say a file is added, so the slot stays beside it.
+    fn carries_file(&self, _cx: &App) -> bool {
+        false
+    }
 }
 
 impl PinDrag for DraggedTab {
@@ -158,6 +172,13 @@ impl PinDrag for DraggedFiles {
     fn edges(&self, _: &Workspace, cx: &App) -> Option<bool> {
         // Files and folders alike can be favorites; shelf items stay on the shelf.
         (self.shelf.is_none() && !self.paths(cx).is_empty()).then_some(true)
+    }
+
+    fn carries_file(&self, cx: &App) -> bool {
+        // The fork's file/folder call for a favorite is its extension, as in `favorite_kind`.
+        self.paths(cx)
+            .iter()
+            .any(|p| super::sidebar::favorite_kind(p).is_some())
     }
 }
 
@@ -199,6 +220,7 @@ impl Workspace {
         if !b.contains(&pos) {
             return;
         }
+        cx.default_global::<PinDrop>().carries_file = e.drag(cx).carries_file(cx);
         let slot = e.drag(cx).edges(self, cx).and_then(|edges| {
             let (start, len, at) = match area {
                 PinArea::Tiles => (b.left(), b.size.width, pos.x),
@@ -242,6 +264,7 @@ impl Workspace {
             state.over_tiles = over;
             cx.notify();
         }
+        state.carries_file = over && e.drag(cx).carries_file(cx);
     }
 
     /// Adds `paths` at `slot`, in order.
@@ -348,9 +371,12 @@ impl Workspace {
         layout: super::sidebar::TileLayout,
         cx: &mut Context<Self>,
     ) -> Option<(AnyElement, bool)> {
-        // One sign at a time: at a tile's edge the insertion mark says where it goes.
-        let marked =
-            self.pin_shown.is_some() && self.pin_mark.is_some_and(|m| m.area == PinArea::Tiles);
+        // One sign at a time: at a tile's edge the insertion mark says where it goes — unless
+        // the drag carries a file, which the mark alone doesn't say is added as a favorite
+        // (a file can also drop into the folder), so the slot stays beside the mark.
+        let marked = self.pin_shown.is_some()
+            && self.pin_mark.is_some_and(|m| m.area == PinArea::Tiles)
+            && !drag_carries_file(cx);
         // A favorite dragged from the list: the tiles show it can go up there from the start of
         // the drag, not only once it is over them (it becomes a tile on entering one).
         // Only one that started in the list: a tile dragged down into the list leaves the tiles

@@ -977,6 +977,8 @@ const FOLDER_TAIL: [&str; 5] = [
 /// A favorite has the same menu wherever it is, in the same order: a tile and a list row differ
 /// only in where "Move" sends it, Home words that row for its own page, a folder that is no
 /// favorite has the same rows without it, and Ctrl+click shows on "Open in new tab".
+/// (Fork: every favorite menu also has a "New group" row after "Move" — creating a group
+/// lives only in this menu, so it shows even when no group exists yet.)
 #[gpui::test]
 fn folder_menus_match_wherever_the_folder_is(cx: &mut TestAppContext) {
     let (ws, cx) = window(cx);
@@ -1007,6 +1009,7 @@ fn folder_menus_match_wherever_the_folder_is(cx: &mut TestAppContext) {
     let tile = with(&[
         "sidebar.remove_favorite",
         "sidebar.move_to_list",
+        "bookmarks.new_group",
         "menu.rename",
     ]);
     assert_eq!(menu(&ws, cx, p("a"), None, false), tile, "a tile");
@@ -1015,6 +1018,7 @@ fn folder_menus_match_wherever_the_folder_is(cx: &mut TestAppContext) {
         with(&[
             "sidebar.remove_favorite",
             "sidebar.move_to_tiles",
+            "bookmarks.new_group",
             "menu.rename",
         ]),
         "a list row"
@@ -1024,6 +1028,7 @@ fn folder_menus_match_wherever_the_folder_is(cx: &mut TestAppContext) {
         with(&[
             "sidebar.remove_favorite",
             "home.move_to_sidebar_list",
+            "bookmarks.new_group",
             "menu.rename",
         ]),
         "a card on Home, which has no list below"
