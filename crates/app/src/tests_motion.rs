@@ -36,6 +36,18 @@ fn menu_state(view: &Entity<Explorer>, cx: &mut VisualTestContext) -> (bool, boo
     })
 }
 
+/// The Menu key opens the context menu like Shift+F10: it's the key most keyboard and screen
+/// reader users press (#322).
+#[gpui::test]
+fn the_menu_key_opens_the_context_menu(cx: &mut TestAppContext) {
+    let fs = FakeFs::new();
+    fs.insert_dir(r"C:\m", vec![file("a.txt", 1)]);
+    let (view, cx) = setup(cx, fs, Arc::default(), r"C:\m");
+    wait_until(cx, &view, "load", loaded(r"C:\m"));
+    cx.simulate_keystrokes("home menu");
+    assert!(menu_state(&view, cx).0, "the menu is open");
+}
+
 /// Escape fades the context menu out (it is closed for everything else at once); a new menu
 /// replaces the ghost; running a command closes it without one.
 #[gpui::test]
@@ -149,6 +161,46 @@ fn view_options_flyout_fades_out(cx: &mut TestAppContext) {
     assert_eq!(state(cx), (true, false));
     toggle(cx);
     assert_eq!(state(cx), (false, true));
+    toggle(cx);
+    assert_eq!(state(cx), (true, false), "reopened: the ghost is dropped");
+    toggle(cx);
+    after_exit(cx);
+    assert_eq!(state(cx), (false, false));
+}
+
+/// The operation center's list fades out when its button closes it, and reopening during the
+/// fade shows the live list only.
+#[gpui::test]
+fn op_center_list_fades_out(cx: &mut TestAppContext) {
+    let _motion = Motion::on();
+    let fs = FakeFs::new();
+    fs.insert_dir(r"C:\o", vec![file("a.txt", 1)]);
+    let (view, cx) = setup(cx, fs, Arc::default(), r"C:\o");
+    wait_until(cx, &view, "load", loaded(r"C:\o"));
+    cx.update(|_, cx| {
+        let (id, _) = crate::op_center::OpCenter::begin(cx, "copy", None);
+        crate::op_center::OpCenter::finish::<String>(
+            cx,
+            id,
+            "copy",
+            &Ok(crate::shell::OpOutcome::Done),
+        );
+    });
+    let toggle = |cx: &mut VisualTestContext| {
+        cx.update(|window, _| window.refresh());
+        cx.run_until_parked();
+        let bounds = cx
+            .debug_bounds("op-center")
+            .expect("the operation center button is drawn");
+        cx.simulate_click(bounds.center(), gpui::Modifiers::none());
+        cx.run_until_parked();
+    };
+    let state =
+        |cx: &mut VisualTestContext| view.update(cx, |v, _| (v.ops_open, v.closing_ops.is_some()));
+    toggle(cx);
+    assert_eq!(state(cx), (true, false));
+    toggle(cx);
+    assert_eq!(state(cx), (false, true), "closed at once, still fading out");
     toggle(cx);
     assert_eq!(state(cx), (true, false), "reopened: the ghost is dropped");
     toggle(cx);

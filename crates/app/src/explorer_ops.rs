@@ -30,6 +30,10 @@ actions!(
         DeleteFiles,
         DeletePermanently,
         RenameFile,
+        /// Tab in the rename box: commits and renames the next item.
+        RenameNext,
+        /// Shift+Tab in the rename box: commits and renames the previous item.
+        RenamePrev,
         NewFolder,
         UndoFileOp,
         RedoFileOp,
@@ -55,6 +59,10 @@ pub(crate) fn bind_keys(cx: &mut App) {
         // redoes nothing there either.
         KeyBinding::new("ctrl-y", gpui::NoAction, Some("TextInput")),
         KeyBinding::new("ctrl-shift-z", gpui::NoAction, Some("TextInput")),
+        // In the rename box they go on to the next or previous item as in File Explorer, instead of
+        // the list's Tab, which switches panes (#310).
+        KeyBinding::new("tab", RenameNext, Some("RenameBox")),
+        KeyBinding::new("shift-tab", RenamePrev, Some("RenameBox")),
     ]);
 }
 
@@ -248,8 +256,6 @@ pub(crate) struct OpFollowUp {
     deleted: Option<(Vec<Arc<str>>, usize)>,
     /// How to undo this operation (whatever completed, including before a cancel).
     undo: Option<Undo>,
-    /// This was an undo: the original operation and item count, for the "undone" toast.
-    undid: Option<(&'static str, usize)>,
     /// Job id in the progress center, if listed there.
     job: Option<u64>,
     /// Say what happened once it's done, with an Undo button (quiet operations otherwise only
@@ -313,21 +319,19 @@ pub(crate) struct PendingCreate {
     row: Option<Arc<str>>,
 }
 
-/// Short "done" notice with Undo for operations whose result is easy to miss: recycled items
-/// leave the list, and moved items disappear into the new folder.
+/// Short "done" notice with Undo for the one operation whose slip needs an immediate way back:
+/// deleting by mistake. Every other finished operation stays quiet and is listed in the
+/// operation center.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Announce {
     /// Moved to the Recycle Bin, with the item count.
     Recycled(usize),
-    /// Moved into a new folder ("Move to new folder"), with the item count.
-    MovedToNewFolder(usize),
 }
 
 impl Announce {
     pub(crate) fn text(self) -> String {
         match self {
             Self::Recycled(count) => tn!("notice.recycled", count).into_owned(),
-            Self::MovedToNewFolder(count) => tn!("notice.moved_to_new_folder", count).into_owned(),
         }
     }
 }
@@ -540,6 +544,7 @@ pub(crate) fn retry_of(op: &FileOp, error: &ShellError) -> Option<FileOp> {
                 FailReason::BadName
                     | FailReason::BadNameInside
                     | FailReason::NoRecycleBin
+                    | FailReason::TooBigForBin
                     | FailReason::PathTooLong
                     | FailReason::Gone
             )
@@ -551,6 +556,11 @@ pub(crate) fn retry_of(op: &FileOp, error: &ShellError) -> Option<FileOp> {
         paths,
         recycle: *recycle,
     })
+}
+
+/// An item a recycle kept back because it is too big for the Recycle Bin.
+fn too_big(failure: &crate::shell::ItemFailure) -> bool {
+    failure.reason == arke_core::failure::FailReason::TooBigForBin
 }
 
 /// Top-level paths an operation removed from where they were: deleted or moved away, minus those
@@ -770,7 +780,7 @@ impl Explorer {
         &mut self,
         result: Result<u32, crate::shell::ShellError>,
         cut: bool,
-        count: usize,
+        _count: usize,
         parent: PathBuf,
         names: HashSet<Arc<str>>,
         cx: &mut Context<Self>,
@@ -780,11 +790,7 @@ impl Explorer {
                 if cut {
                     cx.set_global(CutMarks { seq, parent, names });
                 }
-                self.notice = Some(if cut {
-                    tn!("clip.cut", count).into_owned()
-                } else {
-                    tn!("clip.copied", count).into_owned()
-                });
+                // No toast: cut items are drawn faded, and copying changes nothing to look at.
             }
             Err(e) => self.error = Some(t!("clip.failed", error = e).into_owned()),
         }
@@ -1062,7 +1068,14 @@ impl Explorer {
             (paths, Vec::new())
         };
         if !no_bin.is_empty() {
-            self.ask_no_recycle_bin(paths, no_bin, follow, window, cx);
+            self.ask_no_recycle_bin(
+                paths,
+                no_bin,
+                super::confirm::NoBinWhy::NoBin,
+                follow,
+                window,
+                cx,
+            );
         } else if !recycle {
             self.ask_delete_permanently(paths, follow, window, cx);
         } else if ask {
@@ -1156,9 +1169,13 @@ impl Explorer {
         else {
             return;
         };
-        // Nested tree rows are named by their relative path; only the file name is edited.
-        let leaf = arke_core::tree::leaf(&name);
-        let range = if fresh {
+        // Nested tree rows are named by their relative path; only the file name is edited. A
+        // folder named by its desktop.ini is renamed by that name, as in File Explorer (#370).
+        let leaf = entry
+            .shown
+            .as_deref()
+            .unwrap_or_else(|| arke_core::tree::leaf(&name));
+        let range = if fresh || entry.shown.is_some() {
             0..leaf.len()
         } else {
             arke_core::path::rename_selection(leaf, entry.is_dir_like())
@@ -1225,17 +1242,89 @@ impl Explorer {
         }
     }
 
-    fn commit_rename(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(mut renaming) = self.renaming.take() else {
+    /// Tab and Shift+Tab in the rename box: commits this name and starts renaming the item after
+    /// (before) it in the list, in the order shown. At the last (first) item it only commits, and
+    /// when the name is refused (a problem under the box, or the extension question) it stays
+    /// here. A multi-item rename names all its items at once, so it only commits.
+    pub(super) fn rename_next(
+        &mut self,
+        _: &RenameNext,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.rename_step(true, window, cx);
+    }
+
+    pub(super) fn rename_prev(
+        &mut self,
+        _: &RenamePrev,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.rename_step(false, window, cx);
+    }
+
+    fn rename_step(&mut self, forward: bool, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(renaming) = self.renaming.as_ref() else {
             return;
+        };
+        let next = if renaming.batch.len() > 1 {
+            None
+        } else {
+            self.neighbor_in_view(&renaming.name, forward)
+        };
+        let committed = self.commit_rename_inner(next.is_some(), window, cx);
+        if committed && let Some(next) = next {
+            self.start_rename(next, window, cx);
+        }
+    }
+
+    /// The name of the item next to `name` in the list shown.
+    fn neighbor_in_view(&self, name: &str, forward: bool) -> Option<Arc<str>> {
+        let view = self.view()?;
+        let ix = view.iter().position(|e| &*e.name == name)?;
+        let next = if forward { ix + 1 } else { ix.checked_sub(1)? };
+        view.get(next).map(|e| Arc::clone(&e.name))
+    }
+
+    fn commit_rename(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.commit_rename_inner(false, window, cx);
+    }
+
+    /// Commits the rename in progress. `moving_on`: another item is renamed next, so the renamed
+    /// one isn't selected afterwards, which would take the selection from it. Returns whether the
+    /// name was taken (sent, or left as it was); `false` when the box stays open or waits for
+    /// the extension question.
+    fn commit_rename_inner(
+        &mut self,
+        moving_on: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let Some(mut renaming) = self.renaming.take() else {
+            return false;
         };
         let typed = renaming.input.read(cx).text().to_owned();
         let new_name = typed.trim().to_owned();
+        if renaming.batch.len() <= 1
+            && let Some(shown) = self.view().and_then(|v| {
+                v.iter()
+                    .find(|e| e.name == renaming.name)
+                    .and_then(|e| e.shown.clone())
+            })
+        {
+            window.focus(&self.list_focus, cx);
+            if !new_name.is_empty() && new_name != *shown {
+                self.rename_shown(Arc::clone(&renaming.name), new_name, cx);
+            }
+            cx.notify();
+            return true;
+        }
         let old_leaf = arke_core::tree::leaf(&renaming.name);
         if new_name.is_empty() || new_name == old_leaf {
             window.focus(&self.list_focus, cx);
             cx.notify();
-            return;
+            return true;
         }
         if let Some(problem) = commit_problem(&typed) {
             // Invalid name: stay in edit mode so it can be fixed, with the reason next to the box
@@ -1245,26 +1334,31 @@ impl Explorer {
             self.renaming = Some(renaming);
             window.focus(&focus, cx);
             cx.notify();
-            return;
+            return false;
         }
         window.focus(&self.list_focus, cx);
         let Some(dir) = self.current_path().map(PathBuf::from) else {
-            return;
+            return false;
         };
         if renaming.batch.len() > 1 {
             self.commit_batch_rename(&dir, &renaming, &new_name, cx);
-            return;
+            return true;
         }
         // The renamed row keeps its place in the tree.
         let new_name_arc =
             arke_core::tree::join(arke_core::tree::parent(&renaming.name), &new_name);
         // Point the selection at the new name first so it gets selected when the watcher reports
         // it.
-        self.selection.select_name(Arc::clone(&new_name_arc));
-        self.scroll_to_cursor = Some(ScrollStrategy::Nearest);
+        let select = if moving_on {
+            Vec::new()
+        } else {
+            self.selection.select_name(Arc::clone(&new_name_arc));
+            self.scroll_to_cursor = Some(ScrollStrategy::Nearest);
+            vec![new_name_arc]
+        };
         let follow = OpFollowUp {
             dest: Some(dir.clone()),
-            select: vec![new_name_arc],
+            select,
             ..OpFollowUp::default()
         };
         let path = dir.join(&*renaming.name);
@@ -1285,9 +1379,10 @@ impl Explorer {
         let asked = renaming.fresh;
         if is_file && warn && !asked && super::confirm::extension_changed(old_leaf, &new_name) {
             self.ask_extension_change(path, new_name, follow, window, cx);
-            return;
+            return false;
         }
         self.run_op(FileOp::Rename { path, new_name }, follow, cx);
+        true
     }
 
     /// Multi-item rename like Explorer: the typed name minus extension becomes the stem, and items
@@ -1520,7 +1615,6 @@ impl Explorer {
             dest: Some(parent.clone()),
             select: vec![Arc::clone(&name_arc)],
             rename: Some((name_arc, false)),
-            announce: Some(Announce::MovedToNewFolder(sources.len())),
             ..OpFollowUp::default()
         };
         let create = FileOp::NewFolder {
@@ -1652,7 +1746,6 @@ impl Explorer {
         let follow = OpFollowUp {
             dest: entry.undo.target_dir().map(Path::to_path_buf),
             select,
-            undid: Some((entry.verb, entry.undo.len())),
             redo: entry.redo.clone().map(|op| Box::new((entry.verb, op))),
             ..OpFollowUp::default()
         };
@@ -1771,6 +1864,10 @@ impl Explorer {
         cx.notify();
     }
 
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one place that settles every finished operation, outcome by outcome"
+    )]
     pub(super) fn handle_op_finished(
         &mut self,
         verb: &'static str,
@@ -1805,9 +1902,6 @@ impl Explorer {
         if let (Some(job), Some(undo)) = (follow.job, undo_id) {
             crate::op_center::OpCenter::set_undo(cx, job, undo);
         }
-        if let (Some((original, count)), Ok(OpOutcome::Done)) = (follow.undid, &result) {
-            self.notice = Some(tn!("undo.done", count, op = t!(original)).into_owned());
-        }
         // Undone completely: Ctrl+Y can redo it.
         if let (Some(redo), Ok(OpOutcome::Done)) = (follow.redo.clone(), &result) {
             let (original, op) = *redo;
@@ -1815,12 +1909,6 @@ impl Explorer {
             if let Some(job) = follow.job {
                 crate::op_center::OpCenter::set_redo(cx, job, redo_id);
             }
-        }
-        if let (Some(original), Ok(OpOutcome::Done)) = (follow.redone, &result) {
-            self.notice = Some(t!("redo.done", op = t!(original)).into_owned());
-        }
-        if follow.handed_off && result.is_ok() {
-            self.notice = Some(t!("teracopy.handed_off").into_owned());
         }
         if let (Some(announce), Ok(OpOutcome::Done)) = (follow.announce, &result) {
             let text = announce.text();
@@ -1856,7 +1944,33 @@ impl Explorer {
         if let Some(op) = follow.op.as_deref() {
             self.forget_search_hits(&removed_paths(op, &result), cx);
         }
+        let recycled = matches!(
+            follow.op.as_deref(),
+            Some(FileOp::Delete { recycle: true, .. })
+        );
         match result {
+            // Too big for the Recycle Bin: kept, and Arke asks about deleting them permanently
+            // (instead of the error toast); other failures still show theirs.
+            Err(ShellError::Items { failed }) if recycled && failed.iter().any(too_big) => {
+                let (big, rest): (Vec<_>, Vec<_>) = failed.into_iter().partition(too_big);
+                let purge_follow = OpFollowUp {
+                    dest: follow.dest.clone(),
+                    deleted: follow.deleted.clone(),
+                    ..OpFollowUp::default()
+                };
+                let big = big.into_iter().map(|f| f.path);
+                match &mut self.too_big_ask {
+                    // Another recycle's are still waiting: ask about all of them at once.
+                    Some((waiting, _)) => waiting.extend(big),
+                    None => self.too_big_ask = Some((big.collect(), purge_follow)),
+                }
+                if rest.is_empty() {
+                    self.scroll_to_cursor = None;
+                } else {
+                    let rest = ShellError::Items { failed: rest };
+                    self.show_op_failure(verb, &rest, follow.op.as_deref(), follow.job, cx);
+                }
+            }
             Err(e) => self.show_op_failure(verb, &e, follow.op.as_deref(), follow.job, cx),
             Ok(OpOutcome::Cancelled) => {
                 self.scroll_to_cursor = None;

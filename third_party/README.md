@@ -91,3 +91,51 @@ Zed's Windows platform crate (Apache-2.0), unchanged except for:
   click dropped it. Capture moving to a window of the same thread (menus, OLE drag and drop, the
   move loop) is left alone. Arke's `crates/app/src/press_guard.rs` sends the same release when a
   move or press shows a button is up, and treats `click_count` 0 as "cancelled".
+- Window classes and the integration API (`src/window.rs` `WINDOW_CLASS_NAME`, `POPUP_CLASS_NAME`,
+  `window_class_for`, `register_window_class`, `set_copydata_handler`, `answer_copydata`,
+  `window_procedure`; `src/gpui_windows.rs` exports). Upstream registers every window as
+  `Zed::Window`. Normal windows are now `ArkeWindow`, the class other programs find Arke by
+  (`ahk_class ArkeWindow`), and every other kind (menus, tooltips, dialogs) is
+  `ArkeWindow.Popup`, so such a search never lands on a menu. The window procedure answers
+  `WM_COPYDATA` tagged `COPYDATA_ID` ("ARKE") through the handler the app sets: it gets the
+  request bytes, and its reply goes straight back to the sender's window (`wParam`) as a
+  `WM_COPYDATA` with the same tag (`SendMessageTimeoutW`, so a hung sender can't hang Arke)
+  before the message returns `TRUE`. This runs before the window state is looked at, and the
+  handler must not touch GPUI (Arke answers from a snapshot, see `crates/app/src/api.rs` and
+  `docs/integration.md`). Other `WM_COPYDATA` messages get the default handling. (#193)
+- `src/direct_write.rs` `get_name`: a font with no name in the UI locale or in en-us (a Chinese
+  font named only in zh-TW, on a zh-CN system) takes its first name instead of failing, so it is
+  no longer left out of the font list with a "No localised string" error per font. (#343)
+- `src/window.rs` `begin_modal_drag`, `DispatchingInput` and `on_input`, and `src/events.rs`
+  `handle_hit_test_msg`: while an input callback runs (the app is borrowed then) or while Arke runs
+  Windows' modal drag loop, `WM_NCHITTEST` doesn't ask the app where the window controls are.
+  Asking could only fail: during a drag out of Arke it logged a "RefCell already borrowed" error on
+  every mouse move. Arke's `crates/app/src/win_fileops.rs` `drag_out` holds the drag guard; the
+  input count is kept by the wrapper `on_input` puts around the callback. (#338, #343)
+
+## gpui-pre 0.3.11
+
+Zed's GPUI (Apache-2.0), unchanged except for:
+
+- `src/elements/div.rs` `a11y_click_listeners` and the accessibility block of `Interactivity::paint`:
+  an assistive technology's Click on an element with click listeners runs them, as Enter on the
+  focused element does (`ClickEvent::Keyboard`). Upstream, Click falls back to a synthetic mouse
+  click at the element's position: a button scrolled out of view (the sidebar's "Add network
+  location…" in a short window, a Settings button below the fold) couldn't be pressed with a
+  screen reader, and the click could land on whatever was drawn there instead. Elements that
+  handle Click themselves (`on_a11y_action`) are left alone. (#322)
+
+The test platform, which only builds with the `test-support` feature:
+
+- `src/platform/test/window.rs`: `TestWindow` keeps the accessibility callbacks `a11y_init` is
+  given (upstream it ignores them, so a test window never builds an accessibility tree), and adds
+  `simulate_a11y_activation`, `simulate_a11y_deactivation` and `simulate_a11y_action`.
+- `src/app/test_context.rs`: `TestAppContext::simulate_window_a11y_activation` and
+  `simulate_window_a11y_action`, and `VisualTestContext::simulate_a11y_activation` and
+  `simulate_a11y_action`, which run until parked.
+
+With them, tests read what a screen reader is given through `Window::debug_a11y_tree_json`
+(`crates/app/src/tests_a11y.rs`, #322).
+
+The `examples`, `tests` and `benches` folders and their
+`Cargo.toml` entries are left out. Offered upstream; drop this copy once a gpui-pre has it.

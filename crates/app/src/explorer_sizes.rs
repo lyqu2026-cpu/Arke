@@ -391,7 +391,28 @@ impl Explorer {
             return;
         }
         let names: Vec<Arc<str>> = if self.sort.uses(arke_core::SortColumn::Size) {
-            self.folder_sizes.waiting.keys().cloned().collect()
+            // In the list's order (the worker takes one at a time): a map's order was random, so
+            // a slow folder could come first and hold up the rest at random.
+            let in_list: Vec<Arc<str>> = self.model.as_ref().map_or_default(|m| {
+                m.entries
+                    .iter()
+                    .filter(|e| self.folder_sizes.waiting.contains_key(&e.name))
+                    .map(|e| Arc::clone(&e.name))
+                    .collect()
+            });
+            // Anything waiting that the listing no longer has goes last.
+            let listed: std::collections::HashSet<&Arc<str>> = in_list.iter().collect();
+            let rest: Vec<Arc<str>> = self
+                .folder_sizes
+                .waiting
+                .keys()
+                .filter(|n| !listed.contains(n))
+                .cloned()
+                .collect();
+            drop(listed);
+            let mut names = in_list;
+            names.extend(rest);
+            names
         } else if self.selection.len() > super::view::SIZE_SUM_MAX {
             // No total is shown for that many.
             return;
@@ -627,6 +648,32 @@ impl Explorer {
     #[cfg(test)]
     pub(crate) fn folder_sizes_computing(&self) -> bool {
         self.folder_sizes.computing()
+    }
+
+    /// The folder sizes' bookkeeping, for a test that timed out waiting on them.
+    #[cfg(test)]
+    pub(crate) fn folder_sizes_state(&self) -> String {
+        let f = &self.folder_sizes;
+        let queue = f.queue.as_ref().map(|q| {
+            let (todo, running) = {
+                let t = q.todo.lock();
+                (
+                    t.0.iter().map(|x| Arc::clone(&x.0)).collect::<Vec<_>>(),
+                    t.1,
+                )
+            };
+            let cancel = q.cancel.load(Ordering::Relaxed);
+            format!("todo={todo:?} running={running} cancel={cancel}")
+        });
+        format!(
+            "dir={:?} sizes={:?} pending={:?} waiting={:?} stale={} queue={queue:?} rev={}",
+            f.dir,
+            f.sizes,
+            f.pending,
+            f.waiting.keys().collect::<Vec<_>>(),
+            f.stale,
+            f.rev
+        )
     }
 
     /// What the Size column shows for subfolder `name`.

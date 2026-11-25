@@ -27,17 +27,27 @@ use crate::shell::{
 };
 use crate::workspace::{CloseTab, NewTab, Workspace};
 
+#[path = "tests_a11y.rs"]
+mod a11y_tree;
+#[path = "tests_archive_password.rs"]
+mod archive_password;
 #[path = "tests_column_view.rs"]
 mod column_view;
+#[path = "tests_favorites.rs"]
+mod favorites;
 #[path = "tests_folder_views.rs"]
 mod folder_views;
 #[path = "tests_idle.rs"]
 mod idle;
+#[path = "tests_api.rs"]
+mod integration_api;
 #[path = "tests_lazy_submenus.rs"]
 mod lazy_submenus;
 #[cfg(windows)]
 #[path = "tests_live_recycle.rs"]
 mod live_recycle;
+#[path = "tests_menu_customize.rs"]
+mod menu_customize;
 #[path = "tests_menu_parts.rs"]
 mod menu_parts;
 #[path = "tests_motion.rs"]
@@ -48,6 +58,8 @@ mod place_names;
 mod popup_menus;
 #[path = "tests_preview_info.rs"]
 mod preview_info;
+#[path = "tests_preview_media.rs"]
+mod preview_media;
 #[path = "tests_preview_shelf.rs"]
 mod preview_shelf;
 #[path = "tests_properties_card.rs"]
@@ -56,12 +68,24 @@ mod properties_card;
 mod properties_window;
 #[path = "tests_quick_look.rs"]
 mod quick_look;
+#[path = "tests_quiet_toasts.rs"]
+mod quiet_toasts;
 #[path = "tests_quiet_update.rs"]
 mod quiet_update;
 #[path = "tests_remote.rs"]
 mod remote;
 #[path = "tests_scale.rs"]
 mod scale;
+#[path = "tests_sidebar_keys.rs"]
+mod sidebar_keys;
+#[path = "tests_sidebar_sections.rs"]
+mod sidebar_sections;
+#[path = "tests_sidebar_tree.rs"]
+mod sidebar_tree;
+#[path = "tests_small_behaviors.rs"]
+mod small_behaviors;
+#[path = "tests_sort_options.rs"]
+mod sort_options;
 #[path = "tests_stuck_drag.rs"]
 mod stuck_drag;
 #[path = "tests_tab_drag.rs"]
@@ -72,8 +96,14 @@ mod tabs;
 mod tests_columns;
 #[path = "tests_commands.rs"]
 mod tests_commands;
+#[path = "tests_home_favorites.rs"]
+mod tests_home_favorites;
+#[path = "tests_quick_access.rs"]
+mod tests_quick_access;
 #[path = "tests_text_input_menu.rs"]
 mod text_input_menu;
+#[path = "tests_too_big_for_bin.rs"]
+mod too_big_for_bin;
 #[path = "tests_top_bar.rs"]
 mod top_bar;
 #[path = "tests_views.rs"]
@@ -100,6 +130,8 @@ unsafe impl Sync for FakeClipboardData {}
 
 #[derive(Default)]
 struct FakeShell {
+    /// What Windows' Quick Access has pinned (`None`: unreadable).
+    quick_access: Mutex<Option<Vec<PathBuf>>>,
     opened: Mutex<Vec<PathBuf>>,
     /// The view order each `opened` file was opened in.
     opened_sorts: Mutex<Vec<Option<SortSpec>>>,
@@ -124,6 +156,16 @@ struct FakeShell {
     shell_sessions: std::sync::atomic::AtomicU64,
     /// While set, reading the whole Windows menu waits for a message on it (a slow menu).
     menu_gate: Mutex<Option<flume::Receiver<()>>>,
+    /// Whether each whole Windows menu read asked for Shift's extra commands.
+    menu_extended: Mutex<Vec<bool>>,
+    /// Packaged apps' commands: class id and the item types their manifest names.
+    packaged_types: Mutex<Vec<(String, Vec<String>)>>,
+    /// Items added at the end of the whole Windows menu.
+    extra_menu: Mutex<Vec<crate::shell::ShellMenuEntry>>,
+    /// While set, reading one source's menu waits for a message on it (a slow source).
+    part_gate: Mutex<Option<flume::Receiver<()>>>,
+    /// Submenus the whole menu says are still filling ([`crate::shell::ShellMenu::filling`]).
+    pub(crate) filling_menu: Mutex<Vec<(u32, String)>>,
     /// Context menu extensions and their menus, read on their own (sessions from 100).
     extensions: Mutex<
         Vec<(
@@ -133,6 +175,10 @@ struct FakeShell {
     >,
     /// Names of the extensions read on their own.
     extensions_read: Mutex<Vec<String>>,
+    /// Names of extensions whose menu comes back only partly read (#278).
+    partial_extensions: Mutex<Vec<String>>,
+    /// Whether the whole Windows menu comes back only partly read.
+    partial_menu: std::sync::atomic::AtomicBool,
     /// Submenus added to the end of the whole Windows menu empty, filled only when opened
     /// (lazy index is the position here): label and what filling it gives.
     lazy_submenus: Mutex<Vec<(String, Vec<crate::shell::ShellMenuEntry>)>>,
@@ -163,6 +209,8 @@ struct FakeShell {
     drag_returns: std::sync::atomic::AtomicBool,
     /// Another program's window is on top of Arke at the cursor.
     covered: std::sync::atomic::AtomicBool,
+    /// For each drag out, whether it was handed over after a lost press (`Shell::drag_out`).
+    dragged_out_after_lost_press: Mutex<Vec<bool>>,
     /// Extra places (e.g. Downloads pointing at a temp folder).
     extra_places: Mutex<Vec<Place>>,
     /// Drag images built (request, whether a cached thumbnail existed).
@@ -178,6 +226,8 @@ struct FakeShell {
     /// Windows' recent files list, newest first, and the limit Arke asked for.
     recent: Mutex<Vec<crate::home::RecentFile>>,
     recent_limit: Mutex<Option<usize>>,
+    /// Windows' "Show recently used files" is off.
+    recent_off: std::sync::atomic::AtomicBool,
     /// What the next file dialogs return (`None` is Cancel), and the requests they got.
     picks: Mutex<Vec<Option<PathBuf>>>,
     pick_requests: Mutex<Vec<crate::shell::PickRequest>>,
@@ -220,6 +270,10 @@ impl FakeShell {
 }
 
 impl Shell for FakeShell {
+    fn quick_access_pinned(&self) -> Option<Vec<PathBuf>> {
+        self.quick_access.lock().clone()
+    }
+
     fn load_places(&self) -> Vec<Place> {
         assert!(
             !arke_core::fs::is_ui_thread(),
@@ -282,9 +336,13 @@ impl Shell for FakeShell {
                     .collect(),
             )
         };
-        // Deletes that fail on some items: the rest go, and only they can be undone.
+        // Deletes that fail on some items: the rest go, and only they can be undone. Too big for
+        // the Recycle Bin only stops recycling them; deleting them permanently works.
         if let FileOp::Delete { paths, recycle } = op {
-            let failing = self.fail_delete.lock().clone();
+            let mut failing = self.fail_delete.lock().clone();
+            if !*recycle {
+                failing.retain(|(_, reason, _)| *reason != FailReason::TooBigForBin);
+            }
             let (bad, good): (Vec<PathBuf>, Vec<PathBuf>) = paths
                 .iter()
                 .cloned()
@@ -392,8 +450,12 @@ impl Shell for FakeShell {
         &self,
         paths: &[PathBuf],
         image: Option<&crate::shell::DragImage>,
+        after_lost_press: bool,
     ) -> Result<crate::shell::DragOutEnd, ShellError> {
         self.dragged_out.lock().push(paths.to_vec());
+        self.dragged_out_after_lost_press
+            .lock()
+            .push(after_lost_press);
         // Fake image: width holds the item count, pixels hold the path.
         self.dragged_images.lock().push(image.map(|i| {
             (
@@ -579,8 +641,10 @@ impl Shell for FakeShell {
         &self,
         paths: &[PathBuf],
         background: bool,
+        extended: bool,
     ) -> Result<crate::shell::ShellMenu, ShellError> {
         use crate::shell::ShellMenuEntry as E;
+        self.menu_extended.lock().push(extended);
         assert!(
             !arke_core::fs::is_ui_thread(),
             "shell menu read on the UI thread"
@@ -621,6 +685,7 @@ impl Shell for FakeShell {
             E::Separator,
             verb_item(5, "Copy", Some("Copy")),
         ];
+        entries.extend(self.extra_menu.lock().iter().cloned());
         entries.extend(
             self.lazy_submenus
                 .lock()
@@ -639,6 +704,8 @@ impl Shell for FakeShell {
                 .shell_sessions
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed),
             entries,
+            partial: self.partial_menu.load(std::sync::atomic::Ordering::Relaxed),
+            filling: self.filling_menu.lock().clone(),
         })
     }
 
@@ -682,6 +749,38 @@ impl Shell for FakeShell {
         self.shell_released.lock().push(session);
     }
 
+    fn shell_menu_kind(&self, _paths: &[PathBuf], background: bool) -> Option<String> {
+        assert!(!arke_core::fs::is_ui_thread());
+        Some(
+            if background {
+                r"Directory\Background"
+            } else {
+                ".txt"
+            }
+            .into(),
+        )
+    }
+
+    fn packaged_item_types(&self, clsid: &str) -> Vec<String> {
+        assert!(!arke_core::fs::is_ui_thread());
+        self.packaged_types
+            .lock()
+            .iter()
+            .filter(|(c, _)| c.eq_ignore_ascii_case(clsid))
+            .flat_map(|(_, t)| t.clone())
+            .collect()
+    }
+
+    fn packaged_commands(&self, kind: &str) -> Vec<String> {
+        assert!(!arke_core::fs::is_ui_thread());
+        self.packaged_types
+            .lock()
+            .iter()
+            .filter(|(_, types)| crate::win_menu_parts::kind_matches(types, kind))
+            .map(|(clsid, _)| clsid.clone())
+            .collect()
+    }
+
     fn shell_menu_handlers(
         &self,
         _paths: &[PathBuf],
@@ -700,10 +799,20 @@ impl Shell for FakeShell {
         &self,
         _paths: &[PathBuf],
         _background: bool,
+        _extended: bool,
         handler: &crate::win_menu_parts::MenuHandler,
         _group: u64,
     ) -> Result<(crate::shell::ShellMenu, Duration), ShellError> {
         assert!(!arke_core::fs::is_ui_thread());
+        // A source this shell doesn't have (Send To, asked for on every menu) answers at once,
+        // so a gated test's messages go to the sources it set up.
+        if !self.extensions.lock().iter().any(|(h, _)| h == handler) {
+            return Err(ShellError::Unsupported);
+        }
+        let gate = self.part_gate.lock().clone();
+        if let Some(gate) = gate {
+            let _ = gate.recv_timeout(Duration::from_secs(20));
+        }
         let extensions = self.extensions.lock();
         let at = extensions
             .iter()
@@ -714,6 +823,8 @@ impl Shell for FakeShell {
             crate::shell::ShellMenu {
                 session: 100 + at as u64,
                 entries: extensions[at].1.clone(),
+                partial: self.partial_extensions.lock().contains(&handler.name),
+                filling: Vec::new(),
             },
             Duration::from_millis(5),
         ))
@@ -918,6 +1029,14 @@ impl Shell for FakeShell {
             .lock()
             .push((dir.to_path_buf(), items.to_vec()));
         self.cloud.lock().clone()
+    }
+
+    fn recent_files_enabled(&self) -> bool {
+        assert!(
+            !arke_core::fs::is_ui_thread(),
+            "recent files setting read on the UI thread"
+        );
+        !self.recent_off.load(Ordering::Relaxed)
     }
 
     /// Returns the whole fake list, ignoring `limit`, so the page's own cap is tested too.
@@ -2026,6 +2145,7 @@ fn restores_last_session_tabs(cx: &mut TestAppContext) {
         crate::workspace::bind_keys(cx);
     });
     let session = Session {
+        workspace: None,
         tabs: vec![
             SessionTab {
                 panes: vec![PathBuf::from(r"C:\t")],
@@ -2107,6 +2227,7 @@ fn restores_home_from_the_last_session(cx: &mut TestAppContext) {
         crate::workspace::bind_keys(cx);
     });
     let session = Session {
+        workspace: None,
         tabs: vec![SessionTab {
             panes: vec![PathBuf::from(r"C:\t")],
             active_pane: 0,
@@ -2238,6 +2359,61 @@ fn dragging_over_a_window_on_top_of_arke_hands_off_to_windows(cx: &mut TestAppCo
         [vec![PathBuf::from(r"C:\o\b.txt")]]
     );
     cx.update(|_, cx| assert!(!cx.has_active_drag(), "Arke's own drag should have ended"));
+    assert!(shell.ops().is_empty(), "nothing moved inside Arke");
+}
+
+/// #326: Alt+Tab in the middle of a drag. Another program takes the mouse, and the window is told
+/// the press is over (our GPUI patch sends a release far outside): the files go to Windows drag
+/// and drop, which goes on across the switch. It is marked as handed over after a lost press, so
+/// it drops only once Windows has seen the button down (Arke can't tell from the background).
+/// A press lost before any drag started hands nothing over.
+#[gpui::test]
+fn alt_tab_mid_drag_hands_the_files_to_windows(cx: &mut TestAppContext) {
+    use gpui::{Modifiers, MouseButton, MouseUpEvent, point, px};
+    let fs = FakeFs::new();
+    fs.insert_dir(r"C:\o", vec![file("a.txt", 1), file("b.txt", 1)]);
+    let shell = Arc::new(FakeShell::default());
+    let (ws, cx) = setup_workspace_with(cx, fs, Arc::clone(&shell), r"C:\o");
+    let view = ws.update(cx, |ws, _| ws.active_view().clone());
+    wait_until(cx, &view, "load", loaded(r"C:\o"));
+    cx.run_until_parked();
+    let (bounds, row) = view.update(cx, |v, _| (v.list_bounds_for_test(), v.row_height()));
+    let start = point(bounds.left() + px(60.), bounds.top() + row * 1.5);
+    let lost = MouseUpEvent {
+        button: MouseButton::Left,
+        position: point(px(-100_000.), px(-100_000.)),
+        modifiers: Modifiers::none(),
+        click_count: 0,
+    };
+
+    // A press lost before it became a drag: nothing to hand over.
+    cx.simulate_mouse_down(start, MouseButton::Left, Modifiers::none());
+    cx.run_until_parked();
+    cx.simulate_event(lost.clone());
+    cx.run_until_parked();
+    assert!(shell.dragged_out.lock().is_empty(), "no drag yet");
+    cx.update(|_, cx| assert!(!cx.has_active_drag()));
+
+    // Alt+Tab mid-drag.
+    cx.simulate_mouse_down(start, MouseButton::Left, Modifiers::none());
+    cx.simulate_mouse_move(
+        start + point(px(30.), px(4.)),
+        Some(MouseButton::Left),
+        Modifiers::none(),
+    );
+    cx.run_until_parked();
+    wait_for_drag_image(cx);
+    cx.simulate_event(lost);
+    cx.run_until_parked();
+    assert_eq!(
+        *shell.dragged_out.lock(),
+        [vec![PathBuf::from(r"C:\o\b.txt")]]
+    );
+    assert_eq!(*shell.dragged_out_after_lost_press.lock(), [true]);
+    cx.update(|_, cx| {
+        assert!(!cx.has_active_drag());
+        assert!(!cx.has_global::<crate::explorer::DraggingOutside>());
+    });
     assert!(shell.ops().is_empty(), "nothing moved inside Arke");
 }
 
@@ -2634,6 +2810,10 @@ fn emptying_the_bin_shows_progress_and_can_be_cancelled(cx: &mut TestAppContext)
         purge_job(cx).map(|(state, ..)| state),
         Some(JobState::Running)
     );
+    // The progress toast waits a couple of seconds; a short delete is only in the operation center.
+    assert!(cx.debug_bounds("toast-ops-action-0").is_none(), "not yet");
+    cx.executor().advance_clock(crate::op_center::TOAST_DELAY);
+    cx.run_until_parked();
     assert!(cx.debug_bounds("toast-ops-action-0").is_some(), "Cancel");
 
     // One item goes; the bar moves (1 of 3).
@@ -2748,6 +2928,8 @@ fn reopening_the_bin_while_it_empties_keeps_it_busy(cx: &mut TestAppContext) {
     );
     let purging = t!("recycle.purging").into_owned();
     assert_eq!(page.update(cx, |p, cx| p.status_for_test(cx)), purging);
+    cx.executor().advance_clock(crate::op_center::TOAST_DELAY);
+    cx.run_until_parked();
     assert!(cx.debug_bounds("toast-ops-action-0").is_some(), "Cancel");
 
     for _ in 0..2 {
@@ -2989,7 +3171,9 @@ fn copy_cut_paste_through_clipboard(cx: &mut TestAppContext) {
             cut: false,
         })
     );
-    wait_until(cx, &view, "notice", |v| v.notice.is_some());
+    // Copying to the clipboard is quiet: nothing to look at, so no toast.
+    cx.run_until_parked();
+    assert_eq!(view.update(cx, |v, _| v.notice.clone()), None);
 
     view.update(cx, |v, cx| {
         v.navigate(PathBuf::from(r"C:\b"), NavKind::New, cx);
@@ -3179,6 +3363,28 @@ fn failed_delete_names_the_program_and_retries_only_what_failed(cx: &mut TestApp
     );
 }
 
+/// While a confirmation is open, nothing behind it can be clicked: a click on another file
+/// neither selects it nor closes the dialog's question about the first one (#368).
+#[gpui::test]
+fn a_confirmation_blocks_the_list_behind_it(cx: &mut TestAppContext) {
+    let fs = FakeFs::new();
+    fs.insert_dir(r"C:\cv", vec![file("a.txt", 1), file("b.txt", 1)]);
+    let (view, cx) = setup(cx, Arc::clone(&fs), Arc::default(), r"C:\cv");
+    wait_until(cx, &view, "load", loaded(r"C:\cv"));
+    cx.run_until_parked();
+    let b = cx.debug_bounds("name:b.txt").expect("b.txt is drawn");
+    cx.simulate_keystrokes("home shift-delete");
+    cx.run_until_parked();
+    assert!(view.update(cx, |v, _| v.confirm_title().is_some()), "asks");
+    // A click outside the dialog cancels it, and that is all it does.
+    cx.simulate_click(b.center(), gpui::Modifiers::none());
+    cx.run_until_parked();
+    view.update(cx, |v, _| {
+        assert!(v.confirm_title().is_none(), "cancelled");
+        assert_eq!(selected_names(v), ["a.txt"], "the list behind never saw it");
+    });
+}
+
 /// Items on a drive without a Recycle Bin are never deleted silently: Arke asks like a
 /// permanent delete and says why; the others still go to the Recycle Bin.
 #[gpui::test]
@@ -3290,7 +3496,7 @@ fn ctrl_z_undoes_the_last_file_op_but_not_in_text_boxes(cx: &mut TestAppContext)
 
     cx.simulate_keystrokes("escape ctrl-z");
     wait_until(cx, &view, "undo", |v| {
-        v.ops_running == 0 && v.notice.is_some()
+        v.ops_running == 0 && !shell.undone.lock().is_empty()
     });
     assert_eq!(
         *shell.undone.lock(),
@@ -3300,10 +3506,8 @@ fn ctrl_z_undoes_the_last_file_op_but_not_in_text_boxes(cx: &mut TestAppContext)
             name: "b.txt".into(),
         }])]
     );
-    view.update(cx, |v, _| {
-        let undone = tn!("undo.done", 1, op = t!("op.recycle"));
-        assert_eq!(v.notice.as_deref(), Some(&*undone));
-    });
+    // A finished undo says nothing: it is in the operation center.
+    view.update(cx, |v, _| assert_eq!(v.notice, None));
     // Undo is listed in the progress center too.
     let undo = t!("op.undo");
     let jobs = finished_jobs(cx);
@@ -3513,6 +3717,104 @@ fn inline_rename_validates_names(cx: &mut TestAppContext) {
     );
 }
 
+/// Tab in the rename box commits and renames the next item, Shift+Tab the previous one, in the
+/// order shown (#310).
+#[gpui::test]
+fn tab_in_the_rename_box_moves_to_the_next_item(cx: &mut TestAppContext) {
+    let fs = FakeFs::new();
+    let dir_path = Path::new(r"C:\r");
+    fs.insert_dir(
+        dir_path,
+        vec![file("a.txt", 1), file("b.txt", 1), file("c.txt", 1)],
+    );
+    let shell = Arc::new(FakeShell::default());
+    apply_to_fake_fs(&fs, &shell);
+    let (view, cx) = setup(cx, Arc::clone(&fs), Arc::clone(&shell), r"C:\r");
+    wait_until(cx, &view, "load", loaded(r"C:\r"));
+    wait_watcher(&fs, dir_path);
+    let renaming = |v: &Explorer| v.renaming.as_ref().map(|r| r.name.to_string());
+
+    // Tab commits "a2" and goes on to b.txt, which is the one selected.
+    cx.simulate_keystrokes("home f2");
+    assert_eq!(
+        view.update(cx, |v, _| renaming(v)).as_deref(),
+        Some("a.txt")
+    );
+    cx.simulate_input("a2");
+    cx.simulate_keystrokes("tab");
+    view.update(cx, |v, _| {
+        assert_eq!(renaming(v).as_deref(), Some("b.txt"));
+        assert_eq!(selected_name(v).as_deref(), Some("b.txt"));
+    });
+    wait_until(cx, &view, "a renamed", |v| {
+        names(v).contains(&"a2.txt".to_string())
+    });
+    // The renamed row doesn't take the selection back when the rename is done.
+    view.update(cx, |v, _| {
+        assert_eq!(renaming(v).as_deref(), Some("b.txt"));
+        assert_eq!(selected_name(v).as_deref(), Some("b.txt"));
+    });
+
+    // A name the box refuses keeps it on this item, with the reason under it.
+    cx.simulate_input("x|y");
+    cx.simulate_keystrokes("tab");
+    view.update(cx, |v, _| {
+        assert_eq!(renaming(v).as_deref(), Some("b.txt"));
+        assert!(v.renaming.as_ref().is_some_and(|r| r.problem.is_some()));
+    });
+    cx.simulate_keystrokes("ctrl-a");
+    cx.simulate_input("b2.txt");
+    cx.simulate_keystrokes("tab");
+    assert_eq!(
+        view.update(cx, |v, _| renaming(v)).as_deref(),
+        Some("c.txt")
+    );
+    wait_until(cx, &view, "b renamed", |v| {
+        names(v).contains(&"b2.txt".to_string())
+    });
+
+    // At the last item Tab only commits.
+    cx.simulate_input("c2");
+    cx.simulate_keystrokes("tab");
+    assert!(view.update(cx, |v, _| v.renaming.is_none()));
+    wait_until(cx, &view, "c renamed", |v| {
+        names(v).contains(&"c2.txt".to_string())
+    });
+    assert_eq!(
+        shell.ops(),
+        [
+            FileOp::Rename {
+                path: PathBuf::from(r"C:\r\a.txt"),
+                new_name: "a2.txt".into(),
+            },
+            FileOp::Rename {
+                path: PathBuf::from(r"C:\r\b.txt"),
+                new_name: "b2.txt".into(),
+            },
+            FileOp::Rename {
+                path: PathBuf::from(r"C:\r\c.txt"),
+                new_name: "c2.txt".into(),
+            },
+        ]
+    );
+
+    // Shift+Tab goes back through the list as shown now (a2, b2, c2), and at the first
+    // item it only commits. Nothing is typed, so no more renames.
+    cx.simulate_keystrokes("end f2");
+    assert_eq!(
+        view.update(cx, |v, _| renaming(v)).as_deref(),
+        Some("c2.txt")
+    );
+    cx.simulate_keystrokes("shift-tab");
+    assert_eq!(
+        view.update(cx, |v, _| renaming(v)).as_deref(),
+        Some("b2.txt")
+    );
+    cx.simulate_keystrokes("shift-tab shift-tab");
+    assert!(view.update(cx, |v, _| v.renaming.is_none()));
+    assert_eq!(shell.ops().len(), 3);
+}
+
 /// The profile folder under This PC is named after the account, so it isn't a second "Home".
 #[test]
 fn profile_folder_is_named_after_the_account() {
@@ -3598,13 +3900,31 @@ fn background_menu_new_text_file_and_more_options(cx: &mut TestAppContext) {
 
     right_click(&view, cx, None);
     let labels = menu_labels(&view, cx).unwrap();
+    // New folder and New text document are in "New", at the top (#190).
+    assert_eq!(labels[0], format!("{} ›", t!("menu.new")));
+    view.update(cx, |v, cx| {
+        if let Some(menu) = v.context_menu.as_mut() {
+            menu.highlight_for_test(0);
+        }
+        cx.notify();
+    });
+    cx.simulate_keystrokes("right");
     assert_eq!(
-        &labels[..2],
-        [
+        view.update(cx, |v, _| v.context_menu.as_ref().map(|m| m.labels_at(1))),
+        Some(vec![
             t!("menu.new_folder").into_owned(),
             t!("menu.new_text_file").into_owned()
-        ]
+        ])
     );
+    assert_eq!(
+        view.update(cx, |v, _| v
+            .context_menu
+            .as_ref()
+            .and_then(|m| m.shortcut_at(1, 0))),
+        Some("Ctrl+Shift+N"),
+        "the shortcut stays on New folder"
+    );
+    cx.simulate_keystrokes("left");
     let more_options = format!("{} ›", t!("menu.more_options"));
     assert_eq!(labels.last(), Some(&more_options));
     wait_shell("background menu", || {
@@ -4272,9 +4592,20 @@ fn sorting_by_size_reorders_once_when_sizes_are_done(cx: &mut TestAppContext) {
         fs.release(Path::new(&format!(r"C:\q\{name}")));
     }
     let sized = |v: &Explorer, n: &str| matches!(v.folder_size(n), FolderSize::Known { .. });
-    wait_until(cx, &view, "the quick ones", |v| {
+    // Once in a dozen full runs this timed out on a busy machine; the state then says why.
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while !view.update(cx, |v, _| {
         ["a-small", "b-big", "c-tiny"].iter().all(|n| sized(v, n))
-    });
+    }) {
+        assert!(
+            Instant::now() < deadline,
+            "timed out waiting for the quick ones: {} ({} reads)",
+            view.update(cx, |v, _| v.folder_sizes_state()),
+            fs.read_dir_calls()
+        );
+        cx.run_until_parked();
+        std::thread::sleep(Duration::from_millis(5));
+    }
     cx.executor()
         .advance_clock(std::time::Duration::from_secs(2));
     cx.run_until_parked();
@@ -4325,11 +4656,11 @@ fn sorting_by_size_uses_folder_sizes(cx: &mut TestAppContext) {
         Some("c-mid")
     );
 
-    // Largest first; folders still sort before files.
+    // Largest first: folders trail a descending sort, like File Explorer.
     let mut spec = SortSpec::by(SortColumn::Size, false, false);
     view.update(cx, |v, cx| v.set_sort(spec, cx));
     wait_until(cx, &view, "sort by size", |v| {
-        names(v) == ["b-big", "c-mid", "a-small", "f.bin"]
+        names(v) == ["f.bin", "b-big", "c-mid", "a-small"]
     });
     assert_eq!(
         view.update(cx, |v, _| selected_name(v)).as_deref(),
@@ -4700,7 +5031,7 @@ fn details_rows_end_with_their_columns(cx: &mut TestAppContext) {
     cx.run_until_parked();
     assert!(view.update(cx, |v, _| v.selection.is_empty()));
     let labels = menu_labels(&view, cx).expect("a menu opens");
-    assert_eq!(labels.first(), Some(&t!("menu.new_folder").into_owned()));
+    assert_eq!(labels.first(), Some(&format!("{} ›", t!("menu.new"))));
     // A marquee started there selects the rows it reaches into, not the ones it doesn't.
     cx.simulate_keystrokes("escape");
     let from = point(end + px(40.), bounds.top() + row * 0.5);
@@ -5254,7 +5585,7 @@ fn context_menu_items_selection_and_keyboard(cx: &mut TestAppContext) {
     right_click(&view, cx, None);
     assert!(view.update(cx, |v, _| v.selection.is_empty()));
     let labels = menu_labels(&view, cx).unwrap();
-    assert_eq!(labels.first(), Some(&t!("menu.new_folder").into_owned()));
+    assert_eq!(labels.first(), Some(&format!("{} ›", t!("menu.new"))));
     cx.simulate_keystrokes("escape");
 
     // Keyboard: Shift+F10 opens the menu; Down x7 then Enter runs the seventh enabled item (after
@@ -5301,10 +5632,10 @@ fn extract_zip_from_context_menu(cx: &mut TestAppContext) {
     right_click(&view, cx, Some(0));
     run_command(&view, cx, MenuCommand::ExtractToFolder);
     wait_until(cx, &view, "extract done", |v| {
-        v.extract_job.is_none() && v.notice.is_some()
+        v.extract_job.is_none() && v.selection.contains("album")
     });
-    let notice = view.update(cx, |v, _| v.notice.clone().unwrap());
-    assert_eq!(notice, tn!("extract.done", 2));
+    // A clean extraction says nothing; it is in the operation center.
+    assert_eq!(view.update(cx, |v, _| v.notice.clone()), None);
     // The progress center has a finished extraction.
     let jobs = finished_jobs(cx);
     assert!(
@@ -5611,7 +5942,7 @@ fn ui_text_comes_from_locales() {
         "UI text hard-coded in source:\n{}",
         hardcoded.join("\n")
     );
-    let languages: BTreeSet<String> = ["en", "zh-TW", "zh-CN"]
+    let languages: BTreeSet<String> = ["en", "zh-TW", "zh-CN", "ja", "de", "es", "pt-BR"]
         .iter()
         .map(|s| (*s).to_owned())
         .collect();
@@ -7348,6 +7679,40 @@ fn home_lists_the_ten_most_recent_files(cx: &mut TestAppContext) {
     assert_eq!(listed[9], PathBuf::from(r"C:\docs\file9.txt"));
 }
 
+/// #313: in a narrow window the column chips of Settings › Sorting and view wrap onto more
+/// lines; the card's title keeps a third of the row instead of being squeezed to a letter a line.
+#[gpui::test]
+fn column_chips_wrap_in_a_narrow_window(cx: &mut TestAppContext) {
+    let fs = FakeFs::new();
+    fs.insert_dir(r"C:\o", vec![file("a.txt", 1)]);
+    let (ws, cx) = setup_workspace(cx, fs, r"C:\o");
+    cx.simulate_resize(gpui::size(gpui::px(820.), gpui::px(900.)));
+    cx.dispatch_action(crate::workspace::OpenSettings);
+    cx.run_until_parked();
+    ws.update(cx, |ws, cx| {
+        ws.settings_category_for_test(&t!("settings.sorting"), cx);
+    });
+    for _ in 0..3 {
+        cx.update(|window, _| window.refresh());
+        cx.run_until_parked();
+    }
+    let card = cx
+        .debug_bounds("columns-card")
+        .expect("the columns card is drawn");
+    let chips = cx
+        .debug_bounds("column-chips")
+        .expect("the chips are drawn");
+    assert!(
+        chips.left() - card.left() >= card.size.width / 3.,
+        "the title keeps its room: card {card:?}, chips {chips:?}"
+    );
+    assert!(chips.right() <= card.right(), "the chips stay in the card");
+    assert!(
+        chips.size.height > gpui::px(40.),
+        "the chips wrap onto more lines: {chips:?}"
+    );
+}
+
 /// Settings › Search: while "Search this PC" is off, the settings that depend on it are covered
 /// and clicks don't reach them; once it is on they work.
 #[gpui::test]
@@ -7501,6 +7866,34 @@ fn the_settings_file_is_shown_in_arke(cx: &mut TestAppContext) {
     assert!(
         shell.revealed.lock().is_empty(),
         "File Explorer isn't opened"
+    );
+}
+
+/// Settings › About › Report a problem: Copy next to the e-mail address puts the address on the
+/// clipboard, off the UI thread.
+#[gpui::test]
+fn the_report_card_copies_the_support_address(cx: &mut TestAppContext) {
+    let fs = FakeFs::new();
+    fs.insert_dir(r"C:\o", vec![file("a.txt", 1)]);
+    let shell = Arc::new(FakeShell::default());
+    let (ws, cx) = setup_workspace_with(cx, fs, Arc::clone(&shell), r"C:\o");
+    // Tall enough that the whole card is in view.
+    cx.simulate_resize(gpui::size(gpui::px(1200.), gpui::px(2400.)));
+    cx.dispatch_action(crate::workspace::OpenSettings);
+    cx.run_until_parked();
+    ws.update(cx, |ws, cx| {
+        ws.settings_category_for_test(&t!("settings.about"), cx);
+        ws.expand_settings_card_for_test("report", cx);
+    });
+    cx.run_until_parked();
+    let copy = cx
+        .debug_bounds("report-email-copy")
+        .expect("the address has a Copy button");
+    cx.simulate_click(copy.center(), gpui::Modifiers::none());
+    wait_shell_in(cx, "the copy", || shell.clipboard_text.lock().is_some());
+    assert_eq!(
+        shell.clipboard_text.lock().as_deref(),
+        Some("service@koimsurai.com")
     );
 }
 
@@ -7742,10 +8135,8 @@ fn ctrl_y_redoes_the_last_undo_until_something_new_happens(cx: &mut TestAppConte
     wait_shell("redo", || shell.ops().len() == 2);
     wait_until(cx, &view, "redo done", |v| v.ops_running == 0);
     assert_eq!(shell.ops(), [recycle_b.clone(), recycle_b]);
-    view.update(cx, |v, _| {
-        let redid = t!("redo.done", op = t!("op.recycle"));
-        assert_eq!(v.notice.as_deref(), Some(&*redid));
-    });
+    // A finished redo says nothing: it is in the operation center.
+    view.update(cx, |v, _| assert_eq!(v.notice, None));
     // The redo is itself undoable, and Ctrl+Shift+Z redoes again after that.
     cx.simulate_keystrokes("ctrl-z");
     wait_shell("second undo", || shell.undone.lock().len() == 2);
@@ -8464,6 +8855,7 @@ fn the_cold_start_is_timed_on_the_tab_shown(cx: &mut TestAppContext) {
     fs.insert_many(r"C:\a", 3);
     fs.insert_many(r"C:\b", 4);
     let session = crate::settings::Session {
+        workspace: None,
         tabs: vec![saved_tab(r"C:\a", false), saved_tab(r"C:\b", false)],
         active: 1,
     };
@@ -8491,6 +8883,7 @@ fn a_folder_under_home_is_not_a_cold_start(cx: &mut TestAppContext) {
     let fs = FakeFs::new();
     fs.insert_many(r"C:\a", 3);
     let session = crate::settings::Session {
+        workspace: None,
         tabs: vec![saved_tab(r"C:\a", true)],
         active: 0,
     };
@@ -8501,6 +8894,39 @@ fn a_folder_under_home_is_not_a_cold_start(cx: &mut TestAppContext) {
     assert_eq!(pane.update(cx, |v, _| v.metrics.clock), StartClock::Untimed);
 }
 
+/// #343: the folder the first frame waited for never finished, and another one was opened later:
+/// that listing isn't the start's, so it isn't logged as the cold start's first full listing
+/// (the log said 703657 ms).
+#[gpui::test]
+fn a_later_folder_is_not_the_cold_starts_listing(cx: &mut TestAppContext) {
+    let fs = FakeFs::new();
+    fs.insert_many(r"C:\a", 3);
+    fs.insert_many(r"C:\b", 4);
+    fs.hang(r"C:\a");
+    let session = crate::settings::Session {
+        workspace: None,
+        tabs: vec![saved_tab(r"C:\a", false)],
+        active: 0,
+    };
+    let process_start = Instant::now().checked_sub(Duration::from_secs(1)).unwrap();
+    let (ws, cx) = cold_window(cx, Arc::clone(&fs), session, process_start, None);
+    cx.run_until_parked();
+    let pane = ws.update(cx, |ws, _| ws.tab_views().next().cloned().unwrap());
+    assert_eq!(
+        pane.update(cx, |v, _| v.metrics.clock),
+        StartClock::Cold(process_start)
+    );
+    pane.update(cx, |v, cx| {
+        v.navigate(PathBuf::from(r"C:\b"), NavKind::New, cx);
+    });
+    wait_until(cx, &pane, "b listed", loaded(r"C:\b"));
+    cx.run_until_parked();
+    let (clock, first) = pane.update(cx, |v, _| (v.metrics.clock, v.metrics.first_listing));
+    fs.release_all();
+    assert!(first.is_some(), "the listing is noted");
+    assert_eq!(clock, StartClock::Untimed, "but not as the cold start's");
+}
+
 /// A window the resident Arke opens on request, hours after it started: not a cold start, and
 /// its first frame is timed from when the request arrived.
 #[gpui::test]
@@ -8508,6 +8934,7 @@ fn a_window_opened_on_request_is_timed_from_the_request(cx: &mut TestAppContext)
     let fs = FakeFs::new();
     fs.insert_many(r"C:\a", 3);
     let session = crate::settings::Session {
+        workspace: None,
         tabs: vec![saved_tab(r"C:\a", false)],
         active: 0,
     };
@@ -8754,4 +9181,171 @@ fn click_to_rename_not_in_search_results(cx: &mut TestAppContext) {
     }
     assert_eq!(renaming(&view, cx), None);
     assert!(view.update(cx, |v, _| v.search_mode));
+}
+
+/// Ctrl+double-click on a folder opens it in a new tab in the background (the folder stays
+/// selected); with Shift too, the new tab comes to the front. Ctrl+click alone still selects
+/// (#291).
+#[gpui::test]
+fn ctrl_double_click_opens_a_folder_in_a_new_tab(cx: &mut TestAppContext) {
+    use gpui::{Modifiers, MouseButton, MouseDownEvent, MouseUpEvent, point, px};
+    let fs = FakeFs::new();
+    fs.insert_dir(r"C:\t", vec![dir("one"), dir("two")]);
+    fs.insert_many(r"C:\t\one", 1);
+    fs.insert_many(r"C:\t\two", 2);
+    let (ws, cx) = setup_workspace(cx, fs, r"C:\t");
+    let view = ws.update(cx, |ws, _| ws.active_view().clone());
+    wait_until(cx, &view, "load", loaded(r"C:\t"));
+    cx.run_until_parked();
+    let (bounds, row) = view.update(cx, |v, _| (v.list_bounds_for_test(), v.row_height()));
+    let double_click = |at, modifiers: Modifiers, cx: &mut VisualTestContext| {
+        for click_count in [1, 2] {
+            cx.simulate_event(MouseDownEvent {
+                button: MouseButton::Left,
+                position: at,
+                modifiers,
+                click_count,
+                first_mouse: false,
+            });
+            cx.simulate_event(MouseUpEvent {
+                button: MouseButton::Left,
+                position: at,
+                modifiers,
+                click_count,
+            });
+        }
+        cx.run_until_parked();
+    };
+    let one = point(bounds.left() + px(60.), bounds.top() + row * 0.5);
+    let two = point(bounds.left() + px(60.), bounds.top() + row * 1.5);
+    let ctrl = Modifiers {
+        control: true,
+        ..Modifiers::default()
+    };
+    double_click(one, ctrl, cx);
+    ws.update(cx, |ws, cx| {
+        assert_eq!(
+            tab_paths(ws, cx),
+            [
+                Some(PathBuf::from(r"C:\t")),
+                Some(PathBuf::from(r"C:\t\one"))
+            ]
+        );
+        assert_eq!(ws.active, 0, "in the background");
+    });
+    assert_eq!(view.update(cx, |v, _| selected_names(v)), ["one"]);
+    assert!(view.update(cx, |v, _| loaded(r"C:\t")(v)), "this tab stays");
+
+    let ctrl_shift = Modifiers {
+        control: true,
+        shift: true,
+        ..Modifiers::default()
+    };
+    double_click(two, ctrl_shift, cx);
+    ws.update(cx, |ws, cx| {
+        assert_eq!(tab_paths(ws, cx).len(), 3);
+        assert_eq!(
+            tab_paths(ws, cx)[ws.active],
+            Some(PathBuf::from(r"C:\t\two"))
+        );
+    });
+}
+
+/// #330: a drive plugged in while Arke runs shows in the sidebar of every window right away,
+/// not only after a restart, and goes away when pulled out.
+#[gpui::test]
+fn a_drive_plugged_in_shows_in_the_sidebar(cx: &mut TestAppContext) {
+    let fs = FakeFs::new();
+    fs.insert_dir(r"C:\d", vec![file("a.txt", 1)]);
+    let shell = Arc::new(FakeShell::default());
+    let (ws, cx) = setup_workspace_with(cx, fs, Arc::clone(&shell), r"C:\d");
+    cx.run_until_parked();
+    let view = ws.update(cx, |ws, _| ws.active_view().clone());
+    let has_usb = |v: &Explorer| v.places.iter().any(|p| p.path == Path::new(r"E:\"));
+    assert!(!view.update(cx, |v, _| has_usb(v)));
+
+    shell.extra_places.lock().push(Place {
+        label: "USB Drive (E:)".into(),
+        path: PathBuf::from(r"E:\"),
+        kind: PlaceKind::Drive {
+            remote: false,
+            space: None,
+        },
+    });
+    cx.cx.update(crate::workspace::reload_places_everywhere);
+    wait_until(cx, &view, "the new drive", has_usb);
+
+    shell.extra_places.lock().clear();
+    cx.cx.update(crate::workspace::reload_places_everywhere);
+    wait_until(cx, &view, "the drive gone", |v| !has_usb(v));
+}
+
+/// A drive pulled out under a tab showing the Recycle Bin: the tab's folder moves off the drive,
+/// but the Recycle Bin stays open (it used to close, as if the user had navigated away).
+#[gpui::test]
+fn the_recycle_bin_stays_open_when_its_tabs_drive_is_removed(cx: &mut TestAppContext) {
+    let home = std::env::var_os("USERPROFILE").map_or_else(|| PathBuf::from("C:\\"), PathBuf::from);
+    let fs = FakeFs::new();
+    fs.insert_dir(r"E:\photos", vec![file("a.jpg", 1)]);
+    fs.insert_dir(home.clone(), vec![file("b.txt", 1)]);
+    let (ws, cx) = setup_workspace(cx, fs, r"E:\photos");
+    let view = ws.update(cx, |ws, _| ws.active_view().clone());
+    wait_until(cx, &view, "load", loaded(r"E:\photos"));
+    cx.update(|window, cx| {
+        ws.update(cx, |ws, cx| ws.open_recycle_for_test(window, cx));
+    });
+    cx.run_until_parked();
+    let shown = |cx: &mut VisualTestContext| ws.update(cx, |ws, _| ws.shown_page_for_test());
+    let bin = shown(cx);
+    assert!(bin.is_some(), "the Recycle Bin shows");
+
+    cx.cx
+        .update(|cx| crate::workspace::leave_drive_everywhere(Path::new(r"E:\"), cx));
+    let home_str = home.to_string_lossy().into_owned();
+    wait_until(cx, &view, "moved off the drive", loaded(&home_str));
+    assert_eq!(shown(cx), bin, "the Recycle Bin is still open");
+}
+
+/// A folder named by its desktop.ini sorts and jumps by that name, as in File Explorer, and F2
+/// edits that name (#370).
+#[gpui::test]
+fn a_localized_folder_sorts_jumps_and_renames_by_its_shown_name(cx: &mut TestAppContext) {
+    let fs = FakeFs::new();
+    fs.insert_dir(
+        r"C:\u",
+        vec![
+            Entry::new("Alpha", EntryKind::Dir, 0, None, 0),
+            Entry::new("Beta", EntryKind::Dir, 0, None, 0),
+            Entry::new("Documents", EntryKind::Dir, 0, None, 0x1),
+        ],
+    );
+    let text = "[.ShellClassInfo]\r\nLocalizedResourceName=Aardvark\r\n";
+    let mut ini = vec![0xFF, 0xFE];
+    ini.extend(text.encode_utf16().flat_map(u16::to_le_bytes));
+    fs.set_content(r"C:\u\Documents\desktop.ini", ini);
+    let (view, cx) = setup(cx, fs, Arc::new(FakeShell::default()), r"C:\u");
+    wait_until(cx, &view, "sorted by the shown name", |v| {
+        loaded(r"C:\u")(v) && names(v) == ["Documents", "Alpha", "Beta"]
+    });
+
+    // Typing jumps by the shown name.
+    cx.simulate_input("aar");
+    cx.run_until_parked();
+    assert_eq!(
+        view.update(cx, |v, _| selected_name(v)).as_deref(),
+        Some("Documents")
+    );
+
+    cx.simulate_keystrokes("f2");
+    cx.run_until_parked();
+    let edited = view.update(cx, |v, cx| {
+        v.renaming
+            .as_ref()
+            .map(|r| (r.name.to_string(), r.input.read(cx).text().to_owned()))
+    });
+    assert_eq!(
+        edited,
+        Some(("Documents".to_owned(), "Aardvark".to_owned())),
+        "the shown name is edited"
+    );
 }

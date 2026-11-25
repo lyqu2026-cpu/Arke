@@ -22,10 +22,13 @@ static SHOW_EXTENSION: AtomicBool = AtomicBool::new(false);
 static SHOW_ATTRIBUTES: AtomicBool = AtomicBool::new(false);
 static SHOW_LINK_TARGET: AtomicBool = AtomicBool::new(false);
 static SINGLE_CLICK: AtomicBool = AtomicBool::new(false);
+static POINT_TO_SELECT: AtomicBool = AtomicBool::new(true);
 /// Dragged column widths (px, 0 = default), in [`Col`] order
 static WIDTHS: [AtomicU32; Col::ALL.len()] = [const { AtomicU32::new(0) }; Col::ALL.len()];
 /// Dragged preview pane width (px, 0 = automatic).
 static PREVIEW_W: AtomicU32 = AtomicU32::new(0);
+/// Dragged share of the preview pane's height for its content (thousandths, 0 = automatic).
+static PREVIEW_SPLIT: AtomicU32 = AtomicU32::new(0);
 /// Column view widths (px, 0 = default), in [`ViewColumn`] order.
 static VIEW_COLUMN_W: [AtomicU32; 2] = [const { AtomicU32::new(0) }; 2];
 /// The columns after Name, left to right.
@@ -240,6 +243,37 @@ pub(crate) fn set_preview_width(width: Option<Pixels>) {
     }
 }
 
+/// Smallest and largest share (thousandths) of the preview pane's height the content may take
+/// when dragged: the name and details below keep room, and the content stays big enough to drag
+/// back.
+pub(crate) const PREVIEW_SPLIT_RANGE: (u32, u32) = (150, 800);
+
+/// Share of the preview pane's height the preview content takes (`None`: automatic).
+pub(crate) fn preview_split() -> Option<f32> {
+    match PREVIEW_SPLIT.load(Ordering::Relaxed) {
+        0 => None,
+        v => Some(v as f32 / 1000.),
+    }
+}
+
+/// Sets the share (0 to 1) while dragging, kept within [`PREVIEW_SPLIT_RANGE`] (`None` goes back
+/// to automatic); redraws all windows on change. Saved on release by the caller.
+pub(crate) fn set_preview_split(share: Option<f32>) {
+    let value = share.map_or(0, |s| {
+        ((s * 1000.).round().max(0.) as u32).clamp(PREVIEW_SPLIT_RANGE.0, PREVIEW_SPLIT_RANGE.1)
+    });
+    if PREVIEW_SPLIT.swap(value, Ordering::Relaxed) != value {
+        theme::touch();
+    }
+}
+
+/// Current share for saving (`None` if automatic).
+pub(crate) fn stored_preview_split() -> Option<u16> {
+    u16::try_from(PREVIEW_SPLIT.load(Ordering::Relaxed))
+        .ok()
+        .filter(|&v| v != 0)
+}
+
 /// Current preview pane width for saving (`None` if automatic).
 pub(crate) fn stored_preview_width() -> Option<u16> {
     u16::try_from(PREVIEW_W.load(Ordering::Relaxed))
@@ -360,13 +394,20 @@ pub(crate) fn apply(settings: &Settings) {
         changed |= slot.swap(value, Ordering::Relaxed) != value;
     }
     SINGLE_CLICK.store(settings.single_click, Ordering::Relaxed);
+    POINT_TO_SELECT.store(settings.point_to_select, Ordering::Relaxed);
     crate::win_fast_recycle::set_enabled(settings.fast_recycle);
+    crate::win_fast_copy::set_enabled(settings.fast_copy);
     for col in Col::ALL {
         let value = settings.column_widths.get(col).map_or(0, u32::from);
         changed |= col.slot().swap(value, Ordering::Relaxed) != value;
     }
     let preview = settings.preview_width.map_or(0, u32::from);
     changed |= PREVIEW_W.swap(preview, Ordering::Relaxed) != preview;
+    // Clamped like a drag: a hand-edited value can't hide the name and details or the content.
+    let split = settings.preview_split.map_or(0, |v| {
+        u32::from(v).clamp(PREVIEW_SPLIT_RANGE.0, PREVIEW_SPLIT_RANGE.1)
+    });
+    changed |= PREVIEW_SPLIT.swap(split, Ordering::Relaxed) != split;
     let view_columns = settings.column_view_widths;
     for (col, width) in [
         (ViewColumn::Parent, view_columns.parent),
@@ -411,6 +452,11 @@ pub(crate) fn show_size() -> bool {
 /// Open on single click (on release; select with Ctrl/Shift click, marquee or keyboard).
 pub(crate) fn single_click() -> bool {
     SINGLE_CLICK.load(Ordering::Relaxed)
+}
+
+/// Single-click mode selects the item the pointer rests on (#46).
+pub(crate) fn point_to_select() -> bool {
+    single_click() && POINT_TO_SELECT.load(Ordering::Relaxed)
 }
 
 /// Modified column width: dragged value or default (full date-times are longer).

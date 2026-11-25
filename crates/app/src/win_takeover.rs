@@ -35,7 +35,7 @@ use std::time::{Duration, Instant};
 use arke_core::takeover::{self, Bypass, ShellAttrs, Target};
 use parking_lot::Mutex;
 use windows::Win32::Foundation::{CloseHandle, HWND, LPARAM, WPARAM};
-use windows::Win32::Security::{GetTokenInformation, TOKEN_ELEVATION, TOKEN_QUERY, TokenElevation};
+use windows::Win32::Security::{GetTokenInformation, TOKEN_QUERY};
 use windows::Win32::System::Com::{
     CLSCTX_LOCAL_SERVER, COINIT_APARTMENTTHREADED, COINIT_DISABLE_OLE1DDE, CoCreateInstance,
     CoInitializeEx, CoTaskMemFree, CoUninitialize, IConnectionPointContainer, IDispatch_Impl,
@@ -70,6 +70,10 @@ const OPEN_TIMEOUT: Duration = Duration::from_millis(2500);
 const FAST_TICK_MS: u32 = 10;
 /// Safety net in case an event is missed or the shell's window list went away.
 const SLOW_TICK_MS: u32 = 2000;
+/// After `WindowRegistered`, how long to keep looking on the fast timer: the event comes before
+/// the new window is in the shell's list, and waiting for the slow scan left it on screen for up
+/// to two seconds (#285).
+const REGISTERED_LOOK: Duration = Duration::from_secs(2);
 
 /// Folders Arke itself handed to Explorer.
 static BYPASS: LazyLock<Mutex<Bypass>> = LazyLock::new(|| Mutex::new(Bypass::default()));
@@ -126,7 +130,10 @@ impl Drop for Watcher {
     }
 }
 
-/// Receives `WindowRegistered` and only notes it; the message loop does the work.
+/// Receives `WindowRegistered` and only notes it; the message loop does the work. COM calls it
+/// from inside `GetMessageW`, which then keeps waiting, so it also posts a message to wake the
+/// loop: otherwise the note was only seen at the next slow tick, up to two seconds later, with
+/// the Explorer window on screen all that time (#285).
 #[allow(
     clippy::ref_as_ptr,
     clippy::inline_always,
@@ -146,6 +153,8 @@ mod sink {
     #[implement(DShellWindowsEvents)]
     pub(super) struct Sink {
         pub(super) registered: Arc<AtomicBool>,
+        /// The watching thread, woken when a window is registered.
+        pub(super) thread: u32,
     }
 
     impl DShellWindowsEvents_Impl for Sink_Impl {}
@@ -183,6 +192,15 @@ mod sink {
         ) -> windows::core::Result<()> {
             if dispid == WINDOW_REGISTERED {
                 self.registered.store(true, Ordering::SeqCst);
+                // SAFETY: posts an empty message to the watching thread's queue.
+                let _ = unsafe {
+                    windows::Win32::UI::WindowsAndMessaging::PostThreadMessageW(
+                        self.thread,
+                        windows::Win32::UI::WindowsAndMessaging::WM_NULL,
+                        windows::Win32::Foundation::WPARAM(0),
+                        windows::Win32::Foundation::LPARAM(0),
+                    )
+                };
             }
             Ok(())
         }
@@ -226,6 +244,8 @@ struct Watch {
     tx: flume::Sender<OpenRequest>,
     test_root: Option<PathBuf>,
     fast_timer: usize,
+    /// A window was registered and isn't in the list yet: scan on the fast timer until then.
+    looking_until: Option<Instant>,
 }
 
 fn run(tx: &flume::Sender<OpenRequest>, thread_id: &AtomicU32, stopped: &AtomicBool) {
@@ -263,6 +283,7 @@ fn run(tx: &flume::Sender<OpenRequest>, thread_id: &AtomicU32, stopped: &AtomicB
         tx: tx.clone(),
         test_root,
         fast_timer: 0,
+        looking_until: None,
     };
     watch.seed();
     // SAFETY: a thread timer (no window): WM_TIMER arrives in this thread's queue.
@@ -294,6 +315,7 @@ fn run(tx: &flume::Sender<OpenRequest>, thread_id: &AtomicU32, stopped: &AtomicB
                     }
                 }
             } else {
+                watch.look();
                 watch.step();
             }
         } else {
@@ -304,7 +326,8 @@ fn run(tx: &flume::Sender<OpenRequest>, thread_id: &AtomicU32, stopped: &AtomicB
             }
         }
         if registered.swap(false, Ordering::SeqCst) {
-            let _ = watch.scan();
+            watch.looking_until = Some(Instant::now() + REGISTERED_LOOK);
+            watch.look();
         }
         watch.update_timer();
     }
@@ -353,6 +376,8 @@ fn connect(registered: &Arc<AtomicBool>) -> Option<(IShellWindows, Option<Subscr
         let point = unsafe { container.FindConnectionPoint(&DShellWindowsEvents::IID) }.ok()?;
         let sink: DShellWindowsEvents = sink::Sink {
             registered: Arc::clone(registered),
+            // SAFETY: plain Win32 call; this is the watching thread.
+            thread: unsafe { GetCurrentThreadId() },
         }
         .into();
         // SAFETY: see above.
@@ -372,41 +397,68 @@ fn class_name(hwnd: HWND) -> String {
     String::from_utf16_lossy(&buf[..usize::try_from(len).unwrap_or(0)])
 }
 
-/// Whether the process owning `hwnd` runs elevated (or can't be inspected, which is the same
-/// thing from here: not ours to touch).
-fn elevated(hwnd: HWND) -> bool {
+/// Whether the window belongs to a process above Arke's integrity level (an elevated File Explorer
+/// next to a normal Arke), or one that can't be inspected: not ours to touch. With UAC turned off
+/// every program, Arke included, runs at the same high level, and those windows are Arke's (#343).
+fn above_us(hwnd: HWND) -> bool {
     let mut pid = 0u32;
     // SAFETY: valid out pointer.
     unsafe { GetWindowThreadProcessId(hwnd, Some(&raw mut pid)) };
     // SAFETY: opens a query-only handle, closed below.
-    let Ok(process) = (unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid) })
-    else {
-        return true;
+    let theirs = match unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid) } {
+        Ok(process) => {
+            let level = integrity_level(process);
+            // SAFETY: closes the process handle opened above.
+            let _ = unsafe { CloseHandle(process) };
+            level
+        }
+        Err(_) => None,
+    };
+    // SAFETY: the pseudo handle of this process needs no closing.
+    let ours = integrity_level(unsafe { windows::Win32::System::Threading::GetCurrentProcess() });
+    leaves_to_explorer(theirs, ours)
+}
+
+/// Unknown levels count as above.
+const fn leaves_to_explorer(theirs: Option<u32>, ours: Option<u32>) -> bool {
+    match (theirs, ours) {
+        (Some(theirs), Some(ours)) => theirs > ours,
+        _ => true,
+    }
+}
+
+/// The mandatory integrity level (the RID: 0x2000 medium, 0x3000 high) of `process`'s token.
+fn integrity_level(process: windows::Win32::Foundation::HANDLE) -> Option<u32> {
+    use windows::Win32::Security::{
+        GetSidSubAuthority, GetSidSubAuthorityCount, TOKEN_MANDATORY_LABEL, TokenIntegrityLevel,
     };
     let mut token = windows::Win32::Foundation::HANDLE::default();
     // SAFETY: process is a valid handle; token is a valid out pointer.
-    let elevated = unsafe { OpenProcessToken(process, TOKEN_QUERY, &raw mut token) }
-        .ok()
-        .is_none_or(|()| {
-            let mut info = TOKEN_ELEVATION::default();
-            let mut len = 0u32;
-            // SAFETY: info and len are valid for the call; token is valid.
-            let ok = unsafe {
-                GetTokenInformation(
-                    token,
-                    TokenElevation,
-                    Some((&raw mut info).cast()),
-                    size_of::<TOKEN_ELEVATION>() as u32,
-                    &raw mut len,
-                )
-            };
-            // SAFETY: closes the token handle opened above.
-            let _ = unsafe { CloseHandle(token) };
-            ok.is_err() || info.TokenIsElevated != 0
-        });
-    // SAFETY: closes the process handle opened above.
-    let _ = unsafe { CloseHandle(process) };
-    elevated
+    unsafe { OpenProcessToken(process, TOKEN_QUERY, &raw mut token) }.ok()?;
+    // TOKEN_MANDATORY_LABEL followed by its SID; 64 bytes is plenty, u64 keeps it aligned.
+    let mut buf = [0u64; 8];
+    let mut len = 0u32;
+    // SAFETY: buf and len are valid for the call; token is valid.
+    let ok = unsafe {
+        GetTokenInformation(
+            token,
+            TokenIntegrityLevel,
+            Some(buf.as_mut_ptr().cast()),
+            size_of_val(&buf) as u32,
+            &raw mut len,
+        )
+    };
+    // SAFETY: closes the token handle opened above.
+    let _ = unsafe { CloseHandle(token) };
+    ok.ok()?;
+    // SAFETY: the call filled buf with a TOKEN_MANDATORY_LABEL whose SID lies within buf; the SID
+    // has at least one sub-authority (the level).
+    unsafe {
+        let label = &*buf.as_ptr().cast::<TOKEN_MANDATORY_LABEL>();
+        let sid = label.Label.Sid;
+        let count = *GetSidSubAuthorityCount(sid);
+        (count > 0).then(|| *GetSidSubAuthority(sid, u32::from(count) - 1))
+    }
 }
 
 fn shift_down() -> bool {
@@ -518,8 +570,20 @@ impl Watch {
         out
     }
 
-    /// Picks up windows with a handle not seen before. Errors mean the shell's list is gone.
-    fn scan(&mut self) -> windows::core::Result<()> {
+    /// After `WindowRegistered`: scans until the new window is in the list, or the time is up.
+    fn look(&mut self) {
+        let Some(until) = self.looking_until else {
+            return;
+        };
+        let found = self.scan().unwrap_or(false);
+        if found || Instant::now() >= until {
+            self.looking_until = None;
+        }
+    }
+
+    /// Picks up windows with a handle not seen before; true when there was one. Errors mean the
+    /// shell's list is gone.
+    fn scan(&mut self) -> windows::core::Result<bool> {
         let shift = shift_down();
         // SAFETY: valid interface pointer.
         unsafe { self.windows.Count() }?;
@@ -528,8 +592,10 @@ impl Watch {
         self.seen
             .retain(|&h| unsafe { IsWindow(Some(HWND(h as *mut _))) }.as_bool());
         let now = Instant::now();
+        let mut found = false;
         for (hwnd, browser) in self.list() {
             if self.seen.insert(hwnd) {
+                found = true;
                 log::info!("takeover: new Explorer window {hwnd:x}");
                 self.candidates.push(Candidate {
                     hwnd,
@@ -541,7 +607,7 @@ impl Watch {
             }
         }
         self.step();
-        Ok(())
+        Ok(found)
     }
 
     /// Moves every candidate along; runs on the fast timer and right after a scan.
@@ -722,8 +788,10 @@ impl Watch {
             log::info!("takeover: Shift held, leaving {parsing} to Explorer");
             return None;
         }
-        if elevated(hwnd) {
-            log::info!("takeover: elevated window, leaving {parsing} to Explorer");
+        if above_us(hwnd) {
+            log::info!(
+                "takeover: window above Arke's integrity level, leaving {parsing} to Explorer"
+            );
             return None;
         }
         if let Target::Folder(folder) = &target
@@ -735,9 +803,9 @@ impl Watch {
         Some(target)
     }
 
-    /// The fast timer runs only while a window is being examined.
+    /// The fast timer runs only while a window is being examined or looked for.
     fn update_timer(&mut self) {
-        let busy = !self.candidates.is_empty();
+        let busy = !self.candidates.is_empty() || self.looking_until.is_some();
         if busy && self.fast_timer == 0 {
             // SAFETY: a thread timer; WM_TIMER arrives in this thread's queue.
             self.fast_timer = unsafe { SetTimer(None, 0, FAST_TICK_MS, None) };
@@ -746,5 +814,25 @@ impl Watch {
             let _ = unsafe { KillTimer(None, self.fast_timer) };
             self.fast_timer = 0;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// #343: with UAC turned off File Explorer and Arke run at the same high level, and Arke takes
+    /// the window. Only a level above Arke's, or one it can't read, is left to File Explorer.
+    #[test]
+    fn only_a_level_above_arkes_is_left_to_explorer() {
+        assert!(!leaves_to_explorer(Some(0x3000), Some(0x3000)));
+        assert!(!leaves_to_explorer(Some(0x2000), Some(0x2000)));
+        assert!(!leaves_to_explorer(Some(0x2000), Some(0x3000)));
+        assert!(leaves_to_explorer(Some(0x3000), Some(0x2000)));
+        assert!(leaves_to_explorer(None, Some(0x2000)));
+        // SAFETY: the pseudo handle of this process needs no closing.
+        let ours =
+            integrity_level(unsafe { windows::Win32::System::Threading::GetCurrentProcess() });
+        assert!(ours.is_some_and(|level| level >= 0x1000), "{ours:?}");
     }
 }

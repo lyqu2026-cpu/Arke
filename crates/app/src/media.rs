@@ -19,7 +19,8 @@ use std::time::{Duration, Instant, SystemTime};
 
 use arke_core::Entry;
 use arke_core::filetype::{
-    MAX_THUMBNAIL_SOURCE, can_thumbnail, can_video_thumbnail, wants_system_icon, wants_type_icon,
+    MAX_THUMBNAIL_SOURCE, can_pdf_thumbnail, can_thumbnail, can_video_thumbnail, wants_system_icon,
+    wants_type_icon,
 };
 use arke_core::loader::Loader;
 use arke_core::thumb_cache::{ThumbCache, ThumbKey};
@@ -65,12 +66,14 @@ pub(crate) enum MediaKind {
     SystemIcon,
     /// A video's thumbnail: a frame, from Windows, made in a separate process (`thumb_host.rs`).
     Video,
+    /// A PDF's first page, rendered by Windows in process (the same renderer as the preview).
+    Pdf,
 }
 
 impl MediaKind {
     /// A picture of the content (shown like a photo), not an icon.
     pub(crate) const fn is_picture(self) -> bool {
-        matches!(self, Self::Thumbnail | Self::Video)
+        matches!(self, Self::Thumbnail | Self::Video | Self::Pdf)
     }
 }
 
@@ -173,6 +176,8 @@ impl MediaKey {
             (MediaKind::SystemIcon, 0)
         } else if can_video_thumbnail(entry) {
             (MediaKind::Video, thumbnail_px?)
+        } else if can_pdf_thumbnail(entry) {
+            (MediaKind::Pdf, thumbnail_px?)
         } else {
             (
                 MediaKind::Thumbnail,
@@ -240,6 +245,7 @@ pub(crate) struct MediaStore {
     thumbs: Loader<MediaKey>,
     icons: Loader<MediaKey>,
     videos: Loader<MediaKey>,
+    pdfs: Loader<MediaKey>,
     last_wanted: Vec<MediaKey>,
     /// Wanted by the main list (in priority order)
     main_wanted: Vec<MediaKey>,
@@ -282,6 +288,7 @@ impl MediaStore {
         store
     }
 
+    #[allow(clippy::too_many_lines, reason = "one short loader per kind of media")]
     fn new(services: Services, cx: &mut Context<Self>) -> Self {
         let (tx, rx) = flume::unbounded::<MediaEvent>();
         let thumbs = {
@@ -343,6 +350,30 @@ impl MediaStore {
                 let _ = tx.send(MediaEvent::Loaded(key.clone(), thumb));
             })
         };
+        let pdfs = {
+            let shell = Arc::clone(&services.shell);
+            let tx = tx.clone();
+            // Rendered in the thumbnail host, like videos: a damaged file can stall or crash the
+            // renderer, and the host is ended after a timeout. A failed or unsupported file
+            // (encrypted, damaged) stays a type icon: the store remembers the `None`. A host that
+            // can't be asked at all says nothing about the file, so nothing is remembered.
+            Loader::new("pdf-thumbnail", 2, move |key: &MediaKey| {
+                let mut unavailable = false;
+                let thumb = thumb_cache().load(&key.thumb_key(), || {
+                    shell
+                        .pdf_thumbnail(&key.path, key.px.max(1))
+                        .unwrap_or_else(|_| {
+                            unavailable = true;
+                            None
+                        })
+                });
+                if unavailable {
+                    let _ = tx.send(MediaEvent::Unavailable(key.clone()));
+                    return;
+                }
+                let _ = tx.send(MediaEvent::Loaded(key.clone(), thumb));
+            })
+        };
         thumb_cache().count_in_background();
         let task = cx.spawn(async move |this, cx| {
             while let Ok(event) = rx.recv_async().await {
@@ -359,6 +390,7 @@ impl MediaStore {
             thumbs,
             icons,
             videos,
+            pdfs,
             last_wanted: Vec::new(),
             main_wanted: Vec::new(),
             side_wanted: Vec::new(),
@@ -378,12 +410,16 @@ impl MediaStore {
                     MediaKind::Thumbnail => self.thumbs.acknowledge(&key),
                     MediaKind::SystemIcon => self.icons.acknowledge(&key),
                     MediaKind::Video => self.videos.acknowledge(&key),
+                    MediaKind::Pdf => self.pdfs.acknowledge(&key),
                 }
                 self.insert(key, thumb);
                 self.evict(cx);
             }
             MediaEvent::Unavailable(key) => {
-                self.videos.acknowledge(&key);
+                match key.kind {
+                    MediaKind::Pdf => self.pdfs.acknowledge(&key),
+                    _ => self.videos.acknowledge(&key),
+                }
                 // Asked again with the next change of what's wanted.
                 self.last_wanted.clear();
             }
@@ -423,7 +459,7 @@ impl MediaStore {
                 self.bytes = self.bytes.saturating_sub(image_bytes(&image));
                 // Remove from every window's GPU atlas; dropping the reference alone leaves the
                 // texture in video memory.
-                cx.drop_image(image, None);
+                crate::media::drop_image_later(image, cx);
             }
         }
         // Still on screen: back at the old end, in the same order.
@@ -455,7 +491,7 @@ impl MediaStore {
     pub(crate) fn drop_decoded(&mut self, cx: &mut App) {
         for (_, image) in self.cache.drain() {
             if let Some(image) = image {
-                cx.drop_image(image, None);
+                crate::media::drop_image_later(image, cx);
             }
         }
         self.cache.shrink_to_fit();
@@ -600,7 +636,8 @@ impl MediaStore {
         if keys == self.last_wanted {
             return;
         }
-        let (mut thumbs, mut icons, mut videos) = (Vec::new(), Vec::new(), Vec::new());
+        let (mut thumbs, mut icons, mut videos, mut pdfs) =
+            (Vec::new(), Vec::new(), Vec::new(), Vec::new());
         for key in &keys {
             if self.cache.contains_key(key) {
                 continue;
@@ -609,11 +646,13 @@ impl MediaStore {
                 MediaKind::Thumbnail => thumbs.push(key.clone()),
                 MediaKind::SystemIcon => icons.push(key.clone()),
                 MediaKind::Video => videos.push(key.clone()),
+                MediaKind::Pdf => pdfs.push(key.clone()),
             }
         }
         self.thumbs.set_wanted(thumbs);
         self.icons.set_wanted(icons);
         self.videos.set_wanted(videos);
+        self.pdfs.set_wanted(pdfs);
         // Move used entries to the recent end so visible thumbnails aren't evicted.
         for key in &keys {
             if self.cache.get(key).is_some_and(Option::is_some)
@@ -630,4 +669,12 @@ impl MediaStore {
 fn image_bytes(image: &RenderImage) -> usize {
     let size = image.size(0);
     (size.width.0 as usize) * (size.height.0 as usize) * 4
+}
+
+/// Frees `image` from every window's GPU atlas once the update under way is done. GPUI leaves out
+/// the window it is updating, and nearly everything runs inside one (rendering, key and mouse
+/// handlers), so dropping it right away kept that window's copy in video memory: the preview pane
+/// kept every picture it had shown, about 7 MB each.
+pub(crate) fn drop_image_later(image: Arc<RenderImage>, cx: &mut App) {
+    cx.defer(move |cx| cx.drop_image(image, None));
 }

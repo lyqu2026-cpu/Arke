@@ -606,10 +606,11 @@ impl WindowsWindow {
             None => (CW_USEDEFAULT, CW_USEDEFAULT, CW_USEDEFAULT, CW_USEDEFAULT),
         };
         let owner = popup.map(|(owner, _)| owner).or(parent_hwnd);
+        let class_name = window_class_for(&params.kind);
         let creation_result = unsafe {
             CreateWindowExW(
                 dwexstyle,
-                WINDOW_CLASS_NAME,
+                class_name,
                 &window_name,
                 dwstyle,
                 x,
@@ -1074,8 +1075,13 @@ impl PlatformWindow for WindowsWindow {
         self.state.frames.wake();
     }
 
-    fn on_input(&self, callback: Box<dyn FnMut(PlatformInput) -> DispatchEventResult>) {
-        self.state.callbacks.input.set(Some(callback));
+    fn on_input(&self, mut callback: Box<dyn FnMut(PlatformInput) -> DispatchEventResult>) {
+        // Arke: noted while it runs, so a hit test arriving meanwhile doesn't ask the app (see
+        // `begin_modal_drag`).
+        self.state.callbacks.input.set(Some(Box::new(move |input| {
+            let _dispatching = DispatchingInput::enter();
+            callback(input)
+        })));
     }
 
     fn on_active_status_change(&self, callback: Box<dyn FnMut(bool)>) {
@@ -1569,22 +1575,115 @@ enum WindowOpenState {
     Windowed,
 }
 
-const WINDOW_CLASS_NAME: PCWSTR = w!("Zed::Window");
+/// Arke: the class of normal windows, which other programs find Arke's windows by
+/// (`ahk_class ArkeWindow`). Upstream registers every window as `Zed::Window`.
+const WINDOW_CLASS_NAME: PCWSTR = w!("ArkeWindow");
+/// Arke: the class of every other kind (menus, tooltips, dialogs), so a search for
+/// `ArkeWindow` never lands on a popup.
+const POPUP_CLASS_NAME: PCWSTR = w!("ArkeWindow.Popup");
+
+/// Arke: the class a window of `kind` is made with.
+fn window_class_for(kind: &WindowKind) -> PCWSTR {
+    if matches!(kind, WindowKind::Normal) {
+        WINDOW_CLASS_NAME
+    } else {
+        POPUP_CLASS_NAME
+    }
+}
 
 fn register_window_class(icon_handle: HICON) {
     static ONCE: Once = Once::new();
     ONCE.call_once(|| {
-        let wc = WNDCLASSW {
-            lpfnWndProc: Some(window_procedure),
-            hIcon: icon_handle,
-            lpszClassName: PCWSTR(WINDOW_CLASS_NAME.as_ptr()),
-            style: CS_HREDRAW | CS_VREDRAW,
-            hInstance: get_module_handle().into(),
-            hbrBackground: unsafe { CreateSolidBrush(COLORREF(0x00000000)) },
-            ..Default::default()
-        };
-        unsafe { RegisterClassW(&wc) };
+        for class in [WINDOW_CLASS_NAME, POPUP_CLASS_NAME] {
+            let wc = WNDCLASSW {
+                lpfnWndProc: Some(window_procedure),
+                hIcon: icon_handle,
+                lpszClassName: PCWSTR(class.as_ptr()),
+                style: CS_HREDRAW | CS_VREDRAW,
+                hInstance: get_module_handle().into(),
+                hbrBackground: unsafe { CreateSolidBrush(COLORREF(0x00000000)) },
+                ..Default::default()
+            };
+            unsafe { RegisterClassW(&wc) };
+        }
     });
+}
+
+/// Arke: `COPYDATASTRUCT::dwData` of the integration API's `WM_COPYDATA` messages ("ARKE"), both
+/// requests and replies.
+pub const COPYDATA_ID: usize = 0x454B_5241;
+
+/// Answers a `WM_COPYDATA` request: the window it was sent to (HWND) and the request bytes, to the
+/// reply bytes.
+type CopyDataHandler = Box<dyn Fn(isize, &[u8]) -> Option<Vec<u8>> + Send + Sync>;
+
+static COPYDATA_HANDLER: std::sync::OnceLock<CopyDataHandler> = std::sync::OnceLock::new();
+
+/// How long a reply waits for the sender's window to take it.
+const COPYDATA_REPLY_TIMEOUT_MS: u32 = 5000;
+
+/// Arke: answers `WM_COPYDATA` messages tagged [`COPYDATA_ID`] sent to any of this process's
+/// windows. `handler` gets the HWND the message was sent to and the request bytes, and returns
+/// the reply bytes (`None`: not answered, the message gets the default handling). The reply goes
+/// straight back to the sender's window (the message's `wParam`) as a `WM_COPYDATA` tagged
+/// [`COPYDATA_ID`], before the message returns `TRUE`, as Total Commander does.
+///
+/// The handler runs inside the window procedure, on the UI thread, at any point GPUI lets Windows
+/// deliver a sent message: it must not touch GPUI's app or entities. Only the first handler set
+/// is kept.
+pub fn set_copydata_handler(
+    handler: impl Fn(isize, &[u8]) -> Option<Vec<u8>> + Send + Sync + 'static,
+) {
+    let _ = COPYDATA_HANDLER.set(Box::new(handler));
+}
+
+/// Arke: a `WM_COPYDATA` for [`set_copydata_handler`]; `None` leaves the message to the default
+/// handling.
+unsafe fn answer_copydata(hwnd: HWND, wparam: WPARAM, lparam: LPARAM) -> Option<LRESULT> {
+    use windows::Win32::System::DataExchange::COPYDATASTRUCT;
+    let handler = COPYDATA_HANDLER.get()?;
+    let data = lparam.0 as *const COPYDATASTRUCT;
+    if data.is_null() {
+        return None;
+    }
+    // SAFETY: for WM_COPYDATA, lParam points to a COPYDATASTRUCT valid during the message.
+    let data = unsafe { &*data };
+    if data.dwData != COPYDATA_ID {
+        return None;
+    }
+    let request: &[u8] = if data.lpData.is_null() || data.cbData == 0 {
+        &[]
+    } else {
+        // SAFETY: lpData holds cbData bytes, valid during the message.
+        unsafe { std::slice::from_raw_parts(data.lpData as *const u8, data.cbData as usize) }
+    };
+    let reply = handler(hwnd.0 as isize, request)?;
+    let sender = HWND(wparam.0 as *mut _);
+    let len = u32::try_from(reply.len()).ok();
+    if let Some(len) = len
+        && !sender.is_invalid()
+        && sender != hwnd
+        && unsafe { IsWindow(Some(sender)) }.as_bool()
+    {
+        let answer = COPYDATASTRUCT {
+            dwData: COPYDATA_ID,
+            cbData: len,
+            lpData: reply.as_ptr() as *mut _,
+        };
+        // A timeout, so a sender that stopped answering can't hang this window.
+        unsafe {
+            SendMessageTimeoutW(
+                sender,
+                WM_COPYDATA,
+                WPARAM(hwnd.0 as usize),
+                LPARAM(&answer as *const COPYDATASTRUCT as isize),
+                SMTO_ABORTIFHUNG | SMTO_BLOCK,
+                COPYDATA_REPLY_TIMEOUT_MS,
+                None,
+            )
+        };
+    }
+    Some(LRESULT(1))
 }
 
 unsafe extern "system" fn window_procedure(
@@ -1609,6 +1708,13 @@ unsafe extern "system" fn window_procedure(
                 LRESULT(0)
             }
         };
+    }
+
+    // Arke: the integration API. It never touches the window state, which may be borrowed.
+    if msg == WM_COPYDATA
+        && let Some(answer) = unsafe { answer_copydata(hwnd, wparam, lparam) }
+    {
+        return answer;
     }
 
     let ptr = unsafe { get_window_long(hwnd, GWLP_USERDATA) } as *mut Weak<WindowsWindowInner>;
@@ -1642,6 +1748,61 @@ pub fn set_popup_mouse_passthrough(hwnd: isize, passthrough: bool) {
     {
         window.mouse_passthrough.set(passthrough);
     }
+}
+
+thread_local! {
+    /// Arke: an OLE drag started from inside GPUI's event dispatch is running on this thread.
+    static IN_MODAL_DRAG: Cell<bool> = const { Cell::new(false) };
+}
+
+/// Arke: marks this thread as running Windows' modal drag loop (`DoDragDrop`) until the guard is
+/// dropped. The loop is entered from inside GPUI's event dispatch, so the app is borrowed and
+/// asking it where the window controls are can only fail: each `WM_NCHITTEST` (every mouse move
+/// over the window) logged a "RefCell already borrowed" error (#338, #343). Meanwhile the hit
+/// test answers without asking; nothing during a drag is a title bar or a caption button.
+pub fn begin_modal_drag() -> ModalDragGuard {
+    IN_MODAL_DRAG.with(|d| d.set(true));
+    ModalDragGuard(())
+}
+
+/// Ends the modal drag mark when dropped (see [`begin_modal_drag`]).
+#[must_use]
+pub struct ModalDragGuard(());
+
+impl Drop for ModalDragGuard {
+    fn drop(&mut self) {
+        IN_MODAL_DRAG.with(|d| d.set(false));
+    }
+}
+
+thread_local! {
+    /// Arke: how many input callbacks are running on this thread (nested ones included).
+    static DISPATCHING_INPUT: Cell<u32> = const { Cell::new(0) };
+}
+
+/// Arke: marks an input callback as running. The app is borrowed for as long as one runs, so a
+/// `WM_NCHITTEST` that something inside it lets through (a message loop run by a handler, such as
+/// Windows' drag loop) can't ask the app where the window controls are: that only failed and
+/// logged a "RefCell already borrowed" error on every mouse move (#338, #343).
+struct DispatchingInput;
+
+impl DispatchingInput {
+    fn enter() -> Self {
+        DISPATCHING_INPUT.with(|n| n.set(n.get() + 1));
+        Self
+    }
+}
+
+impl Drop for DispatchingInput {
+    fn drop(&mut self) {
+        DISPATCHING_INPUT.with(|n| n.set(n.get().saturating_sub(1)));
+    }
+}
+
+/// Whether asking the app for a hit test now could only fail: in Windows' modal drag loop, or
+/// inside an input callback.
+pub(crate) fn in_modal_drag() -> bool {
+    IN_MODAL_DRAG.with(Cell::get) || DISPATCHING_INPUT.with(Cell::get) > 0
 }
 
 pub(crate) fn window_from_hwnd(hwnd: HWND) -> Option<Rc<WindowsWindowInner>> {

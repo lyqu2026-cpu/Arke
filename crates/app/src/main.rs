@@ -8,8 +8,11 @@
 //!                                           memory (see `bench_index.rs`)
 //!   arke --no-resident [path]   don't use or become the resident process
 //!   arke --quit                 quit the resident process
+//!   arke --api <json>           an integration API request; prints the JSON reply (see `api.rs`
+//!                               and `docs/integration.md`)
 //!   arke --home                 what Win+E runs while "Open folders in Arke" is on: opens a window
 //!                               like starting Arke (Settings › "New windows open to")
+//!   arke --search <text>        a new window searching the whole computer for <text>
 //!   arke --restore-explorer     undo the folder handler registration and turn the setting off
 //!   arke --uninstall [--keep-settings] [--quiet] [--dry-run]
 //!                               remove Arke from this PC (see `uninstall.rs`)
@@ -38,6 +41,8 @@
 mod plural;
 
 mod a11y;
+mod api;
+mod archive_password;
 mod assets;
 mod bench;
 mod bench_index;
@@ -54,7 +59,10 @@ mod frame_probe;
 mod global_search;
 mod home;
 mod instance;
+mod localized;
 mod media;
+mod menu_order;
+mod menu_pin_looks;
 mod motion;
 mod net_dialog;
 mod op_center;
@@ -65,6 +73,7 @@ mod popup;
 mod prefs;
 mod press_guard;
 mod properties;
+mod quick_access;
 mod quicklook;
 mod recycle_bin;
 mod remote_shell;
@@ -87,6 +96,8 @@ mod tray;
 mod uninstall;
 mod update;
 mod update_quiet;
+mod update_route;
+mod update_sig;
 mod whats_new;
 mod win;
 mod win_cloud;
@@ -94,6 +105,7 @@ mod win_devnotify;
 mod win_dragimage;
 mod win_e_hook;
 mod win_eject;
+mod win_fast_copy;
 mod win_fast_recycle;
 mod win_fileops;
 mod win_http;
@@ -104,6 +116,7 @@ mod win_menu;
 mod win_menu_parts;
 mod win_net;
 mod win_openinfolder;
+mod win_packaged;
 mod win_pdf;
 mod win_picker;
 mod win_popup;
@@ -167,6 +180,8 @@ struct Args {
     restore_explorer: bool,
     /// A window of its own, not a tab in the window used last (`--new-window`)
     new_window: bool,
+    /// Search the whole computer for this text in the window that opens (`--search <text>`)
+    search: Option<String>,
 }
 
 fn parse_args() -> Args {
@@ -184,6 +199,7 @@ fn parse_args_from(mut it: impl Iterator<Item = std::ffi::OsString>) -> Args {
         page: None,
         restore_explorer: false,
         new_window: false,
+        search: None,
     };
     while let Some(arg) = it.next() {
         match arg.to_str() {
@@ -204,6 +220,14 @@ fn parse_args_from(mut it: impl Iterator<Item = std::ffi::OsString>) -> Args {
             Some("--home") => {}
             Some("--restore-explorer") => args.restore_explorer = true,
             Some(NEW_WINDOW_ARG) => args.new_window = true,
+            // Text to search for; a missing or empty one is ignored.
+            Some("--search") => {
+                args.search = it
+                    .next()
+                    .and_then(|text| text.into_string().ok())
+                    .map(|text| text.trim().to_owned())
+                    .filter(|text| !text.is_empty());
+            }
             // Just updated: the old process's pid follows (already waited for at the start of
             // app_main).
             Some(update::AFTER_UPDATE_ARG) => {
@@ -275,6 +299,28 @@ fn main() -> std::process::ExitCode {
     if args.get(1).map(String::as_str) == Some(uninstall::ARG) {
         rust_i18n::set_locale(&win::ui_locale());
         return uninstall::run_cli(&args[2..]);
+    }
+    // `arke.exe --api <json>`: asks the running Arke, prints its reply and exits (`api.rs`).
+    // `--api -` reads the request from stdin: Windows PowerShell 5.1 drops the quotes inside an
+    // argument it passes to a program, so piping the JSON is the way that works everywhere.
+    if args.get(1).map(String::as_str) == Some(api::ARG) {
+        let json = match args.get(2).map(String::as_str) {
+            Some("-") => {
+                let mut bytes = Vec::new();
+                if let Err(err) = std::io::Read::read_to_end(&mut std::io::stdin(), &mut bytes) {
+                    log::warn!("reading the API request from stdin failed: {err}");
+                }
+                api::stdin_text(&bytes)
+            }
+            other => {
+                // SAFETY: GetCommandLineW returns this process's command line, valid for its life.
+                let raw =
+                    unsafe { windows::Win32::System::Environment::GetCommandLineW().to_string() }
+                        .unwrap_or_default();
+                api::command_line_request(other.unwrap_or_default(), &raw)
+            }
+        };
+        return run_api_cli(json.trim());
     }
     // A Browse button's file dialog, shown in its own process (see `win_picker.rs`).
     if args.get(1).map(String::as_str) == Some(win_picker::PICK_ARG) {
@@ -385,6 +431,8 @@ fn app_main(mut args: Args) {
     } else if args.resident || args.quit {
         let request = if args.quit {
             Request::Quit
+        } else if let Some(text) = &args.search {
+            Request::Search(text.clone())
         } else {
             Request::Open(OpenRequest {
                 path: args.path.clone(),
@@ -421,6 +469,7 @@ fn app_main(mut args: Args) {
         .map(|mode| Bench::new(mode, args.bench_out));
     let start_path = args.path;
     let start_page = args.page;
+    let start_search = args.search;
     let resident = listener.is_some();
     log::info!(
         "{}",
@@ -491,6 +540,7 @@ fn app_main(mut args: Args) {
             cx,
         );
         follow_language_setting(&store, cx);
+        follow_update_route(&store, cx);
         let remotes = remote_shell::start(&store, cx);
         let services = Services {
             fs: Arc::new(arke_remote::RoutingFs::new(
@@ -516,8 +566,10 @@ fn app_main(mut args: Args) {
                 explorer::set_open_with(apps, icons);
             });
         }
+        // The integration API (`api.rs`): `WM_COPYDATA` to any window, and the resident pipe.
+        let api_queue = start_api(cx, &services);
         if bench.is_none() {
-            follow_drive_removals(cx);
+            follow_drive_removals(cx, Arc::clone(&services.remotes));
             teracopy::detect_in_background();
             quicklook::detect_in_background();
         }
@@ -561,6 +613,8 @@ fn app_main(mut args: Args) {
             update_quiet::mark_resident(resident, background);
             cx.on_app_quit(|cx| {
                 update_quiet::on_quit(cx);
+                // The process ends right after: the last lines (why it quit) go in the file first.
+                crashlog::flush(Duration::from_millis(200));
                 async {}
             })
             .detach();
@@ -605,8 +659,11 @@ fn app_main(mut args: Args) {
             cx.quit();
             return;
         }
+        if let Some(text) = start_search.filter(|_| first_window_opened) {
+            search_computer(cx, text);
+        }
         if let Some(listener) = listener {
-            start_resident_service(cx, listener, services);
+            start_resident_service(cx, listener, services, api_queue);
             quit_with_last_window_unless_resident(cx);
             resident::watch(cx);
             if background {
@@ -615,6 +672,15 @@ fn app_main(mut args: Args) {
         }
         if !benchmarking {
             prewarm_shell_host();
+            // How pinned Windows commands looked, for the first menu (#278).
+            let pinned = settings::SettingsStore::global(cx)
+                .read(cx)
+                .settings
+                .menu_pinned
+                .clone();
+            let _ = std::thread::Builder::new()
+                .name("menu-icons-load".into())
+                .spawn(move || menu_pin_looks::load(&pinned));
         }
         if !background {
             cx.activate(true);
@@ -624,19 +690,25 @@ fn app_main(mut args: Args) {
 
 /// Drives removed, locked or dismounted from outside Arke: watchers on them were already closed
 /// on the notification thread (`win_devnotify.rs`); here every window moves its tabs off the drive.
-fn follow_drive_removals(cx: &mut App) {
+/// A drive plugged in or pulled out also has every sidebar read its drives again.
+fn follow_drive_removals(cx: &mut App, remotes: Arc<arke_remote::Remotes>) {
     let events = win_devnotify::start();
+    // Phones already connected (#292); later ones arrive as `Phones` below.
+    remote_shell::refresh_phones(Arc::clone(&remotes), cx);
     cx.spawn(async move |cx| {
         while let Ok(event) = events.recv_async().await {
-            cx.update(|cx| match event {
+            match event {
                 win_devnotify::DriveEvent::Leaving(drive) => {
-                    workspace::leave_drive_everywhere(&drive, cx);
-                    workspace::reload_places_everywhere(cx);
+                    cx.update(|cx| workspace::leave_drive_everywhere(&drive, cx));
                 }
-                win_devnotify::DriveEvent::Arrived(_) => {
-                    workspace::reload_places_everywhere(cx);
+                win_devnotify::DriveEvent::Changed => {
+                    cx.update(workspace::reload_places_everywhere);
                 }
-            });
+                win_devnotify::DriveEvent::Phones => {
+                    let remotes = Arc::clone(&remotes);
+                    cx.update(|cx| remote_shell::refresh_phones(remotes, cx));
+                }
+            }
         }
     })
     .detach();
@@ -984,6 +1056,31 @@ fn handle_open(cx: &mut App, services: &Services, open: OpenRequest, received: I
     }
 }
 
+/// `arke.exe --search <text>` reaching the resident Arke: a window of its own that searches the
+/// whole computer, brought to the front.
+fn handle_search(cx: &mut App, services: &Services, text: String, received: Instant) -> bool {
+    let Some(handle) =
+        open_explorer_window(cx, services, None, None, Instant::now(), Some(received))
+    else {
+        return false;
+    };
+    let _ = handle.update(cx, |workspace, window, cx| {
+        bring_to_front(window, None);
+        workspace.search_computer(text, window, cx);
+    });
+    cx.activate(true);
+    true
+}
+
+/// Starts a whole computer search for `text` in the window used last.
+fn search_computer(cx: &mut App, text: String) {
+    if let Some(host) = last_window(cx) {
+        let _ = host.update(cx, |workspace, window, cx| {
+            workspace.search_computer(text, window, cx);
+        });
+    }
+}
+
 /// How long after a maximized window opened behind the others Windows may still activate it: it
 /// shows such a window later (`ShowWindowAsync(SW_MAXIMIZE)`), and maximizing always activates.
 const BEHIND_SETTLE: Duration = Duration::from_millis(250);
@@ -1190,6 +1287,18 @@ fn follow_jump_list(store: &gpui::Entity<settings::SettingsStore>, cx: &mut App)
 
 /// "Language" setting: switch when loaded or changed and redraw all windows (input placeholders
 /// update in new tabs only).
+/// Updates go through the download route in Settings (`update_route.rs`).
+fn follow_update_route(store: &gpui::Entity<settings::SettingsStore>, cx: &mut App) {
+    let apply = |store: &settings::SettingsStore| {
+        if store.loaded {
+            update_route::set(&store.settings.update_route);
+        }
+    };
+    apply(store.read(cx));
+    cx.observe(store, move |store, cx| apply(store.read(cx)))
+        .detach();
+}
+
 fn follow_language_setting(store: &gpui::Entity<settings::SettingsStore>, cx: &mut App) {
     let mut applied: Option<settings::Language> = None;
     cx.observe(store, move |store, cx| {
@@ -1435,19 +1544,34 @@ fn hand_off(request: &Request) -> HandOff {
     HandOff::Standalone
 }
 
-fn start_resident_service(cx: &mut App, listener: instance::Listener, services: Services) {
+fn start_resident_service(
+    cx: &mut App,
+    listener: instance::Listener,
+    services: Services,
+    api_queue: flume::Sender<api::Action>,
+) {
     let (tx, rx) = flume::unbounded::<(Request, Instant, flume::Sender<bool>)>();
     instance::serve(listener, move |request| {
+        // `arke.exe --api`: answered here, from the snapshot, without waiting for the UI thread.
+        if let Request::Api(json) = &request {
+            return instance::Reply::Data(api::serve(
+                json.as_bytes(),
+                api::Target::LastUsed,
+                &api_queue,
+            ));
+        }
         let received = Instant::now();
         let (ack_tx, ack_rx) = flume::bounded(1);
         if tx.send((request, received, ack_tx)).is_err() {
-            return false;
+            return instance::Reply::Status(false);
         }
         // If the UI thread doesn't handle it in time, reply failure so the sender opens its own
         // window.
-        ack_rx
-            .recv_timeout(instance::SERVER_ACK_TIMEOUT)
-            .unwrap_or(false)
+        instance::Reply::Status(
+            ack_rx
+                .recv_timeout(instance::SERVER_ACK_TIMEOUT)
+                .unwrap_or(false),
+        )
     });
     cx.spawn(async move |cx| {
         while let Ok((request, received, ack)) = rx.recv_async().await {
@@ -1458,11 +1582,166 @@ fn start_resident_service(cx: &mut App, listener: instance::Listener, services: 
                 }
                 Request::Select { folder, items } => select_items(cx, &services, &folder, &items),
                 Request::Open(open) => handle_open(cx, &services, open, received),
+                Request::Search(text) => handle_search(cx, &services, text, received),
+                // Answered on the pipe thread.
+                Request::Api(_) => false,
             });
             let _ = ack.send(handled);
         }
     })
     .detach();
+}
+
+/// The integration API (`api.rs`): requests sent to any window as `WM_COPYDATA` are answered in its
+/// window procedure, and those from `arke.exe --api` on the resident pipe thread; both queue their
+/// `open` and `run` here, for the UI thread. Returns the queue for the pipe.
+fn start_api(cx: &mut App, services: &Services) -> flume::Sender<api::Action> {
+    let (tx, rx) = flume::unbounded::<api::Action>();
+    let queue = tx.clone();
+    gpui_windows::set_copydata_handler(move |hwnd, request| {
+        Some(api::serve(request, api::Target::Window(hwnd), &queue))
+    });
+    let services = services.clone();
+    cx.spawn(async move |cx| {
+        while let Ok(action) = rx.recv_async().await {
+            cx.update(|cx| apply_api(cx, &services, action));
+        }
+    })
+    .detach();
+    cx.on_window_closed(|_, id| api::forget(id.as_u64()))
+        .detach();
+    tx
+}
+
+/// The window an API `open` or `run` is for: the one it was sent to when that is a workspace
+/// window, else the one used last.
+fn api_window(cx: &App, target: api::Target) -> Option<gpui::WindowHandle<Workspace>> {
+    let sent_to = match target {
+        api::Target::Window(hwnd) => api::window_of(hwnd).and_then(|id| {
+            cx.windows()
+                .into_iter()
+                .find(|w| w.window_id().as_u64() == id)
+                .and_then(|w| w.downcast::<Workspace>())
+        }),
+        api::Target::LastUsed => None,
+    };
+    sent_to.or_else(|| last_window(cx))
+}
+
+/// Does what an API request queued (`api.rs`).
+fn apply_api(cx: &mut App, services: &Services, action: api::Action) {
+    match action {
+        api::Action::Open {
+            target,
+            path,
+            new_tab,
+            select,
+        } => {
+            if let Some(host) = api_window(cx, target) {
+                let names: Vec<Arc<str>> = select.iter().map(|n| Arc::from(n.as_str())).collect();
+                let shown = host.update(cx, |workspace, window, cx| {
+                    workspace.api_open(path.clone(), new_tab, names, window, cx);
+                    bring_to_front(window, None);
+                });
+                if shown.is_ok() {
+                    cx.activate(true);
+                    return;
+                }
+            }
+            // No window open (only the notification area icon): one opens on it.
+            open_target(cx, services, Target::Folder(path), &select, None);
+        }
+        api::Action::Run { target, id } => {
+            let Some(command) = commands::find(id) else {
+                return;
+            };
+            let host = api_window(cx, target).or_else(|| {
+                open_fresh(cx, services, Instant::now())
+                    .then(|| last_window(cx))
+                    .flatten()
+            });
+            if let Some(host) = host {
+                let front = commands::moves_focus(command.id);
+                let _ = host.update(cx, |workspace, window, cx| {
+                    if front {
+                        bring_to_front(window, None);
+                    }
+                    workspace.api_run(command, window, cx);
+                });
+                if front {
+                    cx.activate(true);
+                }
+            }
+        }
+    }
+}
+
+/// `arke.exe --api <json>`: asks the resident Arke and prints its reply. With no Arke running,
+/// `state` and `commands` are answered here; `open` and `run` start one in the background first.
+fn run_api_cli(json: &str) -> std::process::ExitCode {
+    // A GUI program has no console of its own: write to the one it was started from.
+    bench_index::console::attach();
+    rust_i18n::set_locale(&win::ui_locale());
+    api::print_reply(&api_cli_reply(json))
+}
+
+/// How long `arke.exe --api` waits for an Arke it started to answer.
+const API_START_TIMEOUT: Duration = Duration::from_secs(20);
+
+fn api_cli_reply(json: &str) -> Vec<u8> {
+    let request = match api::parse(json.as_bytes()) {
+        Ok(request) => request,
+        Err(error) => return api::error_reply(&error),
+    };
+    let message = api::encode_request(&api::absolute(request));
+    match instance::ask(&message, instance::CLIENT_TIMEOUT) {
+        instance::Asked::Replied(reply) => return reply,
+        instance::Asked::Failed => return api_unavailable(),
+        instance::Asked::NoServer => {}
+    }
+    // Nothing is running: what needs no window is answered here, as are requests that fail.
+    let local = api::answer(message.as_bytes(), api::Target::LastUsed, &api::NotRunning);
+    if local.action.is_none() {
+        return local.reply;
+    }
+    if !start_background_arke() {
+        return api_unavailable();
+    }
+    let deadline = Instant::now() + API_START_TIMEOUT;
+    while Instant::now() < deadline {
+        match instance::ask(&message, Duration::from_secs(10)) {
+            instance::Asked::Replied(reply) => return reply,
+            instance::Asked::Failed => return api_unavailable(),
+            instance::Asked::NoServer => std::thread::sleep(Duration::from_millis(100)),
+        }
+    }
+    api_unavailable()
+}
+
+fn api_unavailable() -> Vec<u8> {
+    api::error_reply(&api::ApiError::new(
+        api::ErrorCode::Unavailable,
+        "Arke did not answer in time",
+    ))
+}
+
+/// Starts Arke in the background (`--background`, no window) for an API request that needs one.
+/// It gets no console handles, so a script reading this command's output isn't held open by it.
+fn start_background_arke() -> bool {
+    use std::os::windows::process::CommandExt as _;
+    /// No console for the new process.
+    const DETACHED_PROCESS: u32 = 0x0000_0008;
+    let Ok(exe) = std::env::current_exe() else {
+        return false;
+    };
+    std::process::Command::new(exe)
+        .arg("--background")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .creation_flags(DETACHED_PROCESS)
+        .spawn()
+        .is_ok()
 }
 
 /// Resident mode: a notification area icon so Arke is reachable with all windows closed (left click
@@ -1626,7 +1905,7 @@ fn open_explorer_window(
     // touch locations that might block. No path given: if settings say "last location/last tabs",
     // open there (switching once settings finish loading).
     let first_window = cx.windows().is_empty();
-    let (last, mut sessions, place, single_window, loaded) = {
+    let (last, mut sessions, pinned, place, single_window, loaded) = {
         let store = settings::SettingsStore::global(cx).read(cx);
         let start = update::start_location(store.settings.start_location);
         let last =
@@ -1644,6 +1923,14 @@ fn open_explorer_window(
         } else {
             Vec::new()
         };
+        // Pinned tabs come back in front of a folder asked for whatever the start location is
+        // (#298); with the last tabs they are part of the session.
+        let pinned = (store.loaded
+            && first_window
+            && bench.is_none()
+            && start != settings::StartLocation::LastSession)
+            .then(|| store.settings.last_pinned_tabs())
+            .filter(|s| !s.tabs.is_empty());
         // Window position: the first window uses the last one; later windows are centered instead
         // of stacking.
         let place = (first_window && bench.is_none())
@@ -1655,6 +1942,7 @@ fn open_explorer_window(
         (
             last,
             sessions,
+            pinned,
             place,
             store.settings.single_window,
             store.loaded,
@@ -1684,6 +1972,9 @@ fn open_explorer_window(
         let handle = open_workspace_window(cx, services, start, bench, started_at, received)?;
         let _ = handle.update(cx, |workspace, window, cx| {
             workspace.show_taken_over(asked.target, asked.select, window, cx);
+            if let Some(pinned) = &pinned {
+                workspace.restore_session_before(pinned, window, cx);
+            }
             // Settings not read yet: the last session may still come back around this window.
             if wait_for_session {
                 workspace.restore_session_when_read();
@@ -1859,6 +2150,20 @@ mod arg_tests {
         assert!(args.page.is_none() && args.path.is_none() && !args.restore_explorer);
         let args = parse(&["--restore-explorer"]);
         assert!(args.restore_explorer && args.path.is_none() && args.page.is_none());
+    }
+
+    #[test]
+    fn search_takes_the_text_after_it() {
+        assert_eq!(
+            parse(&["--search", "tax return"]).search.as_deref(),
+            Some("tax return")
+        );
+        let args = parse(&["--search", "  notes ", r"C:\work"]);
+        assert_eq!(args.search.as_deref(), Some("notes"));
+        assert_eq!(args.path, Some(PathBuf::from(r"C:\work")));
+        assert_eq!(parse(&["--search"]).search, None);
+        assert_eq!(parse(&["--search", " "]).search, None);
+        assert_eq!(parse(&[r"C:\work"]).search, None);
     }
 
     #[test]

@@ -7,7 +7,7 @@ use std::path::PathBuf;
 
 use gpui::{
     AnimationExt, App, ClickEvent, Context, FocusHandle, KeyBinding, SharedString, Window, actions,
-    deferred, div, prelude::*,
+    anchored, deferred, div, point, prelude::*, px,
 };
 use rust_i18n::t;
 
@@ -39,6 +39,15 @@ pub(crate) enum ConfirmAction {
         purge: Vec<PathBuf>,
         follow: OpFollowUp,
     },
+}
+
+/// Why items to recycle would be deleted permanently instead.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum NoBinWhy {
+    /// Their drive has no Recycle Bin (or it is turned off).
+    NoBin,
+    /// Each is bigger than its drive's Recycle Bin may hold.
+    TooBig,
 }
 
 pub(crate) struct Confirm {
@@ -113,28 +122,30 @@ impl Explorer {
         );
     }
 
-    /// Some items to recycle are where Windows has no Recycle Bin (network share, USB stick):
-    /// they would be deleted permanently, so ask like a permanent delete, naming why.
+    /// Some items to recycle can't go to the Recycle Bin: where Windows has none (network share,
+    /// USB stick), or too big for it. They would be deleted permanently, so ask like a permanent
+    /// delete, naming why.
     pub(super) fn ask_no_recycle_bin(
         &mut self,
         recycle: Vec<PathBuf>,
         purge: Vec<PathBuf>,
+        why: NoBinWhy,
         follow: OpFollowUp,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let mut body = match purge.as_slice() {
-            [one] => t!(
-                "confirm.no_bin_one",
-                name = one.file_name().map_or_else(
-                    || one.display().to_string(),
-                    |n| n.to_string_lossy().into_owned()
-                )
-            ),
-            many => t!(
-                "confirm.no_bin_many",
-                count = arke_core::format::format_count(many.len())
-            ),
+        let name = |path: &PathBuf| {
+            path.file_name().map_or_else(
+                || path.display().to_string(),
+                |n| n.to_string_lossy().into_owned(),
+            )
+        };
+        let count = arke_core::format::format_count(purge.len());
+        let mut body = match (why, purge.as_slice()) {
+            (NoBinWhy::NoBin, [one]) => t!("confirm.no_bin_one", name = name(one)),
+            (NoBinWhy::NoBin, _) => t!("confirm.no_bin_many", count = count),
+            (NoBinWhy::TooBig, [one]) => t!("confirm.too_big_one", name = name(one)),
+            (NoBinWhy::TooBig, _) => t!("confirm.too_big_many", count = count),
         }
         .into_owned();
         if !recycle.is_empty() {
@@ -154,6 +165,19 @@ impl Explorer {
             window,
             cx,
         );
+    }
+
+    /// Asks about the items a recycle kept back as too big for the Recycle Bin (`too_big_ask`):
+    /// Delete removes exactly those, permanently; Cancel leaves them. Called during render, since
+    /// the dialog takes focus, and only once no other dialog is open.
+    pub(super) fn poll_too_big_ask(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.confirm.is_some() {
+            return;
+        }
+        let Some((purge, follow)) = self.too_big_ask.take() else {
+            return;
+        };
+        self.ask_no_recycle_bin(Vec::new(), purge, NoBinWhy::TooBig, follow, window, cx);
     }
 
     /// Ask once before recycling (when "Confirm before deleting" is on).
@@ -270,9 +294,14 @@ impl Explorer {
         self.confirm.as_ref().map(|c| c.body.to_string())
     }
 
-    pub(super) fn render_confirm(&self, cx: &mut Context<Self>) -> Option<gpui::AnyElement> {
+    pub(super) fn render_confirm(
+        &self,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) -> Option<gpui::AnyElement> {
+        let viewport = window.viewport_size();
         if let Some(confirm) = &self.confirm {
-            return Some(Self::confirm_dialog(confirm, None, cx));
+            return Some(Self::confirm_dialog(confirm, None, viewport, cx));
         }
         // A cancelled dialog fading out. Its buttons and veil act on `self.confirm`, which is
         // already gone, so they do nothing meanwhile.
@@ -280,6 +309,7 @@ impl Explorer {
         Some(Self::confirm_dialog(
             &ghost.value,
             Some(ghost.id("confirm-leave")),
+            viewport,
             cx,
         ))
     }
@@ -292,102 +322,111 @@ impl Explorer {
     fn confirm_dialog(
         confirm: &Confirm,
         leaving: Option<gpui::ElementId>,
+        viewport: gpui::Size<gpui::Pixels>,
         cx: &mut Context<Self>,
     ) -> gpui::AnyElement {
         let out = leaving.is_some();
+        // The veil covers the whole window (sidebar, tabs and title bar too) and, while the
+        // dialog is open, takes every press, hover and wheel turn, so nothing behind it can be
+        // clicked or changed (#368). Fading out, it lets them through like Quick Look's.
         deferred(
-            div()
-                .id("confirm-veil")
-                .absolute()
-                .inset_0()
-                .flex()
-                .items_center()
-                .justify_center()
-                .bg(theme::veil())
-                .on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
-                    this.confirm_cancel(&ConfirmCancel, window, cx);
-                }))
-                .child(
-                    div()
-                        .id("confirm")
-                        .a11y(gpui::Role::AlertDialog, confirm.title.clone())
-                        .aria_description(confirm.body.clone())
-                        .key_context(CONTEXT)
-                        .track_focus(&confirm.focus)
-                        .on_action(cx.listener(Self::confirm_ok))
-                        .on_action(cx.listener(Self::confirm_cancel))
-                        .w(crate::theme::scaled_px(420.))
-                        .p(theme::s_20())
-                        .flex()
-                        .flex_col()
-                        .gap(theme::s_12())
-                        .rounded(theme::r_12())
-                        .bg(theme::overlay())
-                        .shadow(theme::elev_3())
-                        .ui_font()
-                        .text_size(theme::fs_14())
-                        .text_color(theme::text())
-                        .on_click(|_, _, cx| cx.stop_propagation())
-                        .child(
-                            div()
-                                .text_size(theme::fs_15())
-                                .font_weight(theme::FW_STRONG)
-                                .child(confirm.title.clone()),
-                        )
-                        .child(
-                            div()
-                                .text_color(theme::text_muted())
-                                .child(confirm.body.clone()),
-                        )
-                        .child(
-                            div()
-                                .pt(theme::s_8())
-                                .flex()
-                                .justify_end()
-                                .gap(theme::s_8())
-                                .child(
-                                    dialog_button(
-                                        "confirm-cancel",
-                                        t!("confirm.cancel").into_owned().into(),
-                                        false,
-                                        false,
+            anchored().position(point(px(0.), px(0.))).child(
+                div()
+                    .id("confirm-veil")
+                    .when(!out, |d| {
+                        d.occlude().on_scroll(|_, _, cx| cx.stop_propagation())
+                    })
+                    .w(viewport.width)
+                    .h(viewport.height)
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .bg(theme::veil())
+                    .on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
+                        this.confirm_cancel(&ConfirmCancel, window, cx);
+                    }))
+                    .child(
+                        div()
+                            .id("confirm")
+                            .a11y(gpui::Role::AlertDialog, confirm.title.clone())
+                            .aria_description(confirm.body.clone())
+                            .key_context(CONTEXT)
+                            .track_focus(&confirm.focus)
+                            .on_action(cx.listener(Self::confirm_ok))
+                            .on_action(cx.listener(Self::confirm_cancel))
+                            .w(crate::theme::scaled_px(420.))
+                            .p(theme::s_20())
+                            .flex()
+                            .flex_col()
+                            .gap(theme::s_12())
+                            .rounded(theme::r_12())
+                            .bg(theme::overlay())
+                            .shadow(theme::elev_3())
+                            .ui_font()
+                            .text_size(theme::fs_14())
+                            .text_color(theme::text())
+                            .on_click(|_, _, cx| cx.stop_propagation())
+                            .child(
+                                div()
+                                    .text_size(theme::fs_15())
+                                    .font_weight(theme::FW_STRONG)
+                                    .child(confirm.title.clone()),
+                            )
+                            .child(
+                                div()
+                                    .text_color(theme::text_muted())
+                                    .child(confirm.body.clone()),
+                            )
+                            .child(
+                                div()
+                                    .pt(theme::s_8())
+                                    .flex()
+                                    .justify_end()
+                                    .gap(theme::s_8())
+                                    .child(
+                                        dialog_button(
+                                            "confirm-cancel",
+                                            t!("confirm.cancel").into_owned().into(),
+                                            false,
+                                            false,
+                                        )
+                                        .on_click(
+                                            cx.listener(|this, _: &ClickEvent, window, cx| {
+                                                this.confirm_cancel(&ConfirmCancel, window, cx);
+                                            }),
+                                        ),
                                     )
-                                    .on_click(cx.listener(
-                                        |this, _: &ClickEvent, window, cx| {
-                                            this.confirm_cancel(&ConfirmCancel, window, cx);
-                                        },
-                                    )),
-                                )
-                                .child(
-                                    dialog_button(
-                                        "confirm-ok",
-                                        confirm.ok.clone(),
-                                        true,
-                                        confirm.danger,
-                                    )
-                                    .on_click(cx.listener(
-                                        |this, _: &ClickEvent, window, cx| {
-                                            this.confirm_ok(&ConfirmOk, window, cx);
-                                        },
-                                    )),
-                                ),
-                        ),
-                )
-                .with_animation(
-                    leaving.unwrap_or_else(|| gpui::ElementId::Name("confirm-appear".into())),
-                    if out {
-                        crate::motion::exit()
-                    } else {
-                        crate::motion::enter()
-                    },
-                    move |el, t| {
+                                    .child(
+                                        dialog_button(
+                                            "confirm-ok",
+                                            confirm.ok.clone(),
+                                            true,
+                                            confirm.danger,
+                                        )
+                                        .on_click(
+                                            cx.listener(|this, _: &ClickEvent, window, cx| {
+                                                this.confirm_ok(&ConfirmOk, window, cx);
+                                            }),
+                                        ),
+                                    ),
+                            ),
+                    )
+                    .with_animation(
+                        leaving.unwrap_or_else(|| gpui::ElementId::Name("confirm-appear".into())),
                         if out {
-                            crate::motion::slide_out(el, t, 0., 0.)
+                            crate::motion::exit()
                         } else {
-                            crate::motion::slide_in(el, t, 0., 0.)
-                        }
-                    },
-                ),
+                            crate::motion::enter()
+                        },
+                        move |el, t| {
+                            if out {
+                                crate::motion::slide_out(el, t, 0., 0.)
+                            } else {
+                                crate::motion::slide_in(el, t, 0., 0.)
+                            }
+                        },
+                    ),
+            ),
         )
         .with_priority(2)
         .into_any_element()

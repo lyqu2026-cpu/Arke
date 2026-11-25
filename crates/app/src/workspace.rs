@@ -61,6 +61,8 @@ mod shelf_view;
 mod shortcuts;
 #[path = "workspace_sidebar.rs"]
 mod sidebar;
+#[path = "workspace_sidebar_keys.rs"]
+pub(crate) mod sidebar_keys;
 #[path = "workspace_tabdrag.rs"]
 mod tabdrag;
 #[path = "workspace_tabghost.rs"]
@@ -91,6 +93,8 @@ actions!(
     workspace,
     [
         NewTab,
+        /// Ctrl+N: another Arke window, on the folder of this tab.
+        NewWindow,
         OpenPalette,
         /// Ctrl+Shift+P: the same box, searching commands.
         OpenCommandPalette,
@@ -133,10 +137,12 @@ pub(crate) fn bind_keys(cx: &mut App) {
     settings_panel::bind_keys(cx);
     uninstall_page::bind_keys(cx);
     crate::net_dialog::bind_keys(cx);
+    crate::archive_password::bind_keys(cx);
     crate::recycle_bin::bind_keys(cx);
     let ctx = Some("Workspace");
     cx.bind_keys([
         KeyBinding::new("ctrl-t", OpenPalette, ctx),
+        KeyBinding::new("ctrl-n", NewWindow, ctx),
         KeyBinding::new("ctrl-shift-p", OpenCommandPalette, ctx),
         KeyBinding::new("ctrl-w", CloseTab, ctx),
         KeyBinding::new("ctrl-shift-t", ReopenClosedTab, ctx),
@@ -148,7 +154,10 @@ pub(crate) fn bind_keys(cx: &mut App) {
         KeyBinding::new("ctrl-shift-s", ToggleSyncBrowsing, ctx),
         KeyBinding::new("ctrl-shift-d", CompareFolders, ctx),
         KeyBinding::new("ctrl-b", ToggleSidebar, ctx),
+        KeyBinding::new("f6", sidebar_keys::FocusNextRegion, ctx),
+        KeyBinding::new("shift-f6", sidebar_keys::FocusPrevRegion, ctx),
     ]);
+    sidebar_keys::bind_keys(cx);
     // The folder keys also work on the pages that cover a tab (Home, Settings, the Recycle Bin,
     // What's new), which step aside for the folder under them (#77).
     for page in ["HomePage", "SettingsPage", "RecycleBin", "WhatsNewPage"] {
@@ -356,6 +365,8 @@ pub(crate) struct Workspace {
     expanded: HashSet<PathBuf>,
     /// The tree node just expanded or collapsed: its chevron turns and its children fade in.
     tree_cue: (Option<PathBuf>, crate::motion::Cue),
+    /// A tab was just split: the new right pane (its view) slides in from the right as it fades in.
+    split_cue: (Option<gpui::EntityId>, crate::motion::Cue),
     tree_children: HashMap<PathBuf, sidebar::TreeChildren>,
     /// Folders a background check found to have no subfolders (no chevron in the tree).
     tree_leaf: HashSet<PathBuf>,
@@ -366,14 +377,21 @@ pub(crate) struct Workspace {
     /// middle click asked for is already open there.
     /// Dragging the sidebar edge: the live width is kept in the theme and saved on release.
     pub(crate) sidebar_resizing: bool,
+    /// The line between the sidebar's places and its tabs is dragged: where the pointer took it
+    /// and how tall the places were then (pixels), and how tall they are now.
+    pub(super) split_drag: Option<(gpui::Pixels, gpui::Pixels, gpui::Pixels)>,
     tab_flash: Option<(u64, u32)>,
     pub(crate) palette: Option<(Entity<LocationPalette>, Subscription)>,
     /// The dismissed palette fading out (see `motion::Leaving`).
     closing_palette: Option<crate::motion::Leaving<Entity<LocationPalette>>>,
     /// Network login/connect dialog.
     net_dialog: Option<NetDialogSlot>,
+    /// An archive's password, asked when extracting it (#346).
+    archive_password: Option<ArchivePasswordSlot>,
     /// Saved workspaces panel.
     workspaces: Option<(Entity<saved::WorkspacesPanel>, Subscription)>,
+    /// The saved workspace this window was opened from or saved as last (#269).
+    saved_shown: Option<saved::ShownWorkspace>,
     _saved_workspaces: Subscription,
     /// Open Settings page (holds focus).
     settings_panel: Option<settings_panel::SettingsPage>,
@@ -414,6 +432,8 @@ pub(crate) struct Workspace {
     /// A close is pending (the pointer left the open sidebar).
     peek_closing: bool,
     sidebar_ui: rail::SidebarUi,
+    /// The sidebar has the keyboard (F6, `sidebar_keys`).
+    sidebar_focus: gpui::FocusHandle,
     /// Repaint when the shelf changes (any window may change it).
     _shelf: Subscription,
     last_viewport_width: gpui::Pixels,
@@ -439,6 +459,15 @@ pub(crate) struct Workspace {
     look_seen: u32,
     /// How this window's start is timed; handed to the pane its first frame shows.
     start_clock: StartClock,
+}
+
+/// Open archive password dialog, and the pane and archive it extracts.
+struct ArchivePasswordSlot {
+    dialog: Entity<crate::archive_password::ArchivePasswordDialog>,
+    view: Entity<Explorer>,
+    archive: PathBuf,
+    here: bool,
+    _events: Subscription,
 }
 
 /// Open network dialog, plus the tab and path to reopen after a successful login.
@@ -467,6 +496,62 @@ impl Workspace {
             _events: events,
         });
         cx.notify();
+    }
+
+    /// Asks for the password of the archive `view` is extracting; that pane then extracts with it.
+    fn ask_password(
+        &mut self,
+        view: &Entity<Explorer>,
+        ask: &crate::archive_password::PasswordAsk,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let (view, ask) = (view.clone(), ask.clone());
+        let name = ask.archive.file_name().map_or_else(
+            || ask.archive.display().to_string(),
+            |n| n.to_string_lossy().into_owned(),
+        );
+        let wrong = ask.wrong;
+        let dialog = cx
+            .new(|cx| crate::archive_password::ArchivePasswordDialog::new(name, wrong, window, cx));
+        let events = cx.subscribe_in(&dialog, window, Self::on_archive_password);
+        self.archive_password = Some(ArchivePasswordSlot {
+            dialog,
+            view,
+            archive: ask.archive,
+            here: ask.here,
+            _events: events,
+        });
+        cx.notify();
+    }
+
+    fn on_archive_password(
+        &mut self,
+        _: &Entity<crate::archive_password::ArchivePasswordDialog>,
+        event: &crate::archive_password::ArchivePasswordEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(slot) = self.archive_password.take() else {
+            return;
+        };
+        self.focus_active(window, cx);
+        if let crate::archive_password::ArchivePasswordEvent::Submit(password) = event {
+            let password = password.clone();
+            slot.view.update(cx, |v, cx| {
+                v.extract_archive(slot.archive, slot.here, Some(password), cx);
+            });
+        }
+        cx.notify();
+    }
+
+    #[cfg(test)]
+    pub(crate) fn archive_password_for_test(
+        &self,
+    ) -> Option<Entity<crate::archive_password::ArchivePasswordDialog>> {
+        self.archive_password
+            .as_ref()
+            .map(|slot| slot.dialog.clone())
     }
 
     fn on_net_dialog(
@@ -682,6 +767,9 @@ impl Workspace {
             this.sync_look(window, cx);
             this.recycle_refresh(cx);
             this.home_refresh(cx);
+            // A folder pinned to Quick Access in File Explorer shows up in the favorites (#45).
+            let places = this.active_view().read(cx).places.clone();
+            crate::quick_access::refresh(&this.services.shell, places, cx);
             // Another program may have added or deleted files.
             this.refresh_disk_space(cx);
             // QuickLook may have been started or quit while Arke was in the background.
@@ -724,6 +812,7 @@ impl Workspace {
             active: 0,
             expanded: HashSet::new(),
             tree_cue: (None, crate::motion::Cue::default()),
+            split_cue: (None, crate::motion::Cue::default()),
             tree_children: HashMap::new(),
             tree_leaf: HashSet::new(),
             sidebar_menu: None,
@@ -732,7 +821,9 @@ impl Workspace {
             palette: None,
             closing_palette: None,
             net_dialog: None,
+            archive_password: None,
             workspaces: None,
+            saved_shown: None,
             _saved_workspaces: saved_workspaces,
             settings_panel: None,
             recycle_page: None,
@@ -745,6 +836,7 @@ impl Workspace {
                 Startup::Done
             },
             sidebar_resizing: false,
+            split_drag: None,
             resizing: false,
             title_layout: crate::explorer::TitleLayout::default(),
             held_buttons: crate::press_guard::HeldButtons::default(),
@@ -760,6 +852,7 @@ impl Workspace {
             rail_hover: 0,
             peek_closing: false,
             sidebar_ui: rail::SidebarUi::default(),
+            sidebar_focus: cx.focus_handle(),
             _shelf: shelf,
             last_viewport_width: crate::theme::scaled_px(1200.),
             window_title: String::new(),
@@ -812,7 +905,8 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.restore_tabs(session, true, window, cx);
+        let ids = self.restore_tabs(session, true, window, cx);
+        self.restore_shown_workspace(session.workspace.as_ref(), &ids, None);
         self.active = session.active.min(self.tabs.len() - 1);
         self.keep_pins_first();
         self.focus_active(window, cx);
@@ -821,7 +915,7 @@ impl Workspace {
 
     /// Restores the last session's tabs before the tabs open now, which stay in front: the
     /// window was opened on a folder before the settings were read.
-    fn restore_session_before(
+    pub(crate) fn restore_session_before(
         &mut self,
         session: &crate::settings::Session,
         window: &mut Window,
@@ -835,6 +929,8 @@ impl Workspace {
             .map(Path::to_path_buf);
         // The folder asked for is open already: no second tab of it.
         let mut session = session.clone();
+        // The tab open now, when it stands for a tab of the session's workspace.
+        let mut kept_in_workspace = None;
         if let Some(path) = showing
             && let Some(ix) = session
                 .tabs
@@ -845,8 +941,20 @@ impl Workspace {
             if let Some(tab) = self.tabs.get_mut(self.active) {
                 tab.pinned |= saved.pinned;
             }
+            if let Some(shown) = session.workspace.as_mut() {
+                if shown.tabs.contains(&ix) {
+                    kept_in_workspace = self.tabs.get(self.active).map(|t| t.id);
+                }
+                shown.tabs.retain(|&t| t != ix);
+                for t in &mut shown.tabs {
+                    if *t > ix {
+                        *t -= 1;
+                    }
+                }
+            }
         }
-        self.restore_tabs(&session, false, window, cx);
+        let ids = self.restore_tabs(&session, false, window, cx);
+        self.restore_shown_workspace(session.workspace.as_ref(), &ids, kept_in_workspace);
         self.keep_pins_first();
         self.active = self
             .tabs
@@ -857,18 +965,44 @@ impl Workspace {
         cx.notify();
     }
 
+    /// The workspace name the last session showed comes back with the tabs that came from it
+    /// (#269). `ids` are the restored tabs, by session index; `kept` a tab open before that
+    /// stands for one of them.
+    fn restore_shown_workspace(
+        &mut self,
+        shown: Option<&crate::settings::SessionWorkspace>,
+        ids: &[Option<u64>],
+        kept: Option<u64>,
+    ) {
+        let Some(shown) = shown else {
+            return;
+        };
+        let tabs: Vec<u64> = shown
+            .tabs
+            .iter()
+            .filter_map(|&ix| ids.get(ix).copied().flatten())
+            .chain(kept)
+            .collect();
+        if !tabs.is_empty() {
+            self.saved_shown = Some(saved::ShownWorkspace::new(shown.name.clone(), tabs));
+        }
+    }
+
     /// Opens `session`'s tabs: from the first tab on when `reuse_first` (it is open already on
-    /// the session's first folder), else as new tabs before the ones open now.
+    /// the session's first folder), else as new tabs before the ones open now. Returns the id of
+    /// the tab made for each of the session's tabs.
     fn restore_tabs(
         &mut self,
         session: &crate::settings::Session,
         reuse_first: bool,
         window: &mut Window,
         cx: &mut Context<Self>,
-    ) {
+    ) -> Vec<Option<u64>> {
         let mut next = 0;
+        let mut ids = Vec::with_capacity(session.tabs.len());
         for (ix, saved) in session.tabs.iter().enumerate() {
             let Some(first) = saved.panes.first() else {
+                ids.push(None);
                 continue;
             };
             let tab_ix = if ix == 0 && reuse_first {
@@ -889,40 +1023,54 @@ impl Workspace {
                 tab.pinned = saved.pinned;
                 tab.synced = saved.synced && tab.is_split();
             }
+            ids.push(self.tabs.get(tab_ix).map(|t| t.id));
             if saved.home {
                 // Home over its folder, as it was left; back shows the folder.
                 self.active = tab_ix;
                 self.open_home_as(false, false, window, cx);
             }
         }
+        ids
     }
 
     /// Snapshot of this window's tabs for the last session. Panes without a path are skipped.
     pub(crate) fn session_snapshot(&self, cx: &App) -> crate::settings::Session {
         let home_tab = self.home_page.as_ref().and_then(|p| self.tab_of(&p.owner));
-        let tabs: Vec<crate::settings::SessionTab> = self
-            .tabs
-            .iter()
-            .enumerate()
-            .filter_map(|(ix, tab)| {
-                let panes: Vec<PathBuf> = tab
-                    .panes
-                    .iter()
-                    .filter_map(|p| p.view.read(cx).display_path().map(Path::to_path_buf))
-                    .collect();
-                (!panes.is_empty()).then(|| crate::settings::SessionTab {
-                    active_pane: tab.active_pane.min(panes.len() - 1),
-                    ratio: tab.ratio,
-                    pinned: tab.pinned,
-                    synced: tab.synced && panes.len() > 1,
-                    home: home_tab == Some(ix),
-                    panes,
-                })
-            })
-            .collect();
+        let shown = self.saved_shown.as_ref();
+        let mut tabs: Vec<crate::settings::SessionTab> = Vec::with_capacity(self.tabs.len());
+        let mut shown_tabs = Vec::new();
+        for (ix, tab) in self.tabs.iter().enumerate() {
+            let panes: Vec<PathBuf> = tab
+                .panes
+                .iter()
+                .filter_map(|p| p.view.read(cx).display_path().map(Path::to_path_buf))
+                .collect();
+            if panes.is_empty() {
+                continue;
+            }
+            if shown.is_some_and(|s| s.has(tab.id)) {
+                shown_tabs.push(tabs.len());
+            }
+            tabs.push(crate::settings::SessionTab {
+                active_pane: tab.active_pane.min(panes.len() - 1),
+                ratio: tab.ratio,
+                pinned: tab.pinned,
+                synced: tab.synced && panes.len() > 1,
+                home: home_tab == Some(ix),
+                panes,
+            });
+        }
+        let workspace =
+            shown
+                .filter(|_| !shown_tabs.is_empty())
+                .map(|s| crate::settings::SessionWorkspace {
+                    name: s.name().to_owned(),
+                    tabs: shown_tabs,
+                });
         crate::settings::Session {
             active: self.active.min(tabs.len().saturating_sub(1)),
             tabs,
+            workspace,
         }
     }
 
@@ -983,7 +1131,15 @@ impl Workspace {
         if startup == Startup::AroundAsked {
             // Opened on a folder before the settings were read: the last session comes back
             // around it, as when they are read in time (`open_explorer_window`).
-            if start != crate::settings::StartLocation::LastSession || other_explorer_windows(cx) {
+            if other_explorer_windows(cx) {
+                return;
+            }
+            if start != crate::settings::StartLocation::LastSession {
+                // Only the pinned tabs come back, in front of the folder asked for.
+                let pinned = store.settings.last_pinned_tabs();
+                if !pinned.tabs.is_empty() {
+                    self.restore_session_before(&pinned, window, cx);
+                }
                 return;
             }
             let mut others = store.settings.last_windows();
@@ -1005,6 +1161,12 @@ impl Workspace {
                 cx.defer(move |cx| crate::open_session_windows(cx, &services, others, handle));
             }
             return;
+        }
+        // Pinned tabs come back whatever the start location is; with the last tabs they are part
+        // of the session, and another open window has them already.
+        let mut pinned = None;
+        if start != crate::settings::StartLocation::LastSession && !other_explorer_windows(cx) {
+            pinned = Some(store.settings.last_pinned_tabs()).filter(|s| !s.tabs.is_empty());
         }
         match start {
             crate::settings::StartLocation::Home => {}
@@ -1044,6 +1206,11 @@ impl Workspace {
                     cx.defer(move |cx| crate::open_session_windows(cx, &services, others, handle));
                 }
             }
+        }
+        // The start tab is in place (Home page, last folder...): the pinned tabs go in front of it
+        // and it stays the active one.
+        if let Some(pinned) = pinned {
+            self.restore_session_before(&pinned, window, cx);
         }
     }
 
@@ -1168,6 +1335,19 @@ impl Workspace {
         );
     }
 
+    /// Right-click on a folder of a path bar: the sidebar's menu for it (#257). A drive or share
+    /// root is the place itself, with its own rows.
+    fn show_folder_menu(
+        &mut self,
+        path: &Path,
+        position: gpui::Point<gpui::Pixels>,
+        cx: &mut Context<Self>,
+    ) {
+        let depth = usize::from(path.parent().is_some());
+        let items = self.folder_menu(path, sidebar::MenuFor::Tree { depth }, cx);
+        self.open_sidebar_menu(position, items, cx);
+    }
+
     fn on_explorer_event(
         &mut self,
         source: &Entity<Explorer>,
@@ -1210,12 +1390,10 @@ impl Workspace {
             ExplorerEvent::NetLogin(path) if arke_core::remote::is_remote(path) => {
                 self.remote_login(path, source, window, cx);
             }
+            ExplorerEvent::ArchivePassword(ask) => self.ask_password(source, ask, window, cx),
             ExplorerEvent::NetLogin(path) => {
-                let view = self
-                    .tabs
-                    .get(tab_ix)
-                    .and_then(|t| t.panes.get(pane_ix))
-                    .map(|p| p.view.clone());
+                // The pane that asked (`locate` found it at tab_ix, pane_ix) reopens the path.
+                let view = Some(source.clone());
                 // Log in to the share root (\\server\share), not a folder below it.
                 let share = arke_core::net::share_root(path).unwrap_or_else(|| path.clone());
                 self.open_net_dialog(
@@ -1227,6 +1405,7 @@ impl Workspace {
             }
             // Record once per real navigation. Doing this in observe would make two panes trigger each other via settings.
             ExplorerEvent::BackToHome { start } => self.back_to_home(source, *start, window, cx),
+            ExplorerEvent::OpenHome => self.open_home(false, window, cx),
             ExplorerEvent::Navigated {
                 path,
                 stepped,
@@ -1250,6 +1429,9 @@ impl Workspace {
             }
             ExplorerEvent::ToggleSync => self.toggle_sync(tab_ix, cx),
             ExplorerEvent::RenamePlace(path) => self.start_place_rename(path, window, cx),
+            ExplorerEvent::FolderMenu { path, position } => {
+                self.show_folder_menu(path, *position, cx);
+            }
             ExplorerEvent::ToggleCompare => self.toggle_compare(tab_ix, cx),
             ExplorerEvent::SelectDifferences => self.select_differences(tab_ix, cx),
             ExplorerEvent::RemoteChanged(path) => {
@@ -1482,8 +1664,20 @@ impl Workspace {
             return;
         }
         if self.tabs.len() == 1 {
-            // The last tab closes the window, like File Explorer and browsers (#98). The session
-            // keeps it, Home included, for the next start.
+            // By default the last tab closes the window, like File Explorer and browsers (#98).
+            // The session keeps it, Home included, for the next start. The setting can keep the
+            // window and show Home instead (#253, #255).
+            if SettingsStore::global(cx).read(cx).settings.last_tab
+                == crate::settings::LastTabAction::Home
+            {
+                // Already on Home: there is nothing left to close.
+                if !self.home_open() {
+                    self.remember_closed(ix, cx);
+                    self.home_page = None;
+                    self.open_home_as(false, true, window, cx);
+                }
+                return;
+            }
             window.remove_window();
             return;
         }
@@ -1677,6 +1871,22 @@ impl Workspace {
         self.open_tab(path, at, true, window, cx);
     }
 
+    /// Ctrl+N: opens another window on this tab's folder. On a page (Home, Settings...) there is
+    /// no folder to show, so the new window starts where any new window does.
+    fn new_window(&mut self, _: &NewWindow, _: &mut Window, cx: &mut Context<Self>) {
+        crate::instance::open_new_window(self.new_window_folder(cx));
+    }
+
+    fn new_window_folder(&self, cx: &App) -> Option<PathBuf> {
+        if self.page_shown() {
+            return None;
+        }
+        self.active_view()
+            .read(cx)
+            .display_path()
+            .map(Path::to_path_buf)
+    }
+
     fn current_dir(&self, cx: &App) -> PathBuf {
         self.active_view()
             .read(cx)
@@ -1780,6 +1990,23 @@ impl Workspace {
         }
     }
 
+    /// A favorite tile click: a file favorite opens the file, a folder one follows the click's
+    /// modifiers (Ctrl opens a new tab) like `open_clicked`.
+    fn open_favorite_clicked(
+        &mut self,
+        path: PathBuf,
+        modifiers: gpui::Modifiers,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if sidebar::favorite_is_file(&path) {
+            let view = self.active_view().clone();
+            view.update(cx, |e, cx| e.open_file(path, cx));
+        } else {
+            self.open_clicked(path, modifiers, window, cx);
+        }
+    }
+
     fn navigate_active(&mut self, path: PathBuf, window: &mut Window, cx: &mut Context<Self>) {
         // A pinned tab keeps what it shows, a page over it included: another folder opens beside it.
         if self.active_pinned_elsewhere(&path, cx) {
@@ -1793,6 +2020,127 @@ impl Workspace {
         let view = self.active_view().clone();
         view.update(cx, |e, cx| e.navigate(path, NavKind::New, cx));
         self.focus_active(window, cx);
+    }
+
+    /// Keeps the integration API's picture of this window fresh (`api.rs`). Runs every frame; only
+    /// what each pane shows is compared, and selections are listed again only when it changed.
+    fn publish_api_state(&self, window: &Window, cx: &App) {
+        let hwnd = Explorer::owner_from(window).unwrap_or(0);
+        crate::api::publish(
+            window.window_handle().window_id().as_u64(),
+            hwnd,
+            self.active,
+            &self.api_tabs(cx),
+        );
+    }
+
+    /// Tests: the integration API's picture of this window.
+    #[cfg(test)]
+    pub(crate) fn api_state_for_test(&self, cx: &App) -> crate::api::WindowState {
+        crate::api::window_state(0, self.active, &self.api_tabs(cx))
+    }
+
+    /// Tests: publishes this window's state as window `id` with HWND `hwnd`.
+    #[cfg(test)]
+    pub(crate) fn api_publish_for_test(&self, id: u64, hwnd: isize, cx: &App) {
+        crate::api::publish(id, hwnd, self.active, &self.api_tabs(cx));
+    }
+
+    /// What the integration API reads from each tab and pane.
+    fn api_tabs<'a>(&'a self, cx: &'a App) -> Vec<crate::api::TabInput<'a>> {
+        use crate::api::{Page, PaneInput, TabInput};
+        use crate::assets::Icon;
+        self.tabs
+            .iter()
+            .map(|tab| TabInput {
+                active_pane: tab.active_pane,
+                panes: tab
+                    .panes
+                    .iter()
+                    .map(|pane| PaneInput {
+                        explorer: pane.view.read(cx),
+                        page: self
+                            .page_title(pane.view.entity_id())
+                            .map(|(_, icon)| match icon {
+                                Icon::KfHome => Page::Home,
+                                Icon::Trash => Page::RecycleBin,
+                                _ => Page::Other,
+                            }),
+                    })
+                    .collect(),
+            })
+            .collect()
+    }
+
+    /// The integration API's `open` (`api.rs`): `path` in the active pane, or in a new tab, with
+    /// the items named in `select` selected once it is listed.
+    pub(crate) fn api_open(
+        &mut self,
+        path: PathBuf,
+        new_tab: bool,
+        select: Vec<Arc<str>>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if new_tab || self.active_pinned_elsewhere(&path, cx) {
+            let at = self.active + 1;
+            if new_tab {
+                self.open_tab(path.clone(), at, true, window, cx);
+            } else {
+                // A pinned tab keeps its folder: one beside it, or the tab already on it.
+                self.open_folder_tab(path.clone(), at, true, window, cx);
+            }
+            if !select.is_empty() {
+                self.active_view()
+                    .update(cx, |e, cx| e.select_in_folder(&path, select, cx));
+            }
+            cx.notify();
+            return;
+        }
+        // A page over the tab gives way, as when a folder is picked in the sidebar.
+        self.drop_shown_page();
+        let view = self.active_view().clone();
+        let here = view
+            .read(cx)
+            .display_path()
+            .is_some_and(|p| crate::explorer::same_folder(p, &path));
+        if here {
+            if !select.is_empty() {
+                view.update(cx, |e, cx| e.select_in_folder(&path, select, cx));
+            }
+        } else {
+            view.update(cx, |e, cx| {
+                e.navigate_selecting_all(path, NavKind::New, select, cx);
+            });
+        }
+        self.focus_active(window, cx);
+        cx.notify();
+    }
+
+    /// The integration API's `run` (`api.rs`): `command` in the active pane, dispatched as the
+    /// command palette does, without counting as a recently run command.
+    pub(crate) fn api_run(
+        &mut self,
+        command: &crate::commands::Command,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.focus_active(window, cx);
+        let action = command.action();
+        window.defer(cx, move |window, cx| window.dispatch_action(action, cx));
+    }
+
+    /// `arke.exe --search <text>`: the active pane searches the whole computer for `text`.
+    pub(crate) fn search_computer(
+        &mut self,
+        text: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.drop_shown_page();
+        let view = self.active_view().clone();
+        view.update(cx, |e, cx| e.search_computer(text, window, cx));
+        cx.notify();
     }
 
     /// The active tab is pinned and `path` isn't its folder (a pinned tab whose folder failed to
@@ -1812,6 +2160,23 @@ impl Workspace {
         self.open_folder_tab(path, at, false, window, cx);
     }
 
+    /// A click on a folder in the sidebar: opens it here, or with Ctrl in a new tab, in the
+    /// background or with Shift too in front, as a link in a browser (#291).
+    fn open_clicked(
+        &mut self,
+        path: PathBuf,
+        modifiers: gpui::Modifiers,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if modifiers.control {
+            let at = self.active + 1;
+            self.open_folder_tab(path, at, modifiers.shift, window, cx);
+        } else {
+            self.navigate_active(path, window, cx);
+        }
+    }
+
     // --- Dual pane ---
 
     /// Splits a tab into two panes, opening `path` on the right as the active side.
@@ -1826,6 +2191,8 @@ impl Workspace {
             return;
         }
         let pane = self.make_pane(path, None, Instant::now(), window, cx);
+        self.split_cue.0 = Some(pane.view.entity_id());
+        self.split_cue.1.fire();
         let tab = &mut self.tabs[tab_ix];
         tab.panes.push(pane);
         tab.active_pane = 1;
@@ -1984,6 +2351,18 @@ impl Workspace {
         cx.notify();
     }
 
+    /// Saves the places' height the drag of the line above the tabs ended on (at 100% scale), as
+    /// tall as they were drawn: a drag past what the tabs leave stops where they stopped.
+    pub(crate) fn finish_split_drag(&mut self, cx: &mut Context<Self>) {
+        if self.split_drag.take().is_none() {
+            return;
+        }
+        let drawn = f32::from(self.sidebar_ui.places_scroll.bounds().size.height);
+        let base = drawn * 100. / theme::scale_pct() as f32;
+        SettingsStore::global(cx).update(cx, |s, cx| s.update(|st| st.sidebar_split = base, cx));
+        cx.notify();
+    }
+
     /// Double-click on the sidebar edge: back to the default width.
     pub(crate) fn reset_sidebar_width(cx: &mut Context<Self>) {
         theme::set_sidebar_base(0.);
@@ -1992,9 +2371,9 @@ impl Workspace {
     }
 
     /// Drag handle on the full sidebar's right edge (not drawn for the collapsed rail or while it
-    /// slides or peeks).
+    /// peeks).
     fn render_sidebar_edge(&self, cx: &mut Context<Self>) -> Option<gpui::AnyElement> {
-        if theme::sidebar_collapsed() || self.sidebar_ui.motion.is_some() {
+        if theme::sidebar_collapsed() {
             return None;
         }
         let active = self.sidebar_resizing;
@@ -2037,6 +2416,16 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if let Some((from_y, from_h, _)) = self.split_drag {
+            if event.pressed_button != Some(MouseButton::Left) {
+                self.finish_split_drag(cx);
+                return;
+            }
+            let height = (from_h + event.position.y - from_y).max(px(0.));
+            self.split_drag = Some((from_y, from_h, height));
+            cx.notify();
+            return;
+        }
         if self.sidebar_resizing {
             if event.pressed_button != Some(MouseButton::Left) {
                 self.finish_sidebar_drag(cx);
@@ -2284,11 +2673,11 @@ impl Workspace {
             .h_full()
             .child(title_row)
             .children(self.tab_strip_under_bar(window, cx))
-            .child(self.render_pane_area(cx))
+            .child(self.render_pane_area(window, cx))
             .into_any_element()
     }
 
-    fn render_pane_area(&self, cx: &mut Context<Self>) -> AnyElement {
+    fn render_pane_area(&self, window: &Window, cx: &mut Context<Self>) -> AnyElement {
         let tab = &self.tabs[self.active];
         if !tab.is_split() {
             return div()
@@ -2347,7 +2736,7 @@ impl Workspace {
             .map_or(px(0.), crate::explorer::SharedPreview::reserve);
         let shared = self.shared_preview.and_then(|shared| {
             let host = tab.view().clone();
-            let preview = host.update(cx, Explorer::render_shared_preview)?;
+            let preview = host.update(cx, |e, cx| e.render_shared_preview(window, cx))?;
             Some(
                 div()
                     .absolute()
@@ -2372,15 +2761,26 @@ impl Workspace {
                     .child(tab.panes[0].view.clone()),
             )
             .child(gutter)
-            .child(
-                div()
-                    .h_full()
-                    .flex_1()
-                    .min_w_0()
-                    .child(tab.panes[1].view.clone()),
-            )
+            .child(self.render_split_right(tab, window))
             .children(shared)
             .into_any_element()
+    }
+}
+
+impl Workspace {
+    /// The right pane of a split tab. Just split, it slides in from the right as it fades in,
+    /// already laid out (the left pane has its new width at once) and taking clicks.
+    fn render_split_right(&self, tab: &Tab, window: &Window) -> gpui::Div {
+        let right = &tab.panes[1].view;
+        let pane = div().h_full().flex_1().min_w_0().child(right.clone());
+        if self.split_cue.0 == Some(right.entity_id()) {
+            let ease = crate::motion::ease_out;
+            self.split_cue
+                .1
+                .slide(pane, window, ease, crate::motion::SLIDE_LG, 0.)
+        } else {
+            pane
+        }
     }
 }
 
@@ -2447,6 +2847,7 @@ impl Workspace {
                 |_, _, _| (),
                 move |_, (), window, _| {
                     let shell = Arc::clone(&shell);
+                    let moved = Arc::clone(&shell);
                     window.on_mouse_event(move |e: &gpui::MouseMoveEvent, phase, window, cx| {
                         if phase != gpui::DispatchPhase::Bubble
                             || e.pressed_button != Some(MouseButton::Left)
@@ -2460,36 +2861,30 @@ impl Workspace {
                             && e.position.y >= px(0.)
                             && e.position.x < size.width
                             && e.position.y < size.height
-                            && !shell.covered_at_cursor(Explorer::owner_from(window));
-                        if inside || !cx.has_global::<PendingDragOut>() {
-                            return;
+                            && !moved.covered_at_cursor(Explorer::owner_from(window));
+                        if !inside {
+                            hand_drag_to_windows(&moved, window, cx, false);
                         }
-                        let pending = cx.remove_global::<PendingDragOut>();
-                        // Keep Arke's drag alive (just hidden) so it can resume if the cursor comes back.
-                        cx.set_global(crate::explorer::DraggingOutside);
-                        window.refresh();
-                        let shell = Arc::clone(&shell);
-                        let handle = window.window_handle();
-                        // Enter the Windows drag loop only after this mouse event is handled, outside GPUI's event dispatch.
-                        cx.spawn(async move |cx| {
-                            let end = shell.drag_out(&pending.paths, pending.image.as_ref());
-                            if let Err(err) = &end {
-                                log::warn!("drag out to another program failed: {err}");
-                            }
-                            let _ = cx.update_window(handle, |_, window, cx| {
-                                if cx.has_global::<crate::explorer::DraggingOutside>() {
-                                    cx.remove_global::<crate::explorer::DraggingOutside>();
-                                }
-                                if matches!(end, Ok(crate::shell::DragOutEnd::Returned)) {
-                                    // Dragged back in: Arke's drag continues, and leaving again hands off to Windows again.
-                                    cx.set_global(pending);
-                                } else {
-                                    crate::explorer::stop_drag(window, cx);
-                                }
-                                window.refresh();
-                            });
-                        })
-                        .detach();
+                    });
+                    // Another program took the mouse in the middle of the drag (Alt+Tab, #326):
+                    // the window is told the press is over (`handle_capture_changed_msg` in our
+                    // GPUI patch), though the button may still be down. Windows' drag goes on
+                    // across the switch, as File Explorer's does; Arke's own can't (GPUI ends it
+                    // on this release), so there is nothing to come back to. Arke, now in the
+                    // background, can't read the button (`GetAsyncKeyState` says up), so Windows'
+                    // drag drops only once it has seen the button down itself.
+                    window.on_mouse_event(move |e: &gpui::MouseUpEvent, phase, window, cx| {
+                        let lost = e.click_count == 0 && e.position.x < px(-50_000.);
+                        if phase == gpui::DispatchPhase::Capture
+                            && lost
+                            && e.button == MouseButton::Left
+                            && cx.has_global::<crate::explorer::PendingDragOut>()
+                        {
+                            log::info!(
+                                "press lost mid-drag: the files go to Windows drag and drop"
+                            );
+                            hand_drag_to_windows(&shell, window, cx, true);
+                        }
                     });
                 },
             )
@@ -2503,6 +2898,48 @@ impl Workspace {
     fn panes_width_hint(&self) -> gpui::Pixels {
         self.last_viewport_width - theme::sidebar_width()
     }
+}
+
+/// Hands the files of the current drag to Windows drag and drop, once (the drag-out data is taken):
+/// the cursor left the window, or another program took the mouse mid-drag (`after_lost_press`).
+fn hand_drag_to_windows(
+    shell: &Arc<dyn crate::shell::Shell>,
+    window: &mut Window,
+    cx: &mut App,
+    after_lost_press: bool,
+) {
+    use crate::explorer::PendingDragOut;
+    if !cx.has_global::<PendingDragOut>() {
+        return;
+    }
+    let pending = cx.remove_global::<PendingDragOut>();
+    // Keep Arke's drag alive (just hidden) so it can resume if the cursor comes back.
+    cx.set_global(crate::explorer::DraggingOutside);
+    window.refresh();
+    let shell = Arc::clone(shell);
+    let handle = window.window_handle();
+    // Enter the Windows drag loop only after this mouse event is handled, outside GPUI's event
+    // dispatch.
+    cx.spawn(async move |cx| {
+        let end = shell.drag_out(&pending.paths, pending.image.as_ref(), after_lost_press);
+        if let Err(err) = &end {
+            log::warn!("drag out to another program failed: {err}");
+        }
+        let _ = cx.update_window(handle, |_, window, cx| {
+            if cx.has_global::<crate::explorer::DraggingOutside>() {
+                cx.remove_global::<crate::explorer::DraggingOutside>();
+            }
+            if matches!(end, Ok(crate::shell::DragOutEnd::Returned)) && cx.has_active_drag() {
+                // Dragged back in: Arke's drag continues, and leaving again hands off to Windows
+                // again.
+                cx.set_global(pending);
+            } else {
+                crate::explorer::stop_drag(window, cx);
+            }
+            window.refresh();
+        });
+    })
+    .detach();
 }
 
 /// Where `window` is, in logical pixels; when maximized, the size it restores to.
@@ -2531,6 +2968,11 @@ impl Workspace {
             cx.defer(crate::spring::settle);
         }
         if !cx.has_active_drag() {
+            // A favorite drag that ended with no drop (Esc, or the window losing the mouse): the
+            // favorites go back the way they were.
+            if self.dragging_pin {
+                self.restore_pins(cx);
+            }
             self.dragging_pin = false;
             self.dragging_tab = None;
             self.close_tab_ghost(cx);
@@ -2549,10 +2991,15 @@ impl Render for Workspace {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         crate::frame_probe::frame_started();
         crate::a11y::sync(window);
+        self.sidebar_ui
+            .keys
+            .focused
+            .set(self.sidebar_focus.is_focused(window));
         // Only the first frame times the start.
         let start_clock = std::mem::take(&mut self.start_clock);
         self.last_viewport_width = window.viewport_size().width;
         self.sync_window_title(window, cx);
+        self.publish_api_state(window, cx);
         self.drop_stale_menu();
         note_menu_open(window, self.sidebar_menu.is_some());
         let sidebar_menu = self.render_sidebar_menu(window, cx);
@@ -2584,65 +3031,16 @@ impl Render for Workspace {
             .relative()
             .flex()
             .flex_col();
-        let left = if let Some((collapsing, serial)) = self.sidebar_ui.motion {
-            // Sliding: the width moves while the full sidebar (clipped) and the column of icons
-            // crossfade. Their icons sit in different places, so swapping one for the other at
-            // the end would read as a jump.
-            let (from, to) = if collapsing {
-                (theme::sidebar_full_width(), theme::rail_w())
-            } else {
-                (theme::rail_w(), theme::sidebar_full_width())
-            };
-            let full = div()
-                .id("sidebar-slide-full")
-                .debug_selector(|| "sidebar-slide-full".to_owned())
-                .w(theme::sidebar_full_width())
-                .flex_none()
-                .h_full()
-                .flex()
-                .flex_col()
-                .child(self.render_brand_row(cx))
-                .child(self.render_home_button(cx))
-                .child(self.render_sidebar(cx))
-                .child(self.render_settings_button(cx));
-            let rail = div()
-                .id("sidebar-slide-rail")
-                .absolute()
-                .top_0()
-                .left_0()
-                .h_full()
-                .w(theme::rail_w())
-                .child(self.render_rail(cx));
-            let fade = |el: gpui::Stateful<gpui::Div>, name: &'static str, going: bool| {
-                gpui::AnimationExt::with_animation(
-                    el,
-                    gpui::ElementId::NamedInteger(name.into(), serial),
-                    gpui::Animation::new(crate::motion::BASE),
-                    move |el, t| el.opacity(crossfade(t, going)),
-                )
-            };
-            gpui::AnimationExt::with_animation(
-                left.overflow_hidden()
-                    .child(fade(full, "sidebar-fade-full", collapsing))
-                    .child(fade(rail, "sidebar-fade-rail", !collapsing)),
-                gpui::ElementId::NamedInteger("sidebar-slide".into(), serial),
-                crate::motion::enter(),
-                move |el, t| el.w(from + (to - from) * t),
-            )
-            .into_any_element()
-        } else {
-            left.when(theme::sidebar_collapsed(), |d| {
+        // The column takes its new width at once (see `slide_sidebar`): only the full sidebar
+        // slides, so the panes are laid out once, at their new size.
+        let left = left
+            .when(theme::sidebar_collapsed(), |d| {
                 d.child(self.render_rail(cx))
             })
             .children(self.render_peek(cx))
             .when(!theme::sidebar_collapsed(), |d| {
-                d.child(self.render_brand_row(cx))
-                    .child(self.render_home_button(cx))
-                    .child(self.render_sidebar(cx))
-                    .child(self.render_settings_button(cx))
-            })
-            .into_any_element()
-        };
+                d.child(self.render_full_sidebar(window, cx))
+            });
         let body = div()
             .relative()
             .flex()
@@ -2668,6 +3066,10 @@ impl Render for Workspace {
                 },
             })
             .children(self.render_sidebar_edge(cx));
+        // A transition drawn in the sidebar (rows dropping in) is still playing.
+        if self.sidebar_ui.frame_wanted.take() {
+            window.request_animation_frame();
+        }
         div()
             .id("workspace")
             .key_context("Workspace")
@@ -2685,8 +3087,12 @@ impl Render for Workspace {
                 self.resizing || self.sidebar_resizing,
                 gpui::Styled::cursor_col_resize,
             )
+            .when(self.split_drag.is_some(), gpui::Styled::cursor_row_resize)
             .on_action(cx.listener(Self::new_tab))
+            .on_action(cx.listener(Self::new_window))
             .on_action(cx.listener(Self::toggle_sidebar))
+            .on_action(cx.listener(Self::focus_next_region))
+            .on_action(cx.listener(Self::focus_prev_region))
             .on_mouse_move(cx.listener(|this, e: &gpui::MouseMoveEvent, _, cx| {
                 this.peek_pointer_moved(e, cx);
             }))
@@ -2798,6 +3204,9 @@ impl Render for Workspace {
                     if this.sidebar_resizing {
                         this.finish_sidebar_drag(cx);
                     }
+                    if this.split_drag.is_some() {
+                        this.finish_split_drag(cx);
+                    }
                 }),
             )
             .child(body)
@@ -2827,6 +3236,11 @@ impl Render for Workspace {
             .children(welcome::welcome_card(cx))
             .children(update_page::update_notice(cx))
             .children(self.net_dialog.as_ref().map(|slot| slot.dialog.clone()))
+            .children(
+                self.archive_password
+                    .as_ref()
+                    .map(|slot| slot.dialog.clone()),
+            )
             .children(self.workspaces.as_ref().map(|(panel, _)| panel.clone()))
             .children(self.palette.as_ref().map(|(palette, _)| {
                 // Ctrl+T: clicking the backdrop closes it.
@@ -2883,22 +3297,30 @@ impl Render for Workspace {
     }
 }
 
-/// Opacity at progress `t` (0 to 1, linear) of a layer leaving (`going`) or arriving in the
-/// sidebar's crossfade: the leaving one is mostly gone before the arriving one is mostly there,
-/// so the two never read as one cluttered layer.
-fn crossfade(t: f32, going: bool) -> f32 {
-    let smooth = |a: f32, b: f32| {
-        let x = ((t - a) / (b - a)).clamp(0., 1.);
-        x * x * (3. - 2. * x)
-    };
-    if going {
-        1. - smooth(0., 0.6)
-    } else {
-        smooth(0.35, 1.)
-    }
-}
-
 impl Workspace {
+    /// The full sidebar in its column. Just expanded, it slides out from behind where the column of
+    /// icons was (its right edge starting at the column's) while it fades in; it is in place and
+    /// takes clicks from the first frame.
+    fn render_full_sidebar(&self, window: &Window, cx: &mut Context<Self>) -> gpui::Div {
+        let body = div()
+            .flex_1()
+            .min_h_0()
+            .w_full()
+            .flex()
+            .flex_col()
+            .child(self.render_brand_row(cx))
+            .children(self.render_home_button(cx))
+            .child(self.render_sidebar(cx))
+            .child(self.render_sidebar_footer(cx));
+        self.sidebar_ui.expand_cue.slide(
+            body,
+            window,
+            crate::motion::ease_out_soft,
+            -Self::drawer_travel(),
+            0.,
+        )
+    }
+
     /// Vertical tabs: the sidebar top row has the Arke mark, then back, forward and refresh for the
     /// active pane (like Arc); the rest is window drag area. The mark sits on the sidebar's icon
     /// column; no name, since the taskbar and Alt+Tab already show it.
@@ -3028,7 +3450,7 @@ impl Workspace {
             .debug_selector(|| "tab-strip".to_owned())
             .relative()
             .child(self.tab_area_recorder(tabmove::AreaPart::Strip))
-            .a11y(gpui::Role::TabList, t!("sidebar.tabs"))
+            .a11y(gpui::Role::TabList, self.tabs_label(cx))
             // Dropping a tab between tabs or on the empty space to the right moves it to the end.
             .on_drop(cx.listener(Self::drop_tab_at_end))
             .h(theme::h_bar())
@@ -3080,6 +3502,11 @@ impl Workspace {
                     .flex_1()
                     .min_w(theme::s_32())
                     .h_full(),
+            )
+            // The saved workspace this window shows, muted before its button (#269).
+            .children(
+                self.workspace_label(cx)
+                    .map(|label| label.max_w(crate::theme::scaled_px(160.))),
             )
             .child(Self::workspaces_button(cx))
             .child(sidebar::tab_layout_button(true, cx))
@@ -3232,11 +3659,12 @@ impl Render for Tooltip {
 /// Arke's interface scale doesn't change.
 const POINTER_CLEARANCE: gpui::Pixels = px(20.);
 
-/// The tooltip bubble itself.
-fn tooltip_card(text: &SharedString) -> gpui::Div {
+/// The tooltip bubble itself. It fades in where it is, as quickly as a context menu (it only
+/// shows after the pointer rested, so nothing waits on it).
+fn tooltip_card(text: &SharedString) -> AnyElement {
     // Tooltips lay out at minimum size (max_w has no effect), so long text gets an explicit width to wrap.
     let long = text.chars().count() > 48;
-    div()
+    let card = div()
         .debug_selector(|| "tooltip-card".to_owned())
         .px(theme::s_8())
         .py(theme::s_4())
@@ -3247,5 +3675,15 @@ fn tooltip_card(text: &SharedString) -> gpui::Div {
         .ui_font()
         .text_size(theme::fs_12())
         .text_color(theme::text())
-        .child(text.clone())
+        .child(text.clone());
+    if !crate::motion::enabled() {
+        return card.into_any_element();
+    }
+    gpui::AnimationExt::with_animation(
+        card,
+        "tooltip-in",
+        crate::motion::menu_enter(),
+        crate::motion::fade_in,
+    )
+    .into_any_element()
 }

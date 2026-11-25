@@ -378,6 +378,45 @@ pub(crate) fn double_click_time() -> std::time::Duration {
     std::time::Duration::from_millis(u64::from(if ms == 0 { 500 } else { ms }))
 }
 
+/// Whether the mouse message being handled was made by Windows from a finger or a pen (it marks
+/// those with a signature in the message's extra info), not by a mouse or touchpad. Single-click
+/// mode selects what the pointer rests on; a finger or a pen hovering over the screen isn't
+/// pointing at anything, so it doesn't (#46). Only meaningful while a mouse event is handled.
+pub(crate) fn pointer_is_touch_or_pen() -> bool {
+    const SIGNATURE_MASK: isize = 0xFFFF_FF00;
+    const MI_WP_SIGNATURE: isize = 0xFF51_5700;
+    if cfg!(test) {
+        return false;
+    }
+    // SAFETY: no arguments; reads the current thread's last message's extra info.
+    let extra = unsafe { windows::Win32::UI::WindowsAndMessaging::GetMessageExtraInfo() }.0;
+    extra & SIGNATURE_MASK == MI_WP_SIGNATURE
+}
+
+/// How long the pointer must rest on an item to select it in single-click mode (Settings >
+/// Mouse; `SPI_GETMOUSEHOVERTIME`, 400 ms by default). Reads one system parameter, fine on the
+/// UI thread.
+pub(crate) fn mouse_hover_time() -> std::time::Duration {
+    use windows::Win32::UI::WindowsAndMessaging::{
+        SPI_GETMOUSEHOVERTIME, SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS, SystemParametersInfoW,
+    };
+    let mut ms = 0u32;
+    // SAFETY: ms is a correctly sized out param.
+    let asked = unsafe {
+        SystemParametersInfoW(
+            SPI_GETMOUSEHOVERTIME,
+            0,
+            Some((&raw mut ms).cast()),
+            SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS(0),
+        )
+    };
+    std::time::Duration::from_millis(if asked.is_err() || ms == 0 {
+        400
+    } else {
+        u64::from(ms)
+    })
+}
+
 /// Windows accent color as 0xRRGGBB. Asks DWM only (no registry); cheap enough for the UI thread.
 pub(crate) fn system_accent() -> Option<u32> {
     use windows::Win32::Graphics::Dwm::DwmGetColorizationColor;
@@ -435,7 +474,8 @@ pub(crate) fn supports_mica() -> bool {
 
 /// UI language: `ARKE_LANG` wins, otherwise the user locale. Traditional Chinese locales
 /// (TW, HK, MO, Hant) map to zh-TW, other Chinese ones (CN, SG, Hans, plain zh) to zh-CN,
-/// everything else to English.
+/// Japanese, German, Spanish and Portuguese ones to ja, de, es and pt-BR, everything else to
+/// English.
 pub(crate) fn ui_locale() -> String {
     if let Ok(lang) = std::env::var("ARKE_LANG") {
         return lang;
@@ -443,7 +483,7 @@ pub(crate) fn ui_locale() -> String {
     system_locale().to_owned()
 }
 
-/// UI language Windows itself is set to (`zh-TW`, `zh-CN` or `en`), ignoring `ARKE_LANG` and the
+/// UI language Windows itself is set to (`zh-TW`, `zh-CN`, `ja`, `de`, `es`, `pt-BR` or `en`), ignoring `ARKE_LANG` and the
 /// Language setting. Decides which Chinese font English UI text falls back to.
 pub(crate) fn system_locale() -> &'static str {
     let mut buf = [0u16; 85];
@@ -485,9 +525,25 @@ fn locale_for(system: &str) -> &'static str {
     } else if lower == "zh" || lower.starts_with("zh-") || lower.starts_with("zh_") {
         // zh-CN, zh-SG, zh-Hans-*, and plain zh default to Simplified.
         "zh-CN"
+    } else if is_language(&lower, "ja") {
+        "ja"
+    } else if is_language(&lower, "de") {
+        "de"
+    } else if is_language(&lower, "es") {
+        "es"
+    } else if is_language(&lower, "pt") {
+        // Portugal's Portuguese reads Brazilian text far better than English.
+        "pt-BR"
     } else {
         "en"
     }
+}
+
+/// Whether the lower-case locale name is `code` itself or one of its regions (`de`, `de-AT`).
+fn is_language(lower: &str, code: &str) -> bool {
+    lower
+        .strip_prefix(code)
+        .is_some_and(|rest| rest.is_empty() || rest.starts_with(['-', '_']))
 }
 
 /// The device behind a drive letter (`\Device\Floppy0`, `\Device\HarddiskVolume3`...), from the
@@ -572,6 +628,10 @@ fn disk_space(root: &[u16]) -> Option<(u64, u64)> {
 }
 
 impl Shell for WinShell {
+    fn quick_access_pinned(&self) -> Option<Vec<PathBuf>> {
+        crate::quick_access::read_windows_pins()
+    }
+
     fn load_places(&self) -> Vec<Place> {
         debug_assert!(
             !arke_core::fs::is_ui_thread(),
@@ -645,7 +705,9 @@ impl Shell for WinShell {
                 hidden |= 1 << i;
                 continue;
             }
-            // Labels only for fixed drives; network or optical drives can block or ask for media.
+            // Labels for fixed drives, and for removable ones that just answered with their media
+            // (an empty slot was left out above, so reading it asks for nothing, #315); network
+            // or optical drives can block or ask for media.
             let (label, remote) = match drive_type {
                 DRIVE_REMOVABLE if floppy => (t!("drive.floppy").into_owned(), false),
                 DRIVE_FIXED => (
@@ -658,7 +720,10 @@ impl Shell for WinShell {
                         .unwrap_or_else(|| t!("drive.network").into_owned()),
                     true,
                 ),
-                DRIVE_REMOVABLE => (t!("drive.removable").into_owned(), false),
+                DRIVE_REMOVABLE => (
+                    volume_label(&root_w).unwrap_or_else(|| t!("drive.removable").into_owned()),
+                    false,
+                ),
                 DRIVE_CDROM => (t!("drive.cdrom").into_owned(), false),
                 _ => (t!("drive.other").into_owned(), false),
             };
@@ -850,8 +915,9 @@ impl Shell for WinShell {
         &self,
         paths: &[PathBuf],
         image: Option<&crate::shell::DragImage>,
+        after_lost_press: bool,
     ) -> Result<crate::shell::DragOutEnd, ShellError> {
-        win_fileops::drag_out(paths, image).map(|outcome| match outcome {
+        win_fileops::drag_out(paths, image, after_lost_press).map(|outcome| match outcome {
             Some(win_fileops::DragOutcome::Returned) => crate::shell::DragOutEnd::Returned,
             _ => crate::shell::DragOutEnd::Finished,
         })
@@ -1005,9 +1071,10 @@ impl Shell for WinShell {
         &self,
         paths: &[PathBuf],
         background: bool,
+        extended: bool,
     ) -> Result<crate::shell::ShellMenu, ShellError> {
         debug_assert!(!arke_core::fs::is_ui_thread());
-        crate::shell_host::query(paths, background)
+        crate::shell_host::query(paths, background, extended)
     }
 
     fn shell_menu_prefetch(&self) -> bool {
@@ -1038,6 +1105,25 @@ impl Shell for WinShell {
         crate::shell_host::fill_submenu(session, index)
     }
 
+    fn shell_menu_kind(&self, paths: &[PathBuf], background: bool) -> Option<String> {
+        debug_assert!(!arke_core::fs::is_ui_thread());
+        crate::win_menu_parts::item_kind(paths, background)
+    }
+
+    fn packaged_item_types(&self, clsid: &str) -> Vec<String> {
+        debug_assert!(!arke_core::fs::is_ui_thread());
+        crate::win_packaged::item_types(clsid)
+    }
+
+    fn packaged_commands(&self, kind: &str) -> Vec<String> {
+        debug_assert!(!arke_core::fs::is_ui_thread());
+        crate::win_packaged::commands()
+            .into_iter()
+            .filter(|(_, types)| crate::win_menu_parts::kind_matches(types, kind))
+            .map(|(clsid, _)| clsid)
+            .collect()
+    }
+
     fn shell_menu_handlers(
         &self,
         paths: &[PathBuf],
@@ -1051,11 +1137,12 @@ impl Shell for WinShell {
         &self,
         paths: &[PathBuf],
         background: bool,
+        extended: bool,
         handler: &crate::win_menu_parts::MenuHandler,
         group: u64,
     ) -> Result<(crate::shell::ShellMenu, std::time::Duration), ShellError> {
         debug_assert!(!arke_core::fs::is_ui_thread());
-        crate::shell_host::query_handler(paths, background, handler, group)
+        crate::shell_host::query_handler(paths, background, extended, handler, group)
     }
 
     fn set_clipboard_text(&self, text: &str) -> Result<(), ShellError> {
@@ -1066,6 +1153,26 @@ impl Shell for WinShell {
     fn local_parts(&self, time: SystemTime) -> Option<[u16; 6]> {
         let t = local_time(time)?;
         Some([t.wYear, t.wMonth, t.wDay, t.wHour, t.wMinute, t.wSecond])
+    }
+
+    fn recent_files_enabled(&self) -> bool {
+        use windows::Win32::System::Registry::{HKEY_CURRENT_USER, HKEY_LOCAL_MACHINE};
+        const EXPLORER: &str = r"Software\Microsoft\Windows\CurrentVersion\Explorer";
+        const POLICIES: &str = r"Software\Microsoft\Windows\CurrentVersion\Policies\Explorer";
+        debug_assert!(
+            !arke_core::fs::is_ui_thread(),
+            "recent_files_enabled must not run on the UI thread"
+        );
+        // File Explorer's own switch (Folder Options > Privacy), absent means on.
+        if read_reg_dword(HKEY_CURRENT_USER, EXPLORER, "ShowRecent") == Some(0) {
+            return false;
+        }
+        // The group policy "Do not keep history of recently opened documents".
+        ![HKEY_CURRENT_USER, HKEY_LOCAL_MACHINE]
+            .into_iter()
+            .any(|hive| {
+                read_reg_dword(hive, POLICIES, "NoRecentDocsHistory").is_some_and(|v| v != 0)
+            })
     }
 
     fn recent_files(&self, limit: usize) -> Vec<crate::home::RecentFile> {
@@ -1109,6 +1216,37 @@ impl Shell for WinShell {
 
     fn is_ejectable(&self, root: &Path) -> bool {
         crate::win_eject::is_ejectable(root)
+    }
+
+    fn format_drive(&self, root: &Path, owner: Option<isize>) -> Result<(), ShellError> {
+        use windows::Win32::UI::Shell::{SHFMT_ID_DEFAULT, SHFMT_OPT_NONE, SHFormatDrive};
+        debug_assert!(!arke_core::fs::is_ui_thread());
+        // The drive number: 0 for A:, 2 for C:.
+        let letter = root
+            .to_string_lossy()
+            .chars()
+            .next()
+            .filter(char::is_ascii_alphabetic)
+            .ok_or(ShellError::Unsupported)?;
+        let drive = u32::from(letter.to_ascii_uppercase()) - u32::from('A');
+        let owner = windows::Win32::Foundation::HWND(owner.unwrap_or_default() as *mut _);
+        // SAFETY: shows Windows' modal Format dialog for the drive; owner is Arke's window or null.
+        let code = unsafe { SHFormatDrive(owner, drive, SHFMT_ID_DEFAULT, SHFMT_OPT_NONE) };
+        format_drive_result(code)
+    }
+
+    fn disk_cleanup(&self, root: &Path) -> Result<(), ShellError> {
+        let letter = root
+            .to_string_lossy()
+            .chars()
+            .next()
+            .filter(char::is_ascii_alphabetic)
+            .ok_or(ShellError::Unsupported)?;
+        std::process::Command::new("cleanmgr.exe")
+            .arg(format!("/d{letter}"))
+            .spawn()
+            .map(drop)
+            .map_err(|e| ShellError::Host(e.to_string()))
     }
 
     fn eject_drive(&self, root: &Path) -> Result<(), ShellError> {
@@ -1518,6 +1656,16 @@ impl Shell for WinShell {
         crate::win_pdf::render_page(path, page, max)
     }
 
+    fn pdf_thumbnail(
+        &self,
+        path: &Path,
+        max_side: u32,
+    ) -> Result<Option<arke_core::thumbs::Thumbnail>, ShellError> {
+        debug_assert!(!arke_core::fs::is_ui_thread());
+        crate::thumb_host::pdf_thumbnail(path, max_side)
+            .map_err(|e| ShellError::Host(e.to_string()))
+    }
+
     fn cloud_scan(&self, dir: &Path, items: &[std::sync::Arc<str>]) -> crate::shell::CloudScan {
         crate::win_cloud::scan(dir, items)
     }
@@ -1857,10 +2005,33 @@ fn raise(hwnd: isize, also: Option<u32>) -> bool {
     }
 }
 
+/// What `SHFormatDrive` answered: a cancelled dialog is not a failure, the other special
+/// codes are; anything else is the drive's format result (success).
+fn format_drive_result(code: u32) -> Result<(), ShellError> {
+    const SHFMT_ERROR: u32 = 0xFFFF_FFFF;
+    const SHFMT_NOFORMAT: u32 = 0xFFFF_FFFD;
+    match code {
+        SHFMT_ERROR => Err(ShellError::Host(t!("error.format_failed").into_owned())),
+        SHFMT_NOFORMAT => Err(ShellError::Host(
+            t!("error.format_unsupported").into_owned(),
+        )),
+        // Formatted, or SHFMT_CANCEL (0xFFFF_FFFE): the dialog was closed.
+        _ => Ok(()),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::time::Duration;
+
+    #[test]
+    fn format_drive_codes_map_to_errors() {
+        assert!(format_drive_result(0).is_ok());
+        assert!(format_drive_result(0xFFFF_FFFE).is_ok());
+        assert!(format_drive_result(0xFFFF_FFFF).is_err());
+        assert!(format_drive_result(0xFFFF_FFFD).is_err());
+    }
 
     /// Real shortcuts in a temp folder: the target reads back, and a name clash gets a number.
     #[test]
@@ -2041,7 +2212,19 @@ mod locale_tests {
         ] {
             assert_eq!(locale_for(cn), "zh-CN", "{cn}");
         }
-        for en in ["en-US", "ja-JP", "", "zhx"] {
+        for (system, ui) in [
+            ("ja-JP", "ja"),
+            ("de-DE", "de"),
+            ("de-AT", "de"),
+            ("es-ES", "es"),
+            ("es-MX", "es"),
+            ("pt-BR", "pt-BR"),
+            ("pt-PT", "pt-BR"),
+            ("DE", "de"),
+        ] {
+            assert_eq!(locale_for(system), ui, "{system}");
+        }
+        for en in ["en-US", "fr-FR", "", "zhx", "dex", "jav", "ko-KR"] {
             assert_eq!(locale_for(en), "en", "{en}");
         }
     }
@@ -2308,7 +2491,7 @@ fn reg_key_exists(root: windows::Win32::System::Registry::HKEY, key: &str) -> bo
 }
 
 /// A `REG_DWORD` value, or `None`.
-fn read_reg_dword(
+pub(crate) fn read_reg_dword(
     root: windows::Win32::System::Registry::HKEY,
     key: &str,
     value: &str,

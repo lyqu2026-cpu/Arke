@@ -40,6 +40,9 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 const LIST_FIRST_TIMEOUT: Duration = Duration::from_secs(180);
 /// Wait for each later batch.
 const LIST_NEXT_TIMEOUT: Duration = Duration::from_secs(30);
+/// While waiting for a batch, how often the sink is asked (with an empty batch) whether it still
+/// wants the listing, so a caller that has stopped needn't wait for the service to read the MFT.
+const LIST_ASK_EVERY: Duration = Duration::from_millis(100);
 
 fn wide(s: &str) -> Vec<u16> {
     s.encode_utf16().chain(std::iter::once(0)).collect()
@@ -314,6 +317,43 @@ fn with_timeout<T: Send + 'static>(
     rx.recv_timeout(timeout).ok().flatten()
 }
 
+/// [`with_timeout`] that also asks `wanted` every [`LIST_ASK_EVERY`] whether the answer is still
+/// wanted: `Err(Interrupted)` at once when it isn't, so a caller that has stopped needn't wait
+/// for the service to start or answer.
+fn with_timeout_while<T: Send + 'static>(
+    timeout: Duration,
+    wanted: &mut dyn FnMut() -> bool,
+    f: impl FnOnce() -> Option<T> + Send + 'static,
+) -> io::Result<Option<T>> {
+    let (tx, rx) = flume::bounded(1);
+    std::thread::Builder::new()
+        .name("arke-indexd-client".into())
+        .spawn(move || {
+            let _ = tx.send(f());
+        })?;
+    let started = Instant::now();
+    loop {
+        match rx.recv_timeout(LIST_ASK_EVERY.min(timeout.saturating_sub(started.elapsed()))) {
+            Ok(answer) => return Ok(answer),
+            Err(flume::RecvTimeoutError::Timeout) if started.elapsed() < timeout => {
+                if !wanted() {
+                    return Err(io::ErrorKind::Interrupted.into());
+                }
+            }
+            Err(_) => return Ok(None),
+        }
+    }
+}
+
+/// Which profile folders the service lists without their contents: every one in the profiles
+/// folder but this user's own and Public (the service's privacy rule).
+pub fn profiles() -> Option<arke_core::dirsize::Profiles> {
+    Some(arke_core::dirsize::Profiles {
+        dir: crate::server::profiles_dir()?,
+        mine: std::env::var_os("USERPROFILE").map(std::path::PathBuf::from),
+    })
+}
+
 /// Reads the USN journal through the background service.
 #[derive(Default)]
 pub struct ServiceJournal {
@@ -353,14 +393,21 @@ impl Journal for ServiceJournal {
     fn list(&self, root: &Path, sink: ListSink) -> io::Result<()> {
         let root = root.to_path_buf();
         let custom = self.custom.clone();
-        let pipe = with_timeout(CONNECT_TIMEOUT * 2, move || {
+        // Connecting may wait for the service to start: the sink is asked meanwhile too. A pipe
+        // that comes after it gave up is dropped, which tells the service nobody is listening.
+        let pipe = with_timeout_while(CONNECT_TIMEOUT * 2, &mut || sink(Vec::new()), move || {
             let pipe = session(custom.as_deref())?;
             send(&pipe, &Request::List { root }).ok()?;
             Some(pipe)
-        })
+        })?
         .ok_or_else(|| io::Error::other("Arke index service unavailable"))?;
         // Receive on another thread so a stuck service times out here (falling back to a walk)
         // instead of stalling the index build.
+        let pipe = Arc::new(pipe);
+        // Leaving early (stopped, timed out) cancels the pending read: the reader thread then
+        // ends and closes the pipe, and the service stops reading the MFT for nobody. Dropping
+        // the receiver alone left the thread waiting in ReadFile until the first batch.
+        let _cancel = ListGuard(Arc::clone(&pipe));
         let (tx, rx) = flume::bounded::<io::Result<Reply>>(4);
         std::thread::Builder::new()
             .name("arke-indexd-list".into())
@@ -377,14 +424,30 @@ impl Journal for ServiceJournal {
             })?;
         let mut timeout = LIST_FIRST_TIMEOUT;
         loop {
-            let reply = rx.recv_timeout(timeout).map_err(|e| match e {
-                flume::RecvTimeoutError::Timeout => {
-                    io::Error::new(io::ErrorKind::TimedOut, "index service timed out")
+            let waiting = std::time::Instant::now();
+            let reply = loop {
+                match rx.recv_timeout(LIST_ASK_EVERY.min(timeout)) {
+                    Ok(reply) => break reply,
+                    Err(flume::RecvTimeoutError::Timeout) if waiting.elapsed() < timeout => {
+                        // Stopped: `ListGuard` cancels the read, so the service stops reading.
+                        if !sink(Vec::new()) {
+                            return Err(io::ErrorKind::Interrupted.into());
+                        }
+                    }
+                    Err(flume::RecvTimeoutError::Timeout) => {
+                        return Err(io::Error::new(
+                            io::ErrorKind::TimedOut,
+                            "index service timed out",
+                        ));
+                    }
+                    Err(flume::RecvTimeoutError::Disconnected) => {
+                        return Err(io::Error::new(
+                            io::ErrorKind::BrokenPipe,
+                            "index service connection closed",
+                        ));
+                    }
                 }
-                flume::RecvTimeoutError::Disconnected => {
-                    io::Error::new(io::ErrorKind::BrokenPipe, "index service connection closed")
-                }
-            })??;
+            }?;
             timeout = LIST_NEXT_TIMEOUT;
             match reply {
                 Reply::Listing(items) => {
@@ -434,9 +497,15 @@ impl Journal for ServiceJournal {
                         }
                         Ok(Reply::CaughtUp) => JournalEvent::CaughtUp,
                         Ok(Reply::Ping) => continue,
-                        // Disconnected, service stopped or unknown reply: changes may be missed.
-                        Ok(_) | Err(_) => {
+                        // Unknown reply: changes may be missed.
+                        Ok(_) => {
                             on_event(JournalEvent::Lost);
+                            return;
+                        }
+                        // The service stopped or is being updated; the journal itself goes on, so
+                        // following again from the last position misses nothing (#343).
+                        Err(_) => {
+                            on_event(JournalEvent::Disconnected);
                             return;
                         }
                     };
@@ -456,6 +525,16 @@ struct Follow {
     stopped: AtomicBool,
 }
 
+/// Cancels a listing's pending read on drop (harmless once the reader has finished).
+struct ListGuard(Arc<OwnedHandle>);
+
+impl Drop for ListGuard {
+    fn drop(&mut self) {
+        // SAFETY: the handle is kept alive by the Arc; cancels all pending I/O on it.
+        let _ = unsafe { CancelIoEx(self.0.0, None) };
+    }
+}
+
 /// Stops following on drop by cancelling the pending read, which ends the reader thread.
 struct FollowGuard(Arc<Follow>);
 
@@ -464,6 +543,27 @@ impl Drop for FollowGuard {
         self.0.stopped.store(true, Ordering::Relaxed);
         // SAFETY: pipe is a valid handle kept alive by the Arc; cancels all pending I/O on it.
         let _ = unsafe { CancelIoEx(self.0.pipe.0, None) };
+    }
+}
+
+#[cfg(test)]
+mod list_tests {
+    use super::*;
+
+    /// A listing given up while still connecting (no service answers on the pipe) ends at once,
+    /// not after the connect timeout.
+    #[test]
+    fn giving_up_while_connecting_ends_the_listing() {
+        let pipe = format!(r"\\.\pipe\arke-indexd-test.nobody.{}", std::process::id());
+        let journal = ServiceJournal::at(&pipe);
+        let started = Instant::now();
+        let listed = journal.list(Path::new(r"C:\"), &mut |_| false);
+        assert_eq!(listed.unwrap_err().kind(), io::ErrorKind::Interrupted);
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "{:?}",
+            started.elapsed()
+        );
     }
 }
 

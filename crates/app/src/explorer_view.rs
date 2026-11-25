@@ -38,6 +38,7 @@ use super::{DragPreview, DraggedFiles, drop_external_into, drop_into};
 use crate::a11y::A11yExt as _;
 use crate::assets::Icon;
 use crate::media::MediaKey;
+use crate::op_center::ToastDelays;
 use crate::text_input::TextInput;
 use crate::theme::{self, UiFont as _};
 use crate::workspace::TooltipBelowExt as _;
@@ -66,6 +67,10 @@ fn tail_items(item: Pixels) -> usize {
 const NOTICE_TTL: Duration = Duration::from_secs(5);
 /// A notice with Undo stays longer, so there's time to reach the button.
 const NOTICE_UNDO_TTL: Duration = Duration::from_secs(10);
+/// Delay keys of the progress toasts (see [`ToastDelays`]).
+const OPS_TOAST: &str = "ops";
+const EXTRACT_TOAST: &str = "extract";
+
 /// Widest the rename problem message gets before wrapping.
 fn rename_balloon_w() -> gpui::Pixels {
     crate::theme::scaled_px(440.)
@@ -280,7 +285,7 @@ impl Explorer {
             .into_any_element()
     }
 
-    /// View tools: details/icons/columns with the view options flyout, preview pane, split.
+    /// View tools: sort, details/icons/columns with the view options flyout, preview pane, split.
     pub(super) fn render_view_controls(
         &self,
         window: &Window,
@@ -291,6 +296,10 @@ impl Explorer {
             .flex_none()
             .items_center()
             .gap(theme::s_4())
+            // Search results keep their own order (relevance, or their headers).
+            .when(!self.search_mode, |d| {
+                d.child(self.render_sort_options(window, cx))
+            })
             // Split panes are half width: the switcher folds into the view options button (the
             // flyout has the same choices), leaving room for Copy to/Move to.
             .when(!self.pane.split, |d| {
@@ -517,6 +526,17 @@ impl Explorer {
                             .text_color(theme::text_muted()),
                     )
                     .tooltip_below(t!("sel.more").to_string())
+                    // A screen reader's Enter: opens where Shift+F10 would (#322).
+                    .a11y_on_click({
+                        let this = cx.entity().downgrade();
+                        move |window, cx| {
+                            let size = window.viewport_size();
+                            let at = gpui::point(size.width / 2., size.height / 3.);
+                            let _ = this.update(cx, |this, cx| {
+                                this.open_context_menu(at, window, cx);
+                            });
+                        }
+                    })
                     // Opens on press, like the other menus.
                     .on_mouse_down(
                         MouseButton::Left,
@@ -695,8 +715,12 @@ impl Explorer {
         let modified = entry
             .modified
             .map_or_default(|t| self.services.shell.format_time(t));
-        // Nested tree rows are named by relative path; read the file name.
-        let name = arke_core::tree::leaf(&entry.name);
+        // Nested tree rows are named by relative path; read the file name. A folder's localized
+        // name is read as it is shown (#370).
+        let name = entry
+            .shown
+            .as_deref()
+            .unwrap_or_else(|| arke_core::tree::leaf(&entry.name));
         crate::a11y::item_label(
             name,
             &[&arke_core::format::type_label(entry), &size, &modified],
@@ -706,7 +730,14 @@ impl Explorer {
     /// Screen reader name of the file list: the folder shown, or the search.
     fn list_a11y_label(&self) -> String {
         if self.search_mode {
-            return t!("filter.search_placeholder").into_owned();
+            return if self.scope() == super::scope::Scope::Computer {
+                t!("filter.computer_placeholder").into_owned()
+            } else {
+                self.search_in_name().map_or_else(
+                    || t!("filter.search_placeholder").into_owned(),
+                    |name| t!("filter.search_in_placeholder", name = name).into_owned(),
+                )
+            };
         }
         self.display_path().map_or_default(|p| {
             p.file_name().map_or_else(
@@ -836,6 +867,13 @@ impl Explorer {
                 if this.right_press.is_some() {
                     this.right_press_moved(event, window, cx);
                 }
+                // Single-click mode: resting on the item selects it (#46).
+                this.on_row_pointer_move(ix, event, window, cx);
+            }))
+            .on_hover(cx.listener(move |this, hovered: &bool, _, _| {
+                if !*hovered {
+                    this.on_row_pointer_left(ix);
+                }
             }))
             // Released on the item before the window-wide listener exists (a quick tap).
             .on_mouse_up(
@@ -872,7 +910,7 @@ impl Explorer {
             .child(name_cell(
                 entry,
                 rename_input,
-                self.show_extensions,
+                self.shown_name_of(entry),
                 true,
                 Some(press),
             ))
@@ -945,7 +983,7 @@ impl Explorer {
                     .a11y_item(ix, is_selected, cursor == Some(ix), || {
                         self.item_a11y_label(entry)
                     })
-                    .map(|row| self.tree_a11y(ix, entry, row))
+                    .map(|row| self.tree_a11y(ix, entry, row, cx))
                     .group(Self::check_group(ix))
                     .text_color(if entry.is_hidden() {
                         theme::text_subtle()
@@ -1054,7 +1092,7 @@ impl Explorer {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         match rename_input {
-            Some(rename) => name_cell(entry, Some(rename), true, false, None),
+            Some(rename) => name_cell(entry, Some(rename), SharedString::default(), false, None),
             None => div()
                 .debug_selector({
                     let name = Arc::clone(&entry.name);
@@ -1067,7 +1105,7 @@ impl Explorer {
                 // rather than clipping the sides.
                 .text_ellipsis()
                 .text_size(theme::fs_12())
-                .child(shown_name(entry, self.show_extensions))
+                .child(self.shown_name_of(entry))
                 .on_mouse_down(
                     MouseButton::Left,
                     cx.listener(move |this, _: &gpui::MouseDownEvent, _, _| {
@@ -1757,6 +1795,10 @@ impl Explorer {
             .notice_undo
             .as_ref()
             .is_some_and(|(text, _)| *text == notice)
+            || self
+                .notice_action
+                .as_ref()
+                .is_some_and(|a| a.text == notice)
         {
             NOTICE_UNDO_TTL
         } else {
@@ -1867,6 +1909,20 @@ impl Explorer {
                 })),
             ));
         }
+        if let Some(action) = self.notice_action.as_ref().filter(|a| a.text == notice) {
+            let run = std::rc::Rc::clone(&action.run);
+            actions.push((
+                std::borrow::Cow::Owned(action.label.to_string()),
+                Box::new(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                    this.notice = None;
+                    this.notice_action = None;
+                    // After this view's update: the action may read it (the sidebar does).
+                    let run = std::rc::Rc::clone(&run);
+                    cx.defer(move |cx| run(cx));
+                    cx.notify();
+                })),
+            ));
+        }
         actions.push((
             t!("toast.close"),
             Box::new(cx.listener(|this, _: &ClickEvent, _, cx| {
@@ -1886,7 +1942,13 @@ impl Explorer {
 
     fn render_toasts(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
         let mut toasts: Vec<AnyElement> = Vec::new();
-        if let Some(job) = &self.extract_job {
+        let view = cx.entity_id();
+        // Progress toasts wait: short jobs are only in the operation center.
+        if let Some(job) = self
+            .extract_job
+            .as_ref()
+            .filter(|_| ToastDelays::shown(cx, view, EXTRACT_TOAST))
+        {
             let p = job.progress;
             let progress = if p.total > 0 {
                 Progress::Fraction(p.done.min(p.total) as f32 / p.total as f32)
@@ -1912,17 +1974,21 @@ impl Explorer {
                 )],
             ));
         }
-        if let Some((progress, verb)) = self.op_progress.as_ref().filter(|_| self.ops_running > 0) {
-            toasts.push(Self::op_toast(progress, verb, cx));
-        } else if self.ops_running > 0 {
-            toasts.push(toast(
-                "toast-ops",
-                Icon::Copy,
-                t!("toast.ops_running").into_owned(),
-                Tone::Normal,
-                Progress::Indeterminate,
-                Vec::new(),
-            ));
+        if self.ops_running > 0 {
+            if ToastDelays::shown(cx, view, OPS_TOAST) {
+                if let Some((progress, verb)) = &self.op_progress {
+                    toasts.push(Self::op_toast(progress, verb, cx));
+                } else {
+                    toasts.push(toast(
+                        "toast-ops",
+                        Icon::Copy,
+                        t!("toast.ops_running").into_owned(),
+                        Tone::Normal,
+                        Progress::Indeterminate,
+                        Vec::new(),
+                    ));
+                }
+            }
         } else if let Some(notice) = &self.notice {
             toasts.push(self.notice_toast(notice, cx));
         }
@@ -1931,6 +1997,7 @@ impl Explorer {
                 let label = match a {
                     ErrorAction::Retry(_) | ErrorAction::RetryOp(_) => t!("toast.retry"),
                     ErrorAction::Login(_) => t!("toast.login"),
+                    ErrorAction::OpenDefault(_) => t!("toast.open_default"),
                 };
                 let listener: Listener =
                     Box::new(cx.listener(|this, _: &ClickEvent, window, cx| {
@@ -1982,7 +2049,11 @@ impl Explorer {
         let undo = self
             .notice_undo
             .as_ref()
-            .is_some_and(|(text, id)| text == notice && super::UndoHistory::has(cx, *id));
+            .is_some_and(|(text, id)| text == notice && super::UndoHistory::has(cx, *id))
+            || self
+                .notice_action
+                .as_ref()
+                .is_some_and(|a| &a.text == notice);
         Some((notice.clone(), undo))
     }
 
@@ -1999,6 +2070,12 @@ impl Explorer {
         } else if let Some(gone) = gone {
             crate::motion::Leaving::start(self, gone, |this| &mut this.closing_notice, cx);
         }
+    }
+
+    /// Starts the delay of the progress toasts when a job begins and forgets it when the job ends.
+    fn track_progress_toasts(&mut self, cx: &mut Context<Self>) {
+        ToastDelays::track(cx, OPS_TOAST, self.ops_running > 0);
+        ToastDelays::track(cx, EXTRACT_TOAST, self.extract_job.is_some());
     }
 
     /// The toasts up now, or else a notice that is fading out.
@@ -2609,6 +2686,17 @@ pub(super) fn caption_group(window: &Window) -> gpui::Div {
                 WindowControlArea::Max => t!("window.maximize"),
                 _ => t!("window.close"),
             })
+            // The system handles the mouse here; a screen reader's Enter comes this way (#322).
+            .a11y_on_click(move |window, _| match area {
+                WindowControlArea::Min => window.minimize_window(),
+                WindowControlArea::Max if maximized => {
+                    if let Some(hwnd) = super::Explorer::owner_from(window) {
+                        crate::win::restore_window(hwnd);
+                    }
+                }
+                WindowControlArea::Max => window.zoom_window(),
+                _ => window.remove_window(),
+            })
             .group(id)
             .size(theme::h_ctl())
             .flex()
@@ -2704,13 +2792,15 @@ type NamePress = Box<dyn Fn(&gpui::MouseDownEvent, &mut Window, &mut App)>;
 fn name_cell(
     entry: &Entry,
     rename: Option<(Entity<TextInput>, Option<NameError>)>,
-    show_ext: bool,
+    shown: SharedString,
     in_row: bool,
     on_press: Option<NamePress>,
 ) -> AnyElement {
     match rename {
         Some((input, problem)) => div()
             .debug_selector(|| "rename-box".to_owned())
+            // Tab and Shift+Tab here go to the next and previous item (`explorer_ops.rs`).
+            .key_context("RenameBox")
             // Presses stay in the box: the row under it would take focus back to the list, which
             // commits the rename, and a double-click would open the file (#69).
             .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
@@ -2759,7 +2849,7 @@ fn name_cell(
                     })
                     .min_w_0()
                     .truncate()
-                    .child(shown_name(entry, show_ext))
+                    .child(shown)
                     .when_some(on_press, |d, press| {
                         d.on_mouse_down(MouseButton::Left, press)
                     }),
@@ -2963,7 +3053,7 @@ impl Explorer {
             self.render_path_overlays(window, cx),
             self.render_context_menu(cx),
             self.render_quick_look(window, cx),
-            self.render_confirm(cx),
+            self.render_confirm(window, cx),
         ]
         .into_iter()
         .flatten()
@@ -2976,6 +3066,7 @@ impl Explorer {
     /// needed (preview, parent, folder sizes).
     fn before_render(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.on_frame(window, cx);
+        self.follow_localized(cx);
         // Windows' type names arrive after the first sort: order by what the column shows.
         if self.sort.uses(SortColumn::Type)
             && self.type_order != Some(arke_core::format::type_names_version())
@@ -2983,6 +3074,7 @@ impl Explorer {
             self.ensure_sorted(cx);
         }
         self.track_notice_exit(cx);
+        self.track_progress_toasts(cx);
         self.screen = (window.viewport_size(), window.scale_factor());
         let window_w = window.viewport_size().width;
         // A split tab's shared preview takes its room first; the panes share the rest.
@@ -3025,6 +3117,7 @@ impl Explorer {
         }
         self.poll_pending_create(cx);
         self.poll_pending_rename(window, cx);
+        self.poll_too_big_ask(window, cx);
         self.schedule_notice_dismiss(cx);
         self.sync_preview(cx);
         self.sync_parent_column();
@@ -3094,7 +3187,7 @@ impl Render for Explorer {
                                     )
                                     .child(self.render_list_appearing(window, cx)),
                             )
-                            .children(self.render_preview_appearing(cx)),
+                            .children(self.render_preview_appearing(window, cx)),
                     )
                     .children((self.pane.split && self.pane.active).then(active_outline))
                     .children(searching.then(search_outline))
@@ -3132,6 +3225,8 @@ impl Explorer {
             .on_action(cx.listener(Self::undo_file_op))
             .on_action(cx.listener(Self::redo_file_op))
             .on_action(cx.listener(Self::rename_file))
+            .on_action(cx.listener(Self::rename_next))
+            .on_action(cx.listener(Self::rename_prev))
             .on_action(cx.listener(Self::new_folder))
             .map(|d| Self::view_actions(d, cx))
             .on_action(cx.listener(Self::copy_to_peer))
@@ -3222,14 +3317,19 @@ impl Explorer {
     /// Preview pane slides in from the right when it is turned on (not when a tab showing it is
     /// drawn again). Turning it off is instant: the list takes the room back at once, and animating
     /// the width would relayout every row on every frame.
-    fn render_preview_appearing(&mut self, cx: &mut Context<Self>) -> Option<AnyElement> {
+    fn render_preview_appearing(
+        &mut self,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) -> Option<AnyElement> {
         let pane = self.render_preview_pane(cx)?;
         let description = crate::a11y::active()
             .then(|| self.preview_a11y_description())
             .flatten();
         Some(
-            self.preview_cue.wrap(
-                div()
+            self.preview_cue
+                .slide(
+                    div()
                 .id("preview-pane")
                 .debug_selector(|| "preview-pane".to_owned())
                 // A click here leaves the search box (and the path being edited), as one on the
@@ -3257,16 +3357,22 @@ impl Explorer {
                     accept_drops_into(d, here, cx)
                 })
                 .on_drag_move(cx.listener(Self::drag_preview_edge)),
-                "preview-pane-appear",
-                crate::motion::SLIDE_LG,
-                0.,
-            ),
+                    window,
+                    crate::motion::ease_out,
+                    crate::motion::SLIDE_LG,
+                    0.,
+                )
+                .into_any_element(),
         )
     }
 
     /// Split tab: the tab's one preview, drawn by the workspace at the tab's right end, showing
     /// this pane's item (the active side). `None` when this pane isn't the one it follows.
-    pub(crate) fn render_shared_preview(&mut self, cx: &mut Context<Self>) -> Option<AnyElement> {
+    pub(crate) fn render_shared_preview(
+        &mut self,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) -> Option<AnyElement> {
         let shared = self.pane.preview_host?;
         // The workspace draws this before the pane renders: catch up with the cursor now, so
         // switching sides never shows the other side's item for a frame.
@@ -3293,8 +3399,9 @@ impl Explorer {
             .then(|| self.preview_a11y_description())
             .flatten();
         Some(
-            self.preview_cue.wrap(
-                div()
+            self.preview_cue
+                .slide(
+                    div()
                 .id("shared-preview")
                 .debug_selector(|| "shared-preview".to_owned())
                 // A click here leaves the search box, as one in the single-pane preview does.
@@ -3324,10 +3431,12 @@ impl Explorer {
                     accept_drops_into(d, here, cx)
                 })
                 .on_drag_move(cx.listener(Self::drag_preview_edge)),
-                "shared-preview-appear",
-                crate::motion::SLIDE_LG,
-                0.,
-            ),
+                    window,
+                    crate::motion::ease_out,
+                    crate::motion::SLIDE_LG,
+                    0.,
+                )
+                .into_any_element(),
         )
     }
 
@@ -3342,16 +3451,14 @@ impl Explorer {
             .flex_1()
             .min_h_0()
             .child(self.render_list(window, cx));
-        if !self.view_cue.live_at(std::time::Instant::now()) {
+        // Styled in place from the cue's clock: the list is never wrapped, so a click made while
+        // it brightens still lands.
+        let Some(t) = self.view_cue.progress() else {
             return list.into_any_element();
-        }
-        gpui::AnimationExt::with_animation(
-            list,
-            ("list-view-switch", self.view_cue.serial()),
-            crate::motion::enter(),
-            |el, t| el.opacity(FLOOR + (1. - FLOOR) * t),
-        )
-        .into_any_element()
+        };
+        window.request_animation_frame();
+        list.opacity(FLOOR + (1. - FLOOR) * crate::motion::ease_out(t))
+            .into_any_element()
     }
 }
 

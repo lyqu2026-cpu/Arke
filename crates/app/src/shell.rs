@@ -201,6 +201,7 @@ impl ItemFailure {
             FailReason::ReadOnly => t!("fail.read_only", name = name),
             FailReason::PathTooLong => t!("fail.too_long", name = name),
             FailReason::NoRecycleBin => t!("fail.no_recycle_bin", name = name),
+            FailReason::TooBigForBin => t!("fail.too_big_for_bin", name = name),
             FailReason::BadName => t!("fail.bad_name", name = name),
             FailReason::BadNameInside => t!("fail.bad_name_inside", name = name),
             FailReason::DiskFull => t!("fail.disk_full", name = name),
@@ -237,6 +238,7 @@ pub(crate) fn items_failed(failed: &[ItemFailure]) -> String {
         Some(t!("fail.hint_close"))
     } else if any(&[
         FailReason::NoRecycleBin,
+        FailReason::TooBigForBin,
         FailReason::BadName,
         FailReason::BadNameInside,
     ]) {
@@ -306,6 +308,8 @@ pub(crate) enum PlaceKind {
     Wsl,
     /// Cloud sync folders such as OneDrive (sync roots registered with Windows).
     Cloud,
+    /// A phone or other portable device (`mtp://`, #292).
+    Phone,
 }
 
 /// How cloud files are kept on this machine (`Shell::set_cloud_pin`).
@@ -336,6 +340,15 @@ pub(crate) enum KnownFolder {
 pub(crate) struct ShellMenu {
     pub(crate) session: u64,
     pub(crate) entries: Vec<ShellMenuEntry>,
+    /// Not everything was read: a submenu still filling when the wait ran out, one left to fill
+    /// when it opens, or the item limit. A command missing from it may still be there, so it
+    /// doesn't count as gone (#278).
+    #[serde(default)]
+    pub(crate) partial: bool,
+    /// Submenus left still filling (their `lazy` number, label): not waited for while the menu
+    /// was read, filled right after it (#278).
+    #[serde(default)]
+    pub(crate) filling: Vec<(u32, String)>,
 }
 
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
@@ -768,7 +781,7 @@ pub(crate) fn run_menu_verb(
             _ => None,
         })
     }
-    let menu = shell.shell_menu(paths, false)?;
+    let menu = shell.shell_menu(paths, false, false)?;
     let Some(id) = find(&menu.entries, verb) else {
         shell.release_shell_menu(menu.session);
         return Ok(false);
@@ -783,6 +796,12 @@ pub(crate) trait Shell: Send + Sync + 'static {
     fn file_details(&self, path: &Path) -> FileDetails {
         let _ = path;
         FileDetails::default()
+    }
+    /// Folders pinned to Quick Access in Windows' File Explorer, in Explorer's order. `None` when
+    /// they could not be read; `Some` of an empty list when none are pinned. Read only: Arke never
+    /// changes Windows' Quick Access. Background thread.
+    fn quick_access_pinned(&self) -> Option<Vec<PathBuf>> {
+        None
     }
     /// Sets the attribute bits in `set` and clears those in `clear` on each of `paths`, leaving
     /// every other bit alone. Stops at the first item that fails. Background thread.
@@ -863,12 +882,17 @@ pub(crate) trait Shell: Send + Sync + 'static {
     /// Drags files into another program via Windows drag and drop; returns on drop or cancel with how it ended.
     /// Call on the UI thread while the left button is down (the drag loop needs a thread with a window). No file system access.
     /// `image` is the cursor image from [`Shell::drag_image`]; if it is not ready only the cursor shows.
+    /// `after_lost_press`: another program took the mouse in the middle of Arke's drag (Alt+Tab,
+    /// #326). Arke, now in the background, can't read whether the button is still down, so the
+    /// drag drops only once Windows has seen the button down (otherwise it is cancelled), and
+    /// coming back over Arke doesn't hand it back (Arke's own drag is over).
     fn drag_out(
         &self,
         paths: &[PathBuf],
         image: Option<&DragImage>,
+        after_lost_press: bool,
     ) -> Result<DragOutEnd, ShellError> {
-        let _ = (paths, image);
+        let _ = (paths, image, after_lost_press);
         Ok(DragOutEnd::Finished)
     }
     /// Whether another program's window is on top of `owner` at the cursor, such as a launcher
@@ -996,7 +1020,13 @@ pub(crate) trait Shell: Send + Sync + 'static {
     /// With `background`, `paths` is one folder and the menu is its empty-space menu (New, Open in Terminal, ...).
     /// Shell extensions are loaded in a separate process (`shell_host.rs`), never in Arke itself. Background thread.
     /// The menu object stays alive there; later calls invoke an entry or release it by `session`.
-    fn shell_menu(&self, paths: &[PathBuf], background: bool) -> Result<ShellMenu, ShellError>;
+    /// `extended`: Shift was held, so commands registered to show only then are included (#272).
+    fn shell_menu(
+        &self,
+        paths: &[PathBuf],
+        background: bool,
+        extended: bool,
+    ) -> Result<ShellMenu, ShellError>;
     /// Whether "More options" can be prefetched when the context menu opens. Only possible out of process;
     /// otherwise it is read when the user opens it.
     fn shell_menu_prefetch(&self) -> bool {
@@ -1023,8 +1053,23 @@ pub(crate) trait Shell: Send + Sync + 'static {
     ) -> Result<Vec<ShellMenuEntry>, ShellError> {
         Err(ShellError::Unsupported)
     }
-    /// Context menu extensions that apply to `paths`, or the folder's empty space
-    /// (`win_menu_parts.rs`). Background thread.
+    /// What kind of item a menu for `paths` is for, as packaged apps register their commands
+    /// (`win_menu_parts::item_kind`: `Directory`, `.txt`...). Background thread.
+    fn shell_menu_kind(&self, _paths: &[PathBuf], _background: bool) -> Option<String> {
+        None
+    }
+    /// Item types a packaged app's command (class id `{...}`) is registered for, from its
+    /// manifest (`win_packaged.rs`); empty when unknown. Background thread.
+    fn packaged_item_types(&self, _clsid: &str) -> Vec<String> {
+        Vec::new()
+    }
+    /// Every packaged app's context menu command (`{...}`) registered for item kind `kind`
+    /// (`win_packaged::commands`). Background thread.
+    fn packaged_commands(&self, _kind: &str) -> Vec<String> {
+        Vec::new()
+    }
+    /// Context menu extensions and registry commands that apply to `paths`, or the folder's
+    /// empty space (`win_menu_parts.rs`). Background thread.
     fn shell_menu_handlers(
         &self,
         _paths: &[PathBuf],
@@ -1039,6 +1084,7 @@ pub(crate) trait Shell: Send + Sync + 'static {
         &self,
         _paths: &[PathBuf],
         _background: bool,
+        _extended: bool,
         _handler: &crate::win_menu_parts::MenuHandler,
         _group: u64,
     ) -> Result<(ShellMenu, std::time::Duration), ShellError> {
@@ -1071,6 +1117,12 @@ pub(crate) trait Shell: Send + Sync + 'static {
         let _ = (sources, dest);
         Err(ShellError::Unsupported)
     }
+    /// Whether File Explorer's "Show recently used files" is on (not `ShowRecent` = 0 and not
+    /// turned off by the "no recent documents history" policy). Home hides its recent files
+    /// when it is off. Reads the registry only. Background thread.
+    fn recent_files_enabled(&self) -> bool {
+        true
+    }
     /// Recent files from the Windows recent list, newest first, at most `limit`; folders excluded.
     /// Reads the stored link targets without touching them, so network files do not hang. Background thread.
     fn recent_files(&self, limit: usize) -> Vec<crate::home::RecentFile> {
@@ -1086,6 +1138,17 @@ pub(crate) trait Shell: Send + Sync + 'static {
     fn is_ejectable(&self, root: &Path) -> bool {
         let _ = root;
         false
+    }
+    /// Windows' Format dialog for the drive at `root`, owned by `owner`. Background thread (the
+    /// dialog is modal).
+    fn format_drive(&self, root: &Path, owner: Option<isize>) -> Result<(), ShellError> {
+        let _ = (root, owner);
+        Err(ShellError::Unsupported)
+    }
+    /// Windows' Disk Cleanup for the drive at `root`. Background thread.
+    fn disk_cleanup(&self, root: &Path) -> Result<(), ShellError> {
+        let _ = root;
+        Err(ShellError::Unsupported)
     }
     /// Ejects a drive (Safely Remove Hardware). Returns the reason if it is in use. Background thread.
     fn eject_drive(&self, root: &Path) -> Result<(), ShellError> {
@@ -1180,6 +1243,19 @@ pub(crate) trait Shell: Send + Sync + 'static {
     fn render_pdf(&self, path: &Path, page: u32, max: (u32, u32)) -> Result<PdfRender, ShellError> {
         let _ = (path, page, max);
         Err(ShellError::Unsupported)
+    }
+    /// The first page of a PDF as a thumbnail fitted within `max_side`, for file lists. Where
+    /// the shell can, it renders in a separate process so a malformed file can't stall or crash
+    /// Arke; the default renders in this one. Background thread. `Ok(None)`: no thumbnail.
+    fn pdf_thumbnail(
+        &self,
+        path: &Path,
+        max_side: u32,
+    ) -> Result<Option<arke_core::thumbs::Thumbnail>, ShellError> {
+        Ok(self
+            .render_pdf(path, 0, (max_side, max_side))
+            .ok()
+            .map(|r| r.image))
     }
     /// Sync state of one folder's items from the Cloud Files API. `items` are the names worth a
     /// per-item read (local placeholders, see `Entry::wants_sync_check`). Reads attributes and

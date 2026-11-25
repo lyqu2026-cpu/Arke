@@ -175,12 +175,19 @@ enum Msg {
     Native(Result<(), String>),
     Hash(HashState),
     Unblocked(Result<(), String>),
+    /// Reading this drive's file table took this long (ms): remembered for the next count.
+    TableTime(String, crate::settings::TableTime),
     /// An action from the quick row that failed.
     Action(Result<(), String>),
 }
 
 pub(crate) struct Properties {
     services: Services,
+    /// The search index, which answers a folder's space at once when it follows its drive live
+    /// (`IndexService::usage_below`); otherwise the folder is walked.
+    index: Option<Arc<arke_core::index_service::IndexService>>,
+    /// How long reading each drive's file table took before (`Settings::mft_list`).
+    table_times: std::collections::BTreeMap<String, crate::settings::TableTime>,
     focus: FocusHandle,
     /// The items asked about, with whether each is a folder.
     targets: Vec<(PathBuf, bool)>,
@@ -375,6 +382,12 @@ impl Properties {
         ];
         let this = Self {
             services,
+            index: crate::global_search::GlobalSearch::local_service(cx),
+            table_times: crate::settings::SettingsStore::global(cx)
+                .read(cx)
+                .settings
+                .mft_list
+                .clone(),
             focus,
             targets,
             loaded: None,
@@ -483,6 +496,8 @@ impl Properties {
 
     fn start_loading(&self) {
         let services = self.services.clone();
+        let index = self.index.clone();
+        let table_times = self.table_times.clone();
         let targets = self.targets.clone();
         let tx = self.tx.clone();
         let cancel = Arc::clone(&self.cancel);
@@ -492,7 +507,18 @@ impl Properties {
             let rows: Vec<Row> = loaded.rows.clone();
             let details = loaded.details;
             let _ = tx.send(Msg::Loaded(Box::new(loaded)));
-            count_space(&services, &rows, details, cluster, &cancel, &tx);
+            let table = table_reader();
+            let profiles = service_profiles();
+            // Shared by the folders of this window: what one teaches is used for the next.
+            let table_times = parking_lot::Mutex::new(table_times);
+            let fast = Fast {
+                index: index.as_deref(),
+                table: table.as_deref(),
+                table_times: &table_times,
+                profiles: profiles.as_ref(),
+                seeks: crate::win_eject::seeks,
+            };
+            count_space(&services, &fast, &rows, details, cluster, &cancel, &tx);
         });
     }
 
@@ -500,6 +526,13 @@ impl Properties {
         match msg {
             Msg::Loaded(loaded) => {
                 self.loaded = Some(*loaded);
+            }
+            Msg::TableTime(volume, time) => {
+                use crate::settings::TableTime;
+                TableTime::learn(&mut self.table_times, volume.clone(), time);
+                crate::settings::SettingsStore::global(cx).update(cx, |store, cx| {
+                    store.update(|s| TableTime::learn(&mut s.mft_list, volume, time), cx);
+                });
             }
             Msg::Space(space, counting) => {
                 // Stopped by the user: what comes in late is dropped.
@@ -1492,9 +1525,210 @@ pub(crate) fn on_disk_of(entry: &Entry, details: FileDetails, cluster: u64) -> u
     )
 }
 
+/// The faster ways to count a folder than walking it.
+struct Fast<'a> {
+    /// The search index, when it follows the folder's drive live: one pass in memory.
+    index: Option<&'a arke_core::index_service::IndexService>,
+    /// The index service, which reads a drive's whole file table ($MFT) in seconds, as WizTree
+    /// does (admin rights, which it has as a service).
+    table: Option<&'a dyn arke_core::journal::Journal>,
+    /// How long that took before, per drive (`C:\`), with what this window has learned since.
+    table_times:
+        &'a parking_lot::Mutex<std::collections::BTreeMap<String, crate::settings::TableTime>>,
+    /// The profiles the service lists without contents (for the index and the file table).
+    profiles: Option<&'a dirsize::Profiles>,
+    /// Whether a drive is a spinning disk (`win_eject::seeks`), where two reads at once slow each
+    /// other down.
+    seeks: fn(&Path) -> bool,
+}
+
+/// The index service, when it is installed, for reading drives' file tables.
+fn table_reader() -> Option<Arc<dyn arke_core::journal::Journal>> {
+    if cfg!(test) || !arke_indexd::client::installed() {
+        return None;
+    }
+    Some(Arc::new(arke_indexd::client::ServiceJournal::new()))
+}
+
+/// Whose profile folders the index service lists without contents. None in tests, which don't
+/// depend on the machine's profiles.
+fn service_profiles() -> Option<dirsize::Profiles> {
+    if cfg!(test) {
+        return None;
+    }
+    arke_indexd::client::profiles()
+}
+
+/// Whether the drive's file table can count `dir`: not inside a folder its listing doesn't go
+/// into (hidden system folders such as `C:\Windows\Installer`, the recycle bin), through a link
+/// (a junction, a mount point: not in the listing) or in another user's profile. Otherwise the
+/// table is neither asked (a whole read for nothing) nor handed over to. A stat per folder on the
+/// way, only when the table would start.
+fn table_can_count(
+    fs: &dyn arke_core::fs::Fs,
+    root: &Path,
+    dir: &Path,
+    profiles: Option<&dirsize::Profiles>,
+) -> bool {
+    if profiles.is_some_and(|p| p.hidden(dir)) {
+        return false;
+    }
+    let mut path = root.to_path_buf();
+    dir.components().skip(2).all(|part| {
+        path.push(part);
+        fs.stat(&path)
+            .is_ok_and(|entry| arke_core::index::descends_into(&entry))
+    })
+}
+
+/// The count from the file table, else from `walk` when the table can't give one (not NTFS, an
+/// older service, the folder isn't in it, a bug in the read). `None` when cancelled.
+fn table_else_walk(
+    read: impl FnOnce() -> std::io::Result<Space>,
+    walk: impl FnOnce() -> Option<Space>,
+) -> Option<Space> {
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(read)) {
+        Ok(Ok(space)) => Some(space),
+        Ok(Err(e)) if e.kind() == std::io::ErrorKind::Interrupted => None,
+        Ok(Err(_)) => walk(),
+        Err(_) => {
+            log::warn!("properties: the file table read panicked");
+            walk()
+        }
+    }
+}
+
+/// `C:\` for anything on drive C.
+fn drive_root(path: &Path) -> Option<PathBuf> {
+    let root: PathBuf = path.components().take(2).collect();
+    (root.components().count() == 2 && root.to_string_lossy().ends_with('\\')).then_some(root)
+}
+
+/// Counts `dir`, reporting as it goes through `progress`:
+/// - from the index when it follows the drive live;
+/// - a drive itself from its file table (a whole drive in seconds instead of a minute or more);
+/// - a folder by walking it, overtaken by a read of the file table once the walk has taken as long
+///   as reading the table took on that drive before (or from the start when that isn't known yet).
+///   Whichever is done first counts; the other stops at once. Nothing is a fixed time: a small
+///   folder is walked in less than the table takes, a big one is not. A read stopped early still
+///   tells that the table isn't worth starting before the walk's time, so small folders soon
+///   stop starting it. A folder the table can't count (`table_can_count`) is only walked.
+///
+/// On a spinning disk the table counts alone, from the start: a walk there seeks for every folder,
+/// and the two at once would slow each other down. Only what the table can't count is walked.
+fn count_folder(
+    fs: &dyn arke_core::fs::Fs,
+    fast: &Fast,
+    dir: &Path,
+    cluster: u64,
+    cancel: &AtomicBool,
+    tx: &flume::Sender<Msg>,
+    progress: &mut dyn FnMut(&Space),
+) -> Option<Space> {
+    use crate::settings::TableTime;
+    let (times, profiles) = (fast.table_times, fast.profiles);
+    if let Some(space) = fast
+        .index
+        .and_then(|ix| ix.usage_below(dir, cluster, profiles, cancel))
+    {
+        return Some(space);
+    }
+    let table = fast.table.zip(drive_root(dir));
+    let Some((table, root)) = table else {
+        return dirsize::usage(fs, dir, cluster, cancel, progress);
+    };
+    let key = root.to_string_lossy().into_owned();
+    // `since`: when the count began. A read stopped early took less than the table takes, and the
+    // count was done first anyway: the table isn't worth starting before that time.
+    let read_table = |stop: &AtomicBool, since: Instant| {
+        let started = Instant::now();
+        let result = dirsize::usage_from_listing(table, fs, dir, cluster, profiles, stop);
+        let ms = |from: Instant| u64::try_from(from.elapsed().as_millis()).unwrap_or(u64::MAX);
+        // Read to the end, also when for nothing (the folder isn't in it): the table's time.
+        let read_all = result.as_ref().err().is_none_or(dirsize::listed_to_end);
+        let stopped = matches!(&result, Err(e) if e.kind() == std::io::ErrorKind::Interrupted);
+        let time = if read_all {
+            Some(TableTime {
+                ms: ms(started),
+                done: true,
+            })
+        } else if stopped {
+            Some(TableTime {
+                ms: ms(since),
+                done: false,
+            })
+        } else {
+            None
+        };
+        if let Some(time) = time {
+            TableTime::learn(&mut times.lock(), key.clone(), time);
+            let _ = tx.send(Msg::TableTime(key.clone(), time));
+        }
+        result
+    };
+    // The drive itself (the table has everything), or a spinning disk: there the table is one
+    // sweep over the drive, a walk seeks for every folder, and the two at once slow each other
+    // down. The table alone, a walk only when it can't count it.
+    if dir == root || ((fast.seeks)(&root) && table_can_count(fs, &root, dir, profiles)) {
+        return table_else_walk(
+            || read_table(cancel, Instant::now()),
+            || dirsize::usage(fs, dir, cluster, cancel, progress),
+        );
+    }
+    let known = times.lock().get(&key).copied();
+    let overtake = known.map(|t| std::time::Duration::from_millis(t.ms));
+    let stop_walk = AtomicBool::new(false);
+    let stop_table = AtomicBool::new(false);
+    let (done_tx, done_rx) = flume::bounded::<std::io::Result<Space>>(1);
+    // Moved into the table's thread, so the channel closes when it ends whatever way (a panic).
+    let mut done_tx = Some(done_tx);
+    let started = Instant::now();
+    std::thread::scope(|scope| {
+        let mut asked = false;
+        let mut reading = None;
+        let mut from_table: Option<Space> = None;
+        let walked = dirsize::usage(fs, dir, cluster, &stop_walk, &mut |so_far| {
+            if cancel.load(Ordering::Relaxed) {
+                stop_walk.store(true, Ordering::Relaxed);
+                return;
+            }
+            if !asked && overtake.is_none_or(|after| started.elapsed() >= after) {
+                asked = true;
+                if table_can_count(fs, &root, dir, profiles)
+                    && let Some(done_tx) = done_tx.take()
+                {
+                    let (read_table, stop_table) = (&read_table, &stop_table);
+                    reading = Some(scope.spawn(move || {
+                        let _ = done_tx.send(read_table(stop_table, started));
+                    }));
+                }
+            }
+            // The table can't count it (or its thread failed): the walk just goes on.
+            if let Ok(Ok(space)) = done_rx.try_recv() {
+                from_table = Some(space);
+                stop_walk.store(true, Ordering::Relaxed);
+                return;
+            }
+            progress(so_far);
+        });
+        stop_table.store(true, Ordering::Relaxed);
+        // Joined here so a panic in the table's thread doesn't take the count down with it.
+        if let Some(reading) = reading
+            && reading.join().is_err()
+        {
+            log::warn!("properties: the file table read panicked");
+        }
+        if cancel.load(Ordering::Relaxed) {
+            return None;
+        }
+        walked.or(from_table)
+    })
+}
+
 /// Counts the files and folders under the items and reports as it goes. Background thread.
 fn count_space(
     services: &Services,
+    fast: &Fast,
     rows: &[Row],
     details: FileDetails,
     cluster: u64,
@@ -1518,19 +1752,27 @@ fn count_space(
     let mut last_sent: Option<Instant> = None;
     for row in rows.iter().filter(|r| r.entry.is_dir_like()) {
         let before = done.clone();
-        let walked = dirsize::usage(&*services.fs, &row.path, cluster, cancel, &mut |so_far| {
-            if last_sent.is_none_or(|at| at.elapsed() >= PROGRESS_EVERY) {
-                last_sent = Some(Instant::now());
-                let mut shown = before.clone();
-                shown.usage += so_far.usage;
-                if single {
-                    shown.children.clone_from(&so_far.children);
-                } else {
-                    shown.children.push((row.path.clone(), so_far.usage.bytes));
+        let walked = count_folder(
+            &*services.fs,
+            fast,
+            &row.path,
+            cluster,
+            cancel,
+            tx,
+            &mut |so_far| {
+                if last_sent.is_none_or(|at| at.elapsed() >= PROGRESS_EVERY) {
+                    last_sent = Some(Instant::now());
+                    let mut shown = before.clone();
+                    shown.usage += so_far.usage;
+                    if single {
+                        shown.children.clone_from(&so_far.children);
+                    } else {
+                        shown.children.push((row.path.clone(), so_far.usage.bytes));
+                    }
+                    let _ = tx.send(Msg::Space(shown, Counting::Running));
                 }
-                let _ = tx.send(Msg::Space(shown, Counting::Running));
-            }
-        });
+            },
+        );
         match walked {
             Some(space) => {
                 done.usage += space.usage;
@@ -1565,6 +1807,8 @@ const ROW_H: f32 = 42.;
 
 /// The row layout of every card: label on the left, the value (and what goes with it) after it.
 fn field(label: String, value: AnyElement, height: f32) -> CardRow {
+    // What's on the right is read with the row's label ("Size, 3 B"; "Location, C:\...").
+    let a11y = crate::a11y::active();
     CardRow {
         element: div()
             .min_h(px(ROW_H))
@@ -1573,6 +1817,9 @@ fn field(label: String, value: AnyElement, height: f32) -> CardRow {
             .flex()
             .items_center()
             .gap(theme::s_16())
+            .when(a11y, |d| {
+                d.child(crate::a11y::label_scope(label.clone().into()))
+            })
             .child(
                 div()
                     .w(LABEL_W)
@@ -1582,6 +1829,7 @@ fn field(label: String, value: AnyElement, height: f32) -> CardRow {
                     .child(label),
             )
             .child(div().flex_1().min_w_0().child(value))
+            .when(a11y, |d| d.child(crate::a11y::end_label_scope()))
             .into_any_element(),
         height: height.max(ROW_H),
     }
@@ -1603,13 +1851,15 @@ fn wide(element: AnyElement, height: f32) -> CardRow {
 }
 
 fn text_value(id: &'static str, text: impl Into<SharedString>) -> AnyElement {
+    let text: SharedString = text.into();
     div()
         .id(id)
         .debug_selector(move || id.to_owned())
+        .a11y_row_text(text.clone())
         .min_w_0()
         .text_size(theme::fs_13())
         .text_color(theme::text())
-        .child(text.into())
+        .child(text)
         .into_any_element()
 }
 
@@ -1688,7 +1938,7 @@ fn button(
     div()
         .id(id)
         .debug_selector(move || id.to_owned())
-        .a11y_button(label.clone())
+        .a11y_row_button(label.clone())
         .h(theme::h_ctl_sm())
         .px(theme::s_12())
         .flex()
@@ -1717,7 +1967,7 @@ fn action(
     div()
         .id(id)
         .debug_selector(move || id.to_owned())
-        .a11y_button(label.clone())
+        .a11y_row_button(label.clone())
         .h(theme::h_ctl_sm())
         .px(theme::s_8())
         .flex()
@@ -1754,7 +2004,7 @@ fn link(
     div()
         .id(id)
         .debug_selector(move || id.to_owned())
-        .a11y_button(text.clone())
+        .a11y_row_button(text.clone())
         .flex_none()
         .cursor_pointer()
         .text_size(theme::fs_12())
@@ -1893,7 +2143,14 @@ impl Properties {
                     theme::line_strong()
                 })
                 .text_size(theme::fs_15())
+                // The field is named "Name" for screen readers (`text_input.rs`).
+                .when(crate::a11y::active(), |d| {
+                    d.child(crate::a11y::label_scope(t!("col.name").into_owned().into()))
+                })
                 .child(self.name_input.clone())
+                .when(crate::a11y::active(), |d| {
+                    d.child(crate::a11y::end_label_scope())
+                })
                 .into_any_element()
         } else {
             let text = match (single, loaded.and_then(|l| l.drive.as_ref())) {
@@ -2040,7 +2297,7 @@ impl Properties {
                 Some(path) => div()
                     .id(id)
                     .debug_selector(move || id.to_owned())
-                    .a11y_button(info.value.clone())
+                    .a11y_row_button(info.value.clone().into())
                     .min_w_0()
                     .truncate()
                     .cursor_pointer()
@@ -2085,7 +2342,7 @@ impl Properties {
                 div()
                     .id("props-target")
                     .debug_selector(|| "props-target".to_owned())
-                    .a11y_button(shown.clone())
+                    .a11y_row_button(shown.clone().into())
                     .cursor_pointer()
                     .text_size(theme::fs_13())
                     .text_color(theme::signal())
@@ -2351,7 +2608,9 @@ impl Properties {
         reason = "one card: bar, legend and folder rows"
     )]
     fn space_card(&self) -> Option<(AnyElement, f32)> {
-        let view = self.space_view()?;
+        let Some(view) = self.space_view() else {
+            return self.space_card_counting();
+        };
         let total = view.total.max(1) as f32;
         let mut bar = div()
             .id("props-space-bar")
@@ -2461,6 +2720,68 @@ impl Properties {
                                     .bg(theme::signal()),
                             ),
                     )
+                    .into_any_element(),
+                height: 44.,
+            });
+        }
+        Some(card(Icon::Sort, t!("props.space").into_owned(), rows))
+    }
+
+    /// The space card while nothing is counted yet (a drive's file table answers all at once):
+    /// there from the start, an empty bar and the rows the folders will fill, so the window
+    /// doesn't change its layout when the numbers come.
+    fn space_card_counting(&self) -> Option<(AnyElement, f32)> {
+        if !self.any_folder() || !matches!(self.counting, Counting::Running) {
+            return None;
+        }
+        let placeholder = |height: f32, width: f32| {
+            div()
+                .h(px(height))
+                .w(relative(width))
+                .rounded(theme::R_FULL)
+                .bg(theme::wash())
+        };
+        let mut rows = vec![CardRow {
+            element: div()
+                .debug_selector(|| "props-space-counting".to_owned())
+                .px(theme::s_16())
+                .py(theme::s_12())
+                .flex()
+                .flex_col()
+                .gap(theme::s_8())
+                .child(
+                    div()
+                        .h(px(12.))
+                        .w_full()
+                        .rounded(theme::R_FULL)
+                        .bg(theme::wash_strong()),
+                )
+                .child(
+                    div()
+                        .h(px(16.))
+                        .text_size(theme::fs_12())
+                        .text_color(theme::text_muted())
+                        .child(t!("props.calculating").into_owned()),
+                )
+                // The legend's usual lines (`space_card`: 20 px each).
+                .child(placeholder(8., 0.7))
+                .child(placeholder(8., 0.5))
+                .into_any_element(),
+            height: 40. + 3. * 20.,
+        }];
+        // The three biggest folders go here.
+        for width in [0.6, 0.45, 0.3] {
+            rows.push(CardRow {
+                element: div()
+                    .px(theme::s_16())
+                    .py(theme::s_8())
+                    .flex()
+                    .flex_col()
+                    .justify_center()
+                    .gap(theme::s_8())
+                    .h(px(44.))
+                    .child(placeholder(8., width))
+                    .child(placeholder(3., 1.))
                     .into_any_element(),
                 height: 44.,
             });
@@ -2663,5 +2984,344 @@ impl Render for Properties {
                     ),
             )
             .child(self.footer(cx))
+    }
+}
+
+#[cfg(test)]
+mod count_folder_tests {
+    use super::*;
+    use crate::settings::TableTime;
+    use arke_core::entry::{Entry, EntryKind};
+    use arke_core::fake::FakeFs;
+    use arke_core::journal::{
+        Cursor, FakeJournal, Journal, JournalCallback, LISTED_ROOT, ListSink, Listed,
+    };
+    use std::collections::BTreeMap;
+    use std::time::Duration;
+
+    /// A file table that takes `wait` before its first batch, asking the sink meanwhile whether
+    /// to go on, as the service's client does.
+    struct Slow {
+        inner: Arc<FakeJournal>,
+        wait: Duration,
+    }
+
+    impl Journal for Slow {
+        fn cursor(&self, root: &Path) -> Option<Cursor> {
+            self.inner.cursor(root)
+        }
+        fn follow(
+            &self,
+            root: &Path,
+            from: Cursor,
+            on_event: JournalCallback,
+        ) -> std::io::Result<Box<dyn Send>> {
+            self.inner.follow(root, from, on_event)
+        }
+        fn list(&self, root: &Path, sink: ListSink) -> std::io::Result<()> {
+            let started = Instant::now();
+            while started.elapsed() < self.wait {
+                if !sink(Vec::new()) {
+                    return Err(std::io::ErrorKind::Interrupted.into());
+                }
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            self.inner.list(root, sink)
+        }
+    }
+
+    /// C:\w holds a.txt (100 bytes) and an empty folder; the file table also has big.bin (a
+    /// million), so a count tells which way it was made. C:\x is on the disk but not in the
+    /// table.
+    fn setup() -> (Arc<FakeFs>, Arc<FakeJournal>) {
+        let fs = FakeFs::new();
+        fs.insert_dir(
+            r"C:\",
+            vec![
+                Entry::new("w", EntryKind::Dir, 0, None, 0x10),
+                Entry::new("x", EntryKind::Dir, 0, None, 0x10),
+            ],
+        );
+        fs.insert_dir(
+            r"C:\w",
+            vec![
+                Entry::new("a.txt", EntryKind::File, 100, None, 0x20),
+                Entry::new("sub", EntryKind::Dir, 0, None, 0x10),
+            ],
+        );
+        fs.insert_dir(r"C:\w\sub", vec![]);
+        fs.insert_dir(
+            r"C:\x",
+            vec![
+                Entry::new("b.txt", EntryKind::File, 7, None, 0x20),
+                Entry::new("sub", EntryKind::Dir, 0, None, 0x10),
+            ],
+        );
+        fs.insert_dir(r"C:\x\sub", vec![]);
+        let item = |parent, name: &str, dir: bool, size| Listed {
+            parent,
+            name: name.into(),
+            attributes: if dir { 0x10 } else { 0x20 },
+            size,
+            mtime: 0,
+            link: false,
+        };
+        let journal = FakeJournal::new(1);
+        journal.set_listing(
+            r"C:\",
+            vec![
+                item(LISTED_ROOT, "w", true, 0),
+                item(0, "a.txt", false, 100),
+                item(0, "big.bin", false, 1_000_000),
+                item(0, "sub", true, 0),
+            ],
+        );
+        (fs, journal)
+    }
+
+    /// Counts `dir` with what is known in `times` (and learned on the way, as in one window).
+    fn count_with(
+        fs: &FakeFs,
+        table: &dyn Journal,
+        times: &parking_lot::Mutex<BTreeMap<String, TableTime>>,
+        seeks: fn(&Path) -> bool,
+        dir: &str,
+    ) -> (u64, Vec<TableTime>) {
+        let fast = Fast {
+            index: None,
+            table: Some(table),
+            table_times: times,
+            profiles: None,
+            seeks,
+        };
+        let (tx, rx) = flume::unbounded();
+        let cancel = AtomicBool::new(false);
+        let space = count_folder(fs, &fast, Path::new(dir), 4096, &cancel, &tx, &mut |_| {})
+            .expect("counted");
+        drop(tx);
+        let learned = rx
+            .iter()
+            .filter_map(|m| match m {
+                Msg::TableTime(_, t) => Some(t),
+                _ => None,
+            })
+            .collect();
+        (space.usage.bytes, learned)
+    }
+
+    fn count(
+        fs: &FakeFs,
+        table: &dyn Journal,
+        times: &BTreeMap<String, TableTime>,
+        seeks: fn(&Path) -> bool,
+        dir: &str,
+    ) -> (u64, Vec<TableTime>) {
+        count_with(
+            fs,
+            table,
+            &parking_lot::Mutex::new(times.clone()),
+            seeks,
+            dir,
+        )
+    }
+
+    /// A file table whose read panics, as a bug in it would.
+    struct Crashing;
+
+    impl Journal for Crashing {
+        fn cursor(&self, _: &Path) -> Option<Cursor> {
+            None
+        }
+        fn follow(
+            &self,
+            _: &Path,
+            _: Cursor,
+            _: JournalCallback,
+        ) -> std::io::Result<Box<dyn Send>> {
+            Err(std::io::ErrorKind::Unsupported.into())
+        }
+        fn list(&self, _: &Path, _: ListSink) -> std::io::Result<()> {
+            panic!("simulated bug in the file table read");
+        }
+    }
+
+    const fn ssd(_: &Path) -> bool {
+        false
+    }
+
+    const fn hdd(_: &Path) -> bool {
+        true
+    }
+
+    fn known(ms: u64, done: bool) -> BTreeMap<String, TableTime> {
+        BTreeMap::from([(r"C:\".to_owned(), TableTime { ms, done })])
+    }
+
+    /// A drive is counted from its file table, and how long that took is remembered.
+    #[test]
+    fn a_drive_comes_from_the_file_table() {
+        let (fs, journal) = setup();
+        let (bytes, learned) = count(&fs, &*journal, &BTreeMap::new(), ssd, r"C:\");
+        assert_eq!(bytes, 1_000_100);
+        assert_eq!(journal.list_calls(), 1);
+        assert!(matches!(learned[..], [TableTime { done: true, .. }]));
+    }
+
+    /// A folder walked in less time than the table takes on that drive never starts the table.
+    #[test]
+    fn a_quick_walk_leaves_the_table_alone() {
+        let (fs, journal) = setup();
+        let (bytes, learned) = count(&fs, &*journal, &known(60_000, true), ssd, r"C:\w");
+        assert_eq!(bytes, 100);
+        assert_eq!(journal.list_calls(), 0);
+        assert!(learned.is_empty());
+    }
+
+    /// Not known yet: the table starts with the walk. The walk is done first: its count shows at
+    /// once (the table stops instead of being waited for), and the table is known to take at
+    /// least that long.
+    #[test]
+    fn the_walk_does_not_wait_for_the_table_it_beat() {
+        let (fs, journal) = setup();
+        let slow = Slow {
+            inner: journal,
+            wait: Duration::from_secs(5),
+        };
+        let started = Instant::now();
+        let (bytes, learned) = count(&fs, &slow, &BTreeMap::new(), ssd, r"C:\w");
+        assert_eq!(bytes, 100);
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "{:?}",
+            started.elapsed()
+        );
+        assert!(
+            matches!(learned[..], [TableTime { done: false, .. }]),
+            "{learned:?}"
+        );
+    }
+
+    /// A read stopped because the walk was done first tells that the table isn't worth starting
+    /// before the walk's whole time, not just the part the table ran: the next count of the same
+    /// folder doesn't start it again.
+    #[test]
+    fn a_stopped_read_learns_the_whole_walk() {
+        let (fs, journal) = setup();
+        fs.set_delay(r"C:\w", Duration::from_millis(60));
+        fs.set_delay(r"C:\w\sub", Duration::from_millis(60));
+        let slow = Slow {
+            inner: journal,
+            wait: Duration::from_secs(5),
+        };
+        // The table starts after the first folder (60 ms), the walk ends after the second.
+        let (bytes, learned) = count(&fs, &slow, &known(1, false), ssd, r"C:\w");
+        assert_eq!(bytes, 100);
+        assert!(
+            matches!(learned[..], [TableTime { ms, done: false }] if ms >= 120),
+            "{learned:?}"
+        );
+    }
+
+    /// What one folder teaches is used by the next in the same window: the times the window
+    /// counts with have the drive's time as soon as it is read.
+    #[test]
+    fn folders_in_one_window_share_what_they_learn() {
+        let (fs, journal) = setup();
+        let times = parking_lot::Mutex::new(BTreeMap::new());
+        let (_, learned) = count_with(&fs, &*journal, &times, ssd, r"C:\");
+        assert!(matches!(learned[..], [TableTime { done: true, .. }]));
+        assert!(
+            times.lock().get(r"C:\").is_some_and(|t| t.done),
+            "the next folder starts with it"
+        );
+    }
+
+    /// On a spinning disk the table goes first and hasn't the folder: it is walked, each folder
+    /// listed once, and the read still tells how long the table takes.
+    #[test]
+    fn a_walk_handed_over_for_nothing_goes_on() {
+        let (fs, journal) = setup();
+        let (bytes, learned) = count(&fs, &*journal, &known(0, true), hdd, r"C:\x");
+        assert_eq!(bytes, 7, "walked");
+        assert_eq!(fs.read_dir_calls(), 2, "C:\\x and its folder, once each");
+        assert_eq!(journal.list_calls(), 1);
+        assert!(
+            matches!(learned[..], [TableTime { done: true, .. }]),
+            "{learned:?}"
+        );
+    }
+
+    /// A folder the table can't count (inside a hidden system folder, through a junction) is
+    /// only walked: the table is never read for it.
+    #[test]
+    fn folders_the_table_cannot_count_are_only_walked() {
+        let (fs, journal) = setup();
+        fs.insert_dir(
+            r"C:\",
+            vec![
+                Entry::new("sys", EntryKind::Dir, 0, None, 0x10 | 0x2 | 0x4),
+                Entry::new(
+                    "jl",
+                    EntryKind::Link { is_dir: true },
+                    0,
+                    None,
+                    0x10 | 0x400,
+                ),
+            ],
+        );
+        fs.insert_dir(
+            r"C:\sys",
+            vec![Entry::new("i.msi", EntryKind::File, 30, None, 0x20)],
+        );
+        fs.insert_dir(
+            r"C:\jl",
+            vec![Entry::new("j.txt", EntryKind::File, 40, None, 0x20)],
+        );
+        for (dir, want) in [(r"C:\sys", 30), (r"C:\jl", 40)] {
+            for seeks in [ssd, hdd] {
+                let (bytes, learned) = count(&fs, &*journal, &known(0, true), seeks, dir);
+                assert_eq!(bytes, want, "{dir}");
+                assert!(learned.is_empty());
+            }
+        }
+        assert_eq!(journal.list_calls(), 0);
+    }
+
+    /// A panic in the table's read doesn't stop the count: a walk handed over to it goes on.
+    #[test]
+    fn a_failing_table_read_leaves_the_walk() {
+        let (fs, _) = setup();
+        let (bytes, learned) = count(&fs, &Crashing, &known(0, true), hdd, r"C:\w");
+        assert_eq!(bytes, 100);
+        assert!(learned.is_empty());
+    }
+
+    /// On a spinning disk the table counts alone from the start, whatever is known about its
+    /// time: nothing is walked (a walk there seeks for every folder).
+    #[test]
+    fn a_spinning_disk_counts_from_the_table() {
+        for times in [known(0, true), known(60_000, false), BTreeMap::new()] {
+            let (fs, journal) = setup();
+            let (bytes, _) = count(&fs, &*journal, &times, hdd, r"C:\w");
+            assert_eq!(bytes, 1_000_000 + 100, "from the table");
+            assert_eq!(fs.read_dir_calls(), 0, "nothing walked");
+        }
+    }
+
+    /// A read to the end replaces what was known; a stopped one only raises a lower bound.
+    #[test]
+    fn table_times_keep_what_is_known_best() {
+        let mut times = BTreeMap::new();
+        let c = || r"C:\".to_owned();
+        let at_least = |ms| TableTime { ms, done: false };
+        let took = |ms| TableTime { ms, done: true };
+        TableTime::learn(&mut times, c(), at_least(30));
+        TableTime::learn(&mut times, c(), at_least(10));
+        assert_eq!(times[r"C:\"], at_least(30));
+        TableTime::learn(&mut times, c(), took(7000));
+        TableTime::learn(&mut times, c(), at_least(9000));
+        assert_eq!(times[r"C:\"], took(7000));
+        TableTime::learn(&mut times, c(), took(5000));
+        assert_eq!(times[r"C:\"], took(5000));
     }
 }

@@ -254,13 +254,38 @@ pub(crate) fn start(
         cache_dir: std::env::temp_dir().join("Arke").join("remote"),
         secrets: Arc::new(arke_remote::creds::CredentialManager),
         transport,
+        portable: Arc::new(arke_remote::wpd::Wpd::new()),
     });
     for place in &store.read(cx).settings.remote_places {
         if let Some(url) = remote(&place.url) {
             remotes.set_key_file(&url, place.key_file.clone());
         }
     }
+    for origin in &store.read(cx).settings.insecure_http {
+        if let Some(url) = remote(Path::new(origin)) {
+            remotes.set_insecure_allowed(&url, true);
+        }
+    }
     remotes
+}
+
+/// Whether the user allowed sending the password over plain http to the server of `path`.
+/// Menus use this to offer [`revoke_insecure_http`] only where it applies.
+pub(crate) fn insecure_http_allowed(remotes: &Remotes, path: &Path) -> bool {
+    remote(path).is_some_and(|url| remotes.insecure_allowed(&url))
+}
+
+/// Takes back the plain-http allowance for the server of `path` (a saved location's menu
+/// entry "Require a secure connection"). The next sign-in over http asks again.
+pub(crate) fn revoke_insecure_http(remotes: &Remotes, path: &Path, cx: &mut gpui::App) {
+    let Some(url) = remote(path) else {
+        return;
+    };
+    remotes.set_insecure_allowed(&url, false);
+    let origin = url.origin();
+    crate::settings::SettingsStore::global(cx).update(cx, |s, cx| {
+        s.update(|st| st.set_insecure_http(&origin, false), cx);
+    });
 }
 
 /// A hub for tests: keys in memory, nothing remembered, no HTTP.
@@ -271,6 +296,7 @@ pub(crate) fn test_remotes() -> Arc<Remotes> {
         cache_dir: std::env::temp_dir().join(format!("arke-test-remote-{}", std::process::id())),
         secrets: Arc::new(arke_remote::creds::NoSecrets),
         transport: Arc::new(NoHttp),
+        portable: Arc::new(arke_remote::mtp::NoDevices),
     })
 }
 
@@ -503,7 +529,18 @@ fn outcome(result: Result<(), ShellError>) -> Result<OpOutcome, ShellError> {
 
 impl Shell for RemoteShell {
     fn load_places(&self) -> Vec<Place> {
-        self.inner.load_places()
+        let mut places = self.inner.load_places();
+        places.extend(phone_places());
+        places
+    }
+    fn quick_access_pinned(&self) -> Option<Vec<PathBuf>> {
+        self.inner.quick_access_pinned()
+    }
+    fn recent_files_enabled(&self) -> bool {
+        self.inner.recent_files_enabled()
+    }
+    fn window_at_cursor(&self) -> Option<(isize, (i32, i32))> {
+        self.inner.window_at_cursor()
     }
     fn disk_spaces(&self, roots: &[PathBuf]) -> Vec<(PathBuf, (u64, u64))> {
         self.inner.disk_spaces(roots)
@@ -560,12 +597,13 @@ impl Shell for RemoteShell {
         &self,
         paths: &[PathBuf],
         image: Option<&DragImage>,
+        after_lost_press: bool,
     ) -> Result<DragOutEnd, ShellError> {
         // Remote drags hand over staged local copies (see explorer_dnd), never URLs.
         if paths.iter().any(|p| remote(p).is_some()) {
             return Ok(DragOutEnd::Finished);
         }
-        self.inner.drag_out(paths, image)
+        self.inner.drag_out(paths, image, after_lost_press)
     }
     fn covered_at_cursor(&self, owner: Option<isize>) -> bool {
         self.inner.covered_at_cursor(owner)
@@ -675,11 +713,16 @@ impl Shell for RemoteShell {
         }
         self.inner.video_thumbnail(path, max_side)
     }
-    fn shell_menu(&self, paths: &[PathBuf], background: bool) -> Result<ShellMenu, ShellError> {
+    fn shell_menu(
+        &self,
+        paths: &[PathBuf],
+        background: bool,
+        extended: bool,
+    ) -> Result<ShellMenu, ShellError> {
         if paths.iter().any(|p| remote(p).is_some()) {
             return Err(ShellError::NotOnRemote);
         }
-        self.inner.shell_menu(paths, background)
+        self.inner.shell_menu(paths, background, extended)
     }
     fn shell_menu_prefetch(&self) -> bool {
         self.inner.shell_menu_prefetch()
@@ -704,6 +747,18 @@ impl Shell for RemoteShell {
     ) -> Result<Vec<crate::shell::ShellMenuEntry>, ShellError> {
         self.inner.fill_shell_submenu(session, index)
     }
+    fn shell_menu_kind(&self, paths: &[PathBuf], background: bool) -> Option<String> {
+        if paths.iter().any(|p| remote(p).is_some()) {
+            return None;
+        }
+        self.inner.shell_menu_kind(paths, background)
+    }
+    fn packaged_item_types(&self, clsid: &str) -> Vec<String> {
+        self.inner.packaged_item_types(clsid)
+    }
+    fn packaged_commands(&self, kind: &str) -> Vec<String> {
+        self.inner.packaged_commands(kind)
+    }
     fn shell_menu_handlers(
         &self,
         paths: &[PathBuf],
@@ -718,6 +773,7 @@ impl Shell for RemoteShell {
         &self,
         paths: &[PathBuf],
         background: bool,
+        extended: bool,
         handler: &crate::win_menu_parts::MenuHandler,
         group: u64,
     ) -> Result<(ShellMenu, std::time::Duration), ShellError> {
@@ -725,7 +781,7 @@ impl Shell for RemoteShell {
             return Err(ShellError::NotOnRemote);
         }
         self.inner
-            .shell_menu_handler(paths, background, handler, group)
+            .shell_menu_handler(paths, background, extended, handler, group)
     }
     fn set_clipboard_text(&self, text: &str) -> Result<(), ShellError> {
         self.inner.set_clipboard_text(text)
@@ -806,6 +862,18 @@ impl Shell for RemoteShell {
     fn eject_drive(&self, root: &Path) -> Result<(), ShellError> {
         self.inner.eject_drive(root)
     }
+    fn format_drive(&self, root: &Path, owner: Option<isize>) -> Result<(), ShellError> {
+        if remote(root).is_some() {
+            return Err(ShellError::NotOnRemote);
+        }
+        self.inner.format_drive(root, owner)
+    }
+    fn disk_cleanup(&self, root: &Path) -> Result<(), ShellError> {
+        if remote(root).is_some() {
+            return Err(ShellError::NotOnRemote);
+        }
+        self.inner.disk_cleanup(root)
+    }
     fn choose_app(&self, path: &Path, owner: Option<isize>) -> Result<(), ShellError> {
         if remote(path).is_some() {
             return Err(ShellError::NotOnRemote);
@@ -885,9 +953,76 @@ impl Shell for RemoteShell {
     }
 }
 
+/// The phones connected now, as last read ([`refresh_phones`]). Reading them takes WPD a moment
+/// (the first time, while it starts), so the sidebar never waits for it: it takes this list and
+/// is reloaded once a new one is in.
+static PHONES: parking_lot::Mutex<Vec<arke_remote::mtp::Device>> =
+    parking_lot::Mutex::new(Vec::new());
+
+/// The phones in [`PHONES`] as places under This PC (#292).
+fn phone_places() -> Vec<Place> {
+    PHONES
+        .lock()
+        .iter()
+        .map(|device| Place {
+            label: device.name.clone(),
+            path: PathBuf::from(format!("mtp://{}", device.key)),
+            kind: crate::shell::PlaceKind::Phone,
+        })
+        .collect()
+}
+
+/// Reads which phones are connected (in the background) and, when that changed, has every
+/// sidebar list its places again. At startup and whenever Windows says a portable device came
+/// or went.
+pub(crate) fn refresh_phones(remotes: Arc<Remotes>, cx: &mut gpui::App) {
+    let read = cx
+        .background_executor()
+        .spawn(async move { remotes.portable_devices() });
+    cx.spawn(async move |cx| {
+        let devices = match read.await {
+            Ok(devices) => devices,
+            Err(err) => {
+                log::info!("portable devices not listed: {err}");
+                return;
+            }
+        };
+        let changed = {
+            let mut phones = PHONES.lock();
+            let changed = *phones != devices;
+            if changed {
+                log::info!("portable devices: {}", devices.len());
+                *phones = devices;
+            }
+            changed
+        };
+        if changed {
+            cx.update(crate::workspace::reload_places_everywhere);
+        }
+    })
+    .detach();
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A connected phone shows under This PC, opening its `mtp://` location (#292).
+    #[test]
+    fn phones_are_places_under_this_pc() {
+        *PHONES.lock() = vec![arke_remote::mtp::Device {
+            key: "pixel-7-3fa2c1".into(),
+            name: "Pixel 7".into(),
+        }];
+        let places = phone_places();
+        assert_eq!(places.len(), 1);
+        assert_eq!(places[0].label, "Pixel 7");
+        assert_eq!(places[0].path, PathBuf::from("mtp://pixel-7-3fa2c1"));
+        assert_eq!(places[0].kind, crate::shell::PlaceKind::Phone);
+        assert!(arke_core::remote::is_remote(&places[0].path));
+        PHONES.lock().clear();
+        assert!(phone_places().is_empty());
+    }
 
     #[test]
     fn free_names_never_overwrite() {

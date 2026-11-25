@@ -22,16 +22,144 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
-/// A context menu extension that applies to an item.
+/// One source of Windows menu commands that applies to an item, read on its own (#129, #278).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct MenuHandler {
-    /// Key under `HKEY_CLASSES_ROOT` it is registered under; handed to the extension, which
-    /// may read its settings there.
+    /// Key under `HKEY_CLASSES_ROOT` it is registered under; handed to an extension, which
+    /// may read its settings there. For a registry command, the class key holding its `shell`.
     pub(crate) key: String,
-    /// Its COM class, `{...}`.
+    /// Its COM class, `{...}` (an extension, or the object that runs a command); empty for a
+    /// registry command run by its command line.
     pub(crate) clsid: String,
-    /// Registered name, for logs.
+    /// Registered name, for logs (a registry command's verb).
     pub(crate) name: String,
+    #[serde(default)]
+    pub(crate) kind: HandlerKind,
+    /// A registry command in a cascading menu (`ExtendedSubCommandsKey`, as context menu
+    /// managers make them): the registry path of the verb that opens that menu
+    /// (`*\shell\Tools`), under whose label it is shown, so its pinned key matches (#278).
+    #[serde(default)]
+    pub(crate) parent: Option<String>,
+}
+
+/// Where a menu command comes from. Each item of the whole Windows menu says which with its
+/// canonical verb (`GCS_VERBW`): a registry command's verb, a packaged app's command's `{CLSID}`.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) enum HandlerKind {
+    /// A `shellex\ContextMenuHandlers` extension (a DLL that adds any number of items).
+    #[default]
+    Extension,
+    /// A command in the registry, `<class>\shell\<verb>`: run by Windows on its own
+    /// (`ShellExecuteEx` with the class key), or by its `ExplorerCommandHandler` (`clsid`).
+    Verb {
+        /// Shown only with Shift held (`Extended`).
+        extended: bool,
+    },
+    /// A packaged app's command (`desktop5:ItemType` in its manifest): an `IExplorerCommand`.
+    Command,
+}
+
+impl MenuHandler {
+    /// How a pinned command remembers its source (`Settings::menu_pin_owners`): the extension's
+    /// class id, `verb:<verb>` or `command:{CLSID}`.
+    pub(crate) fn owner(&self) -> String {
+        match self.kind {
+            HandlerKind::Extension => self.clsid.clone(),
+            HandlerKind::Verb { .. } => format!("{VERB_OWNER}{}", self.name),
+            HandlerKind::Command => format!("{COMMAND_OWNER}{}", self.clsid),
+        }
+    }
+
+    /// Windows' Send To extension, which the menu host lists from its folder itself (#278).
+    pub(crate) fn send_to() -> Self {
+        Self {
+            key: "AllFilesystemObjects".into(),
+            clsid: SEND_TO.into(),
+            name: "SendTo".into(),
+            kind: HandlerKind::Extension,
+            parent: None,
+        }
+    }
+
+    /// Whether this is Windows' Send To extension.
+    pub(crate) fn is_send_to(&self) -> bool {
+        self.kind == HandlerKind::Extension && self.clsid.eq_ignore_ascii_case(SEND_TO)
+    }
+
+    /// A packaged app's command, `clsid` `{...}`.
+    pub(crate) fn command(clsid: &str) -> Self {
+        Self {
+            key: String::new(),
+            clsid: clsid.to_string(),
+            name: clsid.to_string(),
+            kind: HandlerKind::Command,
+            parent: None,
+        }
+    }
+}
+
+/// Windows' Send To extension's class.
+pub(crate) const SEND_TO: &str = "{7BA4C740-9E81-11CF-99D3-00AA004AE837}";
+
+/// Owner prefixes (see [`MenuHandler::owner`]).
+pub(crate) const VERB_OWNER: &str = "verb:";
+pub(crate) const COMMAND_OWNER: &str = "command:";
+
+/// The item kind a menu is for, as packaged apps register commands for it
+/// (`desktop5:ItemType Type`): `Directory\Background`, `Drive`, `Directory`, or a file's
+/// extension (`.txt`, lowercased; `*` without one). The first item decides.
+pub(crate) fn item_kind(paths: &[PathBuf], background: bool) -> Option<String> {
+    let first = paths.first()?;
+    Some(if background {
+        r"Directory\Background".to_string()
+    } else {
+        kind_of(&target_of(first))
+    })
+}
+
+/// [`item_kind`] from what the list already knows of the first item (its path, whether it is a
+/// folder), reading nothing: for drawing pinned rows the moment the menu opens. `None` on a
+/// server, where the Windows menu isn't read.
+pub(crate) fn item_kind_known(first: Option<&(PathBuf, bool)>, background: bool) -> Option<String> {
+    if background {
+        return Some(r"Directory\Background".to_string());
+    }
+    let (path, folder) = first?;
+    if arke_core::remote::is_remote(path) {
+        return None;
+    }
+    Some(if path.parent().is_none() {
+        "Drive".into()
+    } else if *folder {
+        "Directory".into()
+    } else {
+        file_ext(path).unwrap_or_else(|| "*".into())
+    })
+}
+
+/// `.txt`, lowercased.
+fn file_ext(path: &Path) -> Option<String> {
+    path.extension()
+        .and_then(|e| e.to_str())
+        .map(|e| format!(".{}", e.to_lowercase()))
+}
+
+fn kind_of(target: &Target) -> String {
+    match target {
+        Target::Background => r"Directory\Background".into(),
+        Target::Drive => "Drive".into(),
+        Target::Folder => "Directory".into(),
+        Target::File { ext, .. } => ext.clone().unwrap_or_else(|| "*".into()),
+    }
+}
+
+/// Whether a command registered for `types` (item types from a manifest, or the kinds it was
+/// seen on) applies to an item of `kind`: `*` covers every file.
+pub(crate) fn kind_matches(types: &[String], kind: &str) -> bool {
+    let file = kind.starts_with('.') || kind == "*";
+    types
+        .iter()
+        .any(|t| t.eq_ignore_ascii_case(kind) || (file && t == "*"))
 }
 
 /// What an item is, as far as choosing extensions goes.
@@ -127,10 +255,110 @@ pub(crate) fn handlers(paths: &[PathBuf], background: bool) -> Vec<MenuHandler> 
                 key: key.clone(),
                 clsid,
                 name,
+                kind: HandlerKind::Extension,
+                parent: None,
             });
         }
     }
+    out.extend(verbs(&target, paths.len()));
     out
+}
+
+/// Registry commands (`<class>\shell\<verb>`) for `target`, each verb once, the first class
+/// that has it winning, as File Explorer does, and the commands of a cascading menu one level
+/// down (`ExtendedSubCommandsKey`: the key whose `shell` holds them, run with that key as their
+/// class). Left out: ones Windows decides on by itself (`AppliesTo`, `CommandStateHandler`),
+/// Windows' own cascades (`SubCommands`), hidden ones (`LegacyDisable`,
+/// `ProgrammaticAccessOnly`), and, for several items, ones run by command line (Windows runs
+/// those once per item, by rules of their own).
+fn verbs(target: &Target, items: usize) -> Vec<MenuHandler> {
+    let mut out: Vec<MenuHandler> = Vec::new();
+    for key in class_keys(target) {
+        let shell = format!(r"{key}\shell");
+        for verb in reg::subkeys(&shell) {
+            if out
+                .iter()
+                .any(|h| h.parent.is_none() && h.name.eq_ignore_ascii_case(&verb))
+            {
+                continue;
+            }
+            let at = format!(r"{shell}\{verb}");
+            if !shown_alone(&at) {
+                continue;
+            }
+            let extended = reg::value_exists(&at, "Extended");
+            if let Some(sub) = reg::value(&at, "ExtendedSubCommandsKey")
+                .map(|k| k.trim().trim_matches('\\').to_string())
+                .filter(|k| !k.is_empty())
+            {
+                let sub_shell = format!(r"{sub}\shell");
+                for child in reg::subkeys(&sub_shell) {
+                    let child_at = format!(r"{sub_shell}\{child}");
+                    // Each child once; a top-level verb of the same name is still its own.
+                    if out
+                        .iter()
+                        .any(|h| h.parent.is_some() && h.name.eq_ignore_ascii_case(&child))
+                        || !shown_alone(&child_at)
+                        || reg::value_exists(&child_at, "ExtendedSubCommandsKey")
+                    {
+                        continue;
+                    }
+                    if let Some(handler) = verb_handler(&sub, &child, &child_at, items) {
+                        out.push(MenuHandler {
+                            kind: HandlerKind::Verb {
+                                extended: extended || reg::value_exists(&child_at, "Extended"),
+                            },
+                            parent: Some(at.clone()),
+                            ..handler
+                        });
+                    }
+                }
+                continue;
+            }
+            if let Some(handler) = verb_handler(&key, &verb, &at, items) {
+                out.push(MenuHandler {
+                    kind: HandlerKind::Verb { extended },
+                    ..handler
+                });
+            }
+        }
+    }
+    out
+}
+
+/// Whether the verb at registry path `at` can be read on its own: not one Windows decides on by
+/// itself, not Windows' own cascade, not hidden.
+fn shown_alone(at: &str) -> bool {
+    ![
+        "AppliesTo",
+        "CommandStateHandler",
+        "SubCommands",
+        "LegacyDisable",
+        "ProgrammaticAccessOnly",
+    ]
+    .into_iter()
+    .any(|name| reg::value_exists(at, name))
+}
+
+/// The verb `verb` of class `key` (at registry path `at`) as a command run on its own: by its
+/// `ExplorerCommandHandler`, or its command line for one item. `None` when neither applies.
+fn verb_handler(key: &str, verb: &str, at: &str, items: usize) -> Option<MenuHandler> {
+    let handler = reg::value(at, "ExplorerCommandHandler")
+        .map(|c| c.trim().to_string())
+        .filter(|c| is_clsid(c));
+    let by_line = reg::subkeys(at)
+        .iter()
+        .any(|k| k.eq_ignore_ascii_case("command"));
+    if handler.is_none() && (!by_line || items > 1) {
+        return None;
+    }
+    Some(MenuHandler {
+        key: key.to_string(),
+        clsid: handler.unwrap_or_default(),
+        name: verb.to_string(),
+        kind: HandlerKind::Verb { extended: false },
+        parent: None,
+    })
 }
 
 fn target_of(path: &Path) -> Target {
@@ -140,10 +368,7 @@ fn target_of(path: &Path) -> Target {
     if path.is_dir() {
         return Target::Folder;
     }
-    let ext = path
-        .extension()
-        .and_then(|e| e.to_str())
-        .map(|e| format!(".{}", e.to_lowercase()));
+    let ext = file_ext(path);
     let mut classes = Vec::new();
     let mut perceived = None;
     if let Some(ext) = &ext {
@@ -176,6 +401,11 @@ mod reg {
 
     pub(super) fn value(key: &str, name: &str) -> Option<String> {
         crate::win::read_reg_string(HKEY_CLASSES_ROOT, key, name)
+    }
+
+    /// Whether `key` has a value `name`, of any type (flags like `Extended` are often empty).
+    pub(super) fn value_exists(key: &str, name: &str) -> bool {
+        exists(HKEY_CLASSES_ROOT, key, name)
     }
 
     /// The app the user chose for `ext` ("Open with" › "Always").
@@ -268,7 +498,11 @@ mod tests {
         if !star.is_empty() {
             assert!(!found.is_empty(), "{star:?}");
         }
-        for (i, h) in found.iter().enumerate() {
+        for (i, h) in found
+            .iter()
+            .filter(|h| h.kind == HandlerKind::Extension)
+            .enumerate()
+        {
             assert!(is_clsid(&h.clsid), "{h:?}");
             assert!(
                 !found[..i]
@@ -295,7 +529,7 @@ mod timing {
         // group per extension would expire all but the last.
         static GROUP: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1_000);
         let started = Instant::now();
-        let whole = crate::win_menu::query(paths, background);
+        let whole = crate::win_menu::query(paths, background, false);
         let whole_ms = started.elapsed().as_millis();
         if let Ok(menu) = &whole {
             crate::win_menu::release(menu.session);
@@ -318,7 +552,7 @@ mod timing {
                 let paths = paths.to_vec();
                 std::thread::spawn(move || {
                     let started = Instant::now();
-                    let menu = crate::win_menu::query_handler(&paths, background, &h, group);
+                    let menu = crate::win_menu::query_handler(&paths, background, false, &h, group);
                     let ms = started.elapsed().as_millis();
                     let items = menu.as_ref().map_or(0, |m| m.entries.len());
                     if let Ok(m) = &menu
@@ -533,7 +767,7 @@ mod leftovers {
         std::fs::write(&file, b"x").unwrap();
         // Warm up once so one-time threads don't count.
         for (paths, background) in [(vec![file.clone()], false), (vec![dir.clone()], true)] {
-            if let Ok(m) = crate::win_menu::query(&paths, background) {
+            if let Ok(m) = crate::win_menu::query(&paths, background, false) {
                 crate::win_menu::release(m.session);
             }
         }
@@ -543,7 +777,7 @@ mod leftovers {
             ("background menu", vec![dir], true),
         ] {
             for _ in 0..ROUNDS {
-                if let Ok(m) = crate::win_menu::query(&paths, background) {
+                if let Ok(m) = crate::win_menu::query(&paths, background, false) {
                     crate::win_menu::release(m.session);
                 }
             }
@@ -553,6 +787,7 @@ mod leftovers {
                     if let Ok(m) = crate::win_menu::query_handler(
                         &paths,
                         background,
+                        false,
                         &handler,
                         10_000 + round as u64,
                     ) {

@@ -2,7 +2,8 @@
 //!
 //! The first Arke creates a named pipe and stays resident after its last window closes. Later
 //! launches of `arke.exe` just pass the path to open to the resident process and exit, skipping GPU
-//! init (about 260 ms).
+//! init (about 260 ms). `arke.exe --api <json>` asks it integration API requests the same way
+//! (`api.rs`); their reply is the JSON reply instead of a status byte.
 //!
 //! Guards against hangs:
 //! - The sender's whole exchange has a timeout; if the resident process doesn't confirm a window in
@@ -87,6 +88,26 @@ pub(crate) enum Request {
         items: Vec<PathBuf>,
     },
     Quit,
+    /// `arke.exe --search <text>`: a window searching the whole computer for the text.
+    Search(String),
+    /// An integration API request (`api.rs`, `arke.exe --api <json>`): the JSON text. Its reply
+    /// is the JSON reply, not a status byte.
+    Api(String),
+}
+
+/// What the resident process answers a request with.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum Reply {
+    /// Handled or not (every request but [`Request::Api`])
+    Status(bool),
+    /// The reply to [`Request::Api`]
+    Data(Vec<u8>),
+}
+
+impl From<bool> for Reply {
+    fn from(handled: bool) -> Self {
+        Self::Status(handled)
+    }
 }
 
 // ─── Protocol: NUL-separated UTF-16 fields (Windows paths may not be valid UTF-8, so no string
@@ -105,6 +126,14 @@ pub(crate) fn encode(req: &Request) -> Vec<u8> {
     let mut w = Vec::new();
     match req {
         Request::Quit => push_field(&mut w, &wide("quit")),
+        Request::Search(text) => {
+            push_field(&mut w, &wide("search"));
+            push_field(&mut w, &wide(text));
+        }
+        Request::Api(json) => {
+            push_field(&mut w, &wide("api"));
+            push_field(&mut w, &wide(json));
+        }
         Request::Select { folder, items } => {
             push_field(&mut w, &wide("select"));
             push_field(
@@ -161,6 +190,8 @@ pub(crate) fn decode(bytes: &[u8]) -> Option<Request> {
     let as_path = |f: &[u16]| (!f.is_empty()).then(|| PathBuf::from(OsString::from_wide(f)));
     match as_string(fields.next()?)?.as_str() {
         "quit" => Some(Request::Quit),
+        "api" => Some(Request::Api(as_string(fields.next()?)?)),
+        "search" => Some(Request::Search(as_string(fields.next()?)?)),
         "open" => {
             let path = as_path(fields.next()?);
             let bench = match as_string(fields.next()?)?.as_str() {
@@ -262,8 +293,11 @@ fn listen_at(name: Vec<u16>) -> Option<Listener> {
 }
 
 /// Handle requests on a background thread. `handler` returns `true` when handled (e.g. the window
-/// opened).
-pub(crate) fn serve(listener: Listener, handler: impl Fn(Request) -> bool + Send + 'static) {
+/// opened), or the reply to an API request.
+pub(crate) fn serve<R: Into<Reply>>(
+    listener: Listener,
+    handler: impl Fn(Request) -> R + Send + 'static,
+) {
     let spawned = std::thread::Builder::new()
         .name("arke-instance".into())
         .spawn(move || {
@@ -300,24 +334,27 @@ pub(crate) fn serve(listener: Listener, handler: impl Fn(Request) -> bool + Send
     }
 }
 
-fn handle_connection(pipe: &Pipe, handler: &impl Fn(Request) -> bool) {
+fn handle_connection<R: Into<Reply>>(pipe: &Pipe, handler: &impl Fn(Request) -> R) {
     let mut buf = vec![0u8; MAX_MESSAGE_BYTES];
     let mut read = 0u32;
     // SAFETY: buf is valid and writable for the call; read is a valid out pointer.
     let ok = unsafe { ReadFile(pipe.0, Some(&mut buf), Some(&raw mut read), None) };
-    let status = if let Err(err) = ok {
+    let reply = if let Err(err) = ok {
         log::warn!("resident pipe read failed: {err}");
-        false
+        Reply::Status(false)
     } else if let Some(req) = decode(&buf[..read as usize]) {
-        handler(req)
+        handler(req).into()
     } else {
         log::warn!("resident pipe got an unparsable message ({read} bytes)");
-        false
+        Reply::Status(false)
     };
-    let reply = [u8::from(status)];
+    let bytes = match reply {
+        Reply::Status(status) => vec![u8::from(status)],
+        Reply::Data(data) => data,
+    };
     let mut written = 0u32;
-    // SAFETY: reply is valid for the call; written is a valid out pointer.
-    let _ = unsafe { WriteFile(pipe.0, Some(&reply), Some(&raw mut written), None) };
+    // SAFETY: bytes is valid for the call; written is a valid out pointer.
+    let _ = unsafe { WriteFile(pipe.0, Some(&bytes), Some(&raw mut written), None) };
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -430,6 +467,79 @@ fn talk(pipe: &Pipe, message: &[u8]) -> SendOutcome {
     }
 }
 
+/// What [`ask`] got.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum Asked {
+    /// The resident process's reply
+    Replied(Vec<u8>),
+    /// No resident process
+    NoServer,
+    /// Resident process exists but didn't answer in time, or is an Arke that doesn't know the API
+    Failed,
+}
+
+/// Sends an integration API request (`arke.exe --api <json>`) to the resident process and waits
+/// at most `timeout` for its reply, on a helper thread like [`send`].
+pub(crate) fn ask(json: &str, timeout: Duration) -> Asked {
+    ask_at(pipe_name(), json, timeout)
+}
+
+fn ask_at(name: Vec<u16>, json: &str, timeout: Duration) -> Asked {
+    let message = encode(&Request::Api(json.to_owned()));
+    let (tx, rx) = flume::bounded(1);
+    let spawned = std::thread::Builder::new()
+        .name("arke-instance-api".into())
+        .spawn(move || {
+            let asked = match connect(&name) {
+                Ok(pipe) => talk_for_reply(&pipe, &message),
+                Err(SendOutcome::NoServer) => Asked::NoServer,
+                Err(_) => Asked::Failed,
+            };
+            let _ = tx.send(asked);
+        });
+    if spawned.is_err() {
+        return Asked::Failed;
+    }
+    rx.recv_timeout(timeout).unwrap_or(Asked::Failed)
+}
+
+/// Sends one message on a connected pipe and reads a reply of any length.
+fn talk_for_reply(pipe: &Pipe, message: &[u8]) -> Asked {
+    // As in `talk`: an `open` may bring a window to the front.
+    if let Some(pid) = server_pid(pipe) {
+        // SAFETY: plain Win32 call with no pointer arguments.
+        let _ = unsafe { AllowSetForegroundWindow(pid) };
+    }
+    let mut written = 0u32;
+    // SAFETY: message is valid for the call; written is a valid out pointer.
+    if unsafe { WriteFile(pipe.0, Some(message), Some(&raw mut written), None) }.is_err() {
+        return Asked::Failed;
+    }
+    match read_message(pipe) {
+        // A single status byte: an older Arke, which can't read API requests.
+        Some(reply) if reply.len() > 1 => Asked::Replied(reply),
+        _ => Asked::Failed,
+    }
+}
+
+/// Reads one whole message, however long (a `state` reply can list many selected paths).
+fn read_message(pipe: &Pipe) -> Option<Vec<u8>> {
+    use windows::Win32::Foundation::ERROR_MORE_DATA;
+    let mut out = Vec::new();
+    let mut chunk = vec![0u8; 64 * 1024];
+    loop {
+        let mut read = 0u32;
+        // SAFETY: chunk is valid and writable for the call; read is a valid out pointer.
+        let ok = unsafe { ReadFile(pipe.0, Some(&mut chunk), Some(&raw mut read), None) };
+        out.extend_from_slice(&chunk[..read as usize]);
+        match ok {
+            Ok(()) => return Some(out),
+            Err(err) if err.code() == ERROR_MORE_DATA.to_hresult() => {}
+            Err(_) => return None,
+        }
+    }
+}
+
 /// Whether a resident process's pipe exists. Only waits on the name, never connects, so the
 /// resident process sees nothing.
 fn pipe_exists(name: &[u16]) -> bool {
@@ -531,6 +641,42 @@ pub(crate) fn same_file(a: &Path, b: &Path) -> bool {
         (Ok(a), Ok(b)) => text(&a) == text(&b),
         _ => text(a) == text(b),
     }
+}
+
+/// Opens a new window by launching Arke again, on a background thread: at `path`, or where a new
+/// window starts without one. In background mode the running process takes it over, so it's fast.
+/// Marked as a new window, so single window mode doesn't turn it into a tab.
+pub(crate) fn open_new_window(path: Option<PathBuf>) {
+    // Tests run inside the test binary, which must not launch itself: they read what was asked.
+    #[cfg(test)]
+    NEW_WINDOWS.with(|asked| asked.borrow_mut().push(path));
+    #[cfg(not(test))]
+    crate::explorer::spawn_thread("new-window", move || {
+        let spawned = std::env::current_exe().and_then(|exe| {
+            let mut command = std::process::Command::new(exe);
+            command.arg(NEW_WINDOW_ARG);
+            if let Some(path) = &path {
+                command.arg(path);
+            }
+            command.spawn()
+        });
+        if let Err(err) = spawned {
+            log::warn!("failed to open a new window: {err}");
+        }
+    });
+}
+
+#[cfg(test)]
+thread_local! {
+    /// What `open_new_window` was asked for, in order.
+    static NEW_WINDOWS: std::cell::RefCell<Vec<Option<PathBuf>>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Takes the new windows asked for since the last call.
+#[cfg(test)]
+pub(crate) fn take_new_windows() -> Vec<Option<PathBuf>> {
+    NEW_WINDOWS.with(|asked| std::mem::take(&mut *asked.borrow_mut()))
 }
 
 #[cfg(test)]
@@ -715,6 +861,57 @@ mod tests {
     }
 
     #[test]
+    fn api_requests_round_trip() {
+        for json in [
+            r#"{"v":1,"cmd":"state"}"#,
+            // Non-ASCII, quotes and backslashes, as a path in a request has them.
+            r#"{"v":1,"cmd":"open","path":"C:\\測試 \"x\"","select":["a b.txt"]}"#,
+            "",
+        ] {
+            let req = Request::Api(json.to_owned());
+            assert_eq!(decode(&encode(&req)), Some(req));
+        }
+    }
+
+    /// The resident process's reply to an API request comes back whole, also when it is longer
+    /// than one read.
+    #[test]
+    fn api_replies_come_back_whole() {
+        let name = test_pipe("api");
+        assert_eq!(
+            ask_at(name.clone(), "{}", Duration::from_secs(2)),
+            Asked::NoServer
+        );
+        let long = "x".repeat(300 * 1024);
+        let reply = format!(r#"{{"v":1,"long":"{long}"}}"#);
+        let expected = reply.clone().into_bytes();
+        serve(listen_at(name.clone()).unwrap(), move |req| match req {
+            Request::Api(json) if json == "{}" => Reply::Data(reply.clone().into_bytes()),
+            _ => Reply::Status(false),
+        });
+        assert_eq!(
+            ask_at(name.clone(), "{}", Duration::from_secs(5)),
+            Asked::Replied(expected)
+        );
+        // Old kinds still get their status byte.
+        assert_eq!(
+            send_to(name, &Request::Quit, Duration::from_secs(2)),
+            SendOutcome::Failed
+        );
+    }
+
+    /// An Arke from before the API answers with one status byte, which is no reply.
+    #[test]
+    fn an_older_resident_is_no_reply() {
+        let name = test_pipe("api-old");
+        serve(listen_at(name.clone()).unwrap(), |_| false);
+        assert_eq!(
+            ask_at(name, r#"{"v":1,"cmd":"state"}"#, Duration::from_secs(2)),
+            Asked::Failed
+        );
+    }
+
+    #[test]
     fn protocol_keeps_non_utf8_paths() {
         // A lone surrogate is a valid Windows file name but not valid UTF-8.
         let raw = OsString::from_wide(&[0x0041, 0xD800, 0x0042]);
@@ -726,6 +923,12 @@ mod tests {
             page: None,
             new_window: false,
         });
+        assert_eq!(decode(&encode(&req)), Some(req));
+    }
+
+    #[test]
+    fn search_requests_keep_their_text() {
+        let req = Request::Search("annual report 日本語".to_owned());
         assert_eq!(decode(&encode(&req)), Some(req));
     }
 

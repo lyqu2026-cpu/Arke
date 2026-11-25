@@ -69,6 +69,15 @@ pub enum RemoteError {
     /// The user cancelled.
     #[error("{}", t!("remote.cancelled"))]
     Cancelled,
+    /// Phones are read-only in this version (`mtp.rs`).
+    #[error("{}", t!("remote.read_only"))]
+    ReadOnly,
+    /// The phone refused access: its screen is locked, or it isn't sharing files.
+    #[error("{}", t!("remote.locked"))]
+    Locked,
+    /// The device was disconnected.
+    #[error("{}", t!("remote.device_gone"))]
+    DeviceGone,
     /// The server answered with an error of its own.
     #[error("{}", t!("remote.server", reason = .0))]
     Server(String),
@@ -91,6 +100,8 @@ impl RemoteError {
             | Self::LoginFailed
             | Self::HostKeyUnknown(_)
             | Self::HostKeyChanged(_)
+            // The sign-in dialog is where the user can allow plain http for the location.
+            | Self::Insecure
             | Self::BadKey(_) => FailKind::NeedsLogin,
             _ => FailKind::Other,
         }
@@ -105,8 +116,11 @@ impl RemoteError {
     /// (see [`LocationError`]).
     pub fn into_io(self) -> io::Error {
         let kind = match &self {
-            Self::NotFound => io::ErrorKind::NotFound,
-            Self::Denied | Self::NeedsLogin | Self::LoginFailed => io::ErrorKind::PermissionDenied,
+            Self::NotFound | Self::DeviceGone => io::ErrorKind::NotFound,
+            Self::Denied | Self::NeedsLogin | Self::LoginFailed | Self::Locked => {
+                io::ErrorKind::PermissionDenied
+            }
+            Self::ReadOnly => io::ErrorKind::ReadOnlyFilesystem,
             Self::Exists => io::ErrorKind::AlreadyExists,
             Self::Timeout => io::ErrorKind::TimedOut,
             Self::Cancelled => io::ErrorKind::Interrupted,

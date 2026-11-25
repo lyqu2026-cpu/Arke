@@ -9,6 +9,11 @@
 //! - PDFs: rendered by Windows (`win_pdf.rs`), sized for the space in device pixels. The pane
 //!   scrolls through every page (`explorer_pdf_pane.rs`), Quick Look turns them (Left/Right, Page
 //!   Up/Down, Home/End). Recent Quick Look pages are cached per tab.
+//! - SVG: rendered with GPUI's own SVG renderer (the same resvg that draws Arke's icons) to an
+//!   image; no third-party handlers.
+//! - Plain `.gz` (one compressed file, not `.tar.gz`): the inner file's name and uncompressed size,
+//!   and its text when it is small text. Only the header, the size field and the first 64 KB are
+//!   read.
 //! - Archives: list the contents without extracting (zip reads only the central directory, tar
 //!   stops at a limit).
 //! - Folders: list the contents (in column view the third column is the next level; clicking enters
@@ -165,7 +170,11 @@ pub(crate) enum PreviewBody {
     Text {
         lines: Arc<Vec<CodeLine>>,
         encoding: TextEncoding,
+        /// Set for the text inside a `.gz` file (its details are listed with the file's)
+        inner: Option<GzipInner>,
     },
+    /// A `.gz` file whose content isn't small text: only what it holds is shown
+    Gzip(GzipInner),
     /// A rendered PDF page
     Pdf(PdfView),
     /// Markdown, parsed
@@ -190,6 +199,15 @@ pub(crate) enum PreviewBody {
     /// An archive that can't be listed, with the localized reason (e.g. a RAR on a Windows without
     /// a RAR reader), so it doesn't look like an empty preview
     Unreadable(SharedString),
+}
+
+/// What a plain `.gz` file holds.
+#[derive(Clone, Debug)]
+pub(crate) struct GzipInner {
+    /// The name stored in the header, else the file's own name without `.gz`
+    pub(crate) name: String,
+    /// Uncompressed size, when it can be told
+    pub(crate) size: Option<u64>,
 }
 
 pub(crate) struct Preview {
@@ -220,6 +238,11 @@ pub(crate) enum PreviewData {
     },
     Markdown(arke_core::markdown::Doc),
     Archive(ArchiveListing),
+    /// A `.gz` file, with its content's text when that is small text
+    Gzip {
+        inner: GzipInner,
+        text: Option<(Vec<CodeLine>, TextEncoding)>,
+    },
     Folder {
         entries: Vec<Entry>,
         total: usize,
@@ -285,12 +308,27 @@ pub(crate) const fn turned(page: u32, pages: u32, turn: PageTurn) -> Option<u32>
     if next == page { None } else { Some(next) }
 }
 
-/// Recently rendered pages (keyed by file identity, page and box), least recently used first.
+/// Recently rendered PDF pages (keyed by file identity, page and box), least recently used first.
+/// One cache for all tabs: kept per tab, 12 pages each, a few tabs on large pages could hold
+/// hundreds of MB. A tab's handle onto it (the pages are only touched on the UI thread).
 #[derive(Default)]
-pub(crate) struct PdfCache(std::collections::VecDeque<(PdfKey, PdfPage)>);
+pub(crate) struct PdfCache;
 
-/// Pages kept per tab (a full-screen page at 200 % is about 30 MB, most are far smaller).
-const PDF_CACHE: usize = 12;
+thread_local! {
+    static PDF_PAGES: std::cell::RefCell<std::collections::VecDeque<(PdfKey, PdfPage)>> =
+        std::cell::RefCell::default();
+}
+
+/// Pages kept at most, in all tabs together.
+const PDF_CACHE: usize = 24;
+/// Bytes of pages kept at most (a full-screen page at 200 % is about 30 MB, most are far
+/// smaller). The page just rendered stays even when it alone is bigger.
+const PDF_CACHE_BYTES: usize = 96 << 20;
+
+/// Bytes a page holds (BGRA).
+const fn page_bytes(page: &PdfPage) -> usize {
+    (page.width as usize) * (page.height as usize) * 4
+}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct PdfKey {
@@ -315,26 +353,41 @@ impl PdfKey {
 
 impl PdfCache {
     /// A page rendered for this file and a box close to `key`'s (see [`close_enough`]).
+    #[allow(
+        clippy::unused_self,
+        reason = "a tab's handle: the pages are shared by all tabs"
+    )]
     fn get(&mut self, key: &PdfKey) -> Option<PdfPage> {
-        let ix = self.0.iter().position(|(k, _)| {
-            k.page == key.page
-                && k.size == key.size
-                && k.modified == key.modified
-                && k.path == key.path
-                && close_enough(k.target, key.target)
-        })?;
-        let hit = self.0.remove(ix)?;
-        let page = hit.1.clone();
-        self.0.push_back(hit);
-        Some(page)
+        PDF_PAGES.with_borrow_mut(|pages| {
+            let ix = pages.iter().position(|(k, _)| {
+                k.page == key.page
+                    && k.size == key.size
+                    && k.modified == key.modified
+                    && k.path == key.path
+                    && close_enough(k.target, key.target)
+            })?;
+            let hit = pages.remove(ix)?;
+            let page = hit.1.clone();
+            pages.push_back(hit);
+            Some(page)
+        })
     }
 
+    #[allow(
+        clippy::unused_self,
+        reason = "a tab's handle: the pages are shared by all tabs"
+    )]
     fn put(&mut self, key: PdfKey, page: PdfPage) {
-        self.0.retain(|(k, _)| *k != key);
-        self.0.push_back((key, page));
-        while self.0.len() > PDF_CACHE {
-            self.0.pop_front();
-        }
+        PDF_PAGES.with_borrow_mut(|pages| {
+            pages.retain(|(k, _)| *k != key);
+            pages.push_back((key, page));
+            let mut bytes: usize = pages.iter().map(|(_, p)| page_bytes(p)).sum();
+            while pages.len() > 1 && (pages.len() > PDF_CACHE || bytes > PDF_CACHE_BYTES) {
+                if let Some((_, old)) = pages.pop_front() {
+                    bytes -= page_bytes(&old);
+                }
+            }
+        });
     }
 }
 
@@ -407,6 +460,190 @@ fn archive_preview(
     }
 }
 
+/// Largest SVG source rendered. Real drawings are far smaller; this keeps a huge or hostile file
+/// from taking long to parse.
+const SVG_MAX_SOURCE: u64 = 8 * 1024 * 1024;
+/// Width the first, small render of an SVG is made at to learn its proportions.
+const SVG_PROBE_SIDE: u32 = 512;
+
+/// Most markup tags a previewed SVG may have. Drawings with more take seconds to render and
+/// nothing in a preview is worth that.
+const SVG_MAX_TAGS: usize = 150_000;
+
+/// Whether an SVG is fine to hand to the renderer: not absurdly complex, and with no `<image>` or
+/// `<feImage>` pointing anywhere but inside the file (`data:` or `#id`). The renderer would read
+/// any other `href` as a local file path, so a downloaded SVG could show another file's picture.
+fn svg_is_self_contained(bytes: &[u8]) -> bool {
+    let mut tags = 0;
+    let mut at = 0;
+    while let Some(found) = bytes[at..].iter().position(|&b| b == b'<') {
+        at += found + 1;
+        tags += 1;
+        if tags > SVG_MAX_TAGS {
+            return false;
+        }
+        // The tag's name after any namespace prefix (`<svg:image`).
+        let name_len = bytes[at..]
+            .iter()
+            .take_while(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-' | b'.' | b':'))
+            .count();
+        let name = &bytes[at..at + name_len];
+        let local = name
+            .iter()
+            .rposition(|&b| b == b':')
+            .map_or(name, |colon| &name[colon + 1..]);
+        if !(local == b"image" || local == b"feImage") {
+            continue;
+        }
+        let rest = &bytes[at..];
+        // The tag's attributes, up to the `>` outside quotes.
+        let mut quote = None;
+        let end = rest
+            .iter()
+            .position(|&b| match (quote, b) {
+                (None, b'"' | b'\'') => {
+                    quote = Some(b);
+                    false
+                }
+                (Some(q), _) if q == b => {
+                    quote = None;
+                    false
+                }
+                (None, b'>') => true,
+                _ => false,
+            })
+            .unwrap_or(rest.len());
+        let tag = &rest[..end];
+        let mut from = 0;
+        while let Some(h) = find(&tag[from..], b"href") {
+            let value = tag[from + h + 4..]
+                .iter()
+                .skip_while(|b| b.is_ascii_whitespace())
+                .skip(1) // `=`
+                .skip_while(|b| b.is_ascii_whitespace())
+                .skip(1) // the opening quote
+                .copied()
+                .take(5)
+                .collect::<Vec<u8>>();
+            if !(value.starts_with(b"#") || value.eq_ignore_ascii_case(b"data:")) {
+                return false;
+            }
+            from += h + 4;
+        }
+    }
+    true
+}
+
+fn find(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    haystack.windows(needle.len()).position(|w| w == needle)
+}
+
+/// An SVG rendered to `IMAGE_SIDE` on its long side by GPUI's renderer (resvg). It is parsed once
+/// and rendered twice: a small render shows whether it is portrait or landscape, since the
+/// renderer fits a width. Fonts come from the system; the file is never run or fetched from.
+fn load_svg(fs: &dyn Fs, renderer: &gpui::SvgRenderer, path: &Path, size: u64) -> PreviewData {
+    use gpui::{DevicePixels, SvgSize};
+    if size == 0 || size > SVG_MAX_SOURCE {
+        return PreviewData::Nothing;
+    }
+    let device = |v: u32| DevicePixels(i32::try_from(v).unwrap_or(i32::MAX));
+    let Ok(bytes) = fs.read(path, SVG_MAX_SOURCE) else {
+        return PreviewData::Nothing;
+    };
+    if !svg_is_self_contained(&bytes) {
+        return PreviewData::Nothing;
+    }
+    let Ok(parsed) = renderer.parse_svg(&bytes) else {
+        return PreviewData::Nothing;
+    };
+    let Ok(probe) = renderer.render_parsed(
+        &parsed,
+        SvgSize::Size(gpui::size(device(SVG_PROBE_SIDE), device(SVG_PROBE_SIDE))),
+    ) else {
+        return PreviewData::Nothing;
+    };
+    let probe_size = probe.size(0);
+    // Width over height of the picture; at least 1 pixel each way.
+    let aspect = u32::try_from(probe_size.width.0).unwrap_or(1).max(1) as f32
+        / u32::try_from(probe_size.height.0).unwrap_or(1).max(1) as f32;
+    let picture = if aspect >= 1. {
+        // Landscape or square: the width is the long side, and the height follows.
+        renderer.render_parsed(
+            &parsed,
+            SvgSize::Size(gpui::size(device(IMAGE_SIDE), device(IMAGE_SIDE))),
+        )
+    } else {
+        let width = (IMAGE_SIDE as f32 * aspect).round().max(1.) as u32;
+        renderer.render_parsed(
+            &parsed,
+            SvgSize::ExactSize(gpui::size(device(width), device(IMAGE_SIDE))),
+        )
+    };
+    let Ok(image) = picture else {
+        return PreviewData::Nothing;
+    };
+    let rendered_size = image.size(0);
+    PreviewData::Image {
+        width: u32::try_from(rendered_size.width.0).unwrap_or(1),
+        height: u32::try_from(rendered_size.height.0).unwrap_or(1),
+        image,
+        info: None,
+    }
+}
+
+/// A plain `.gz`: the inner name and size, and the content when it is small text. Reads the
+/// header, the last four bytes and at most `TEXT_HEAD` of content, however large the file is.
+/// Not on a server (opening would fetch the whole file).
+fn load_gzip(fs: &dyn Fs, shell: &dyn Shell, path: &Path, entry: &Entry) -> PreviewData {
+    if arke_core::remote::is_remote(path) {
+        return PreviewData::Nothing;
+    }
+    let Ok(reader) = fs.open(path) else {
+        return PreviewData::Nothing;
+    };
+    let Ok(info) = arke_core::gzip::inspect(reader, TEXT_HEAD) else {
+        return PreviewData::Nothing;
+    };
+    // `gzip` run on a pipe stores no name: the file's own name without `.gz` is the best guess.
+    // A file named just `.gz` has nothing left after the cut: its own name then.
+    let name = info.name.unwrap_or_else(|| {
+        let stem = entry
+            .name
+            .get(..entry.name.len().saturating_sub(".gz".len()))
+            .unwrap_or_default();
+        let name = if stem.is_empty() { &entry.name } else { stem };
+        name.to_owned()
+    });
+    let decode = |bytes: &[u8]| shell.decode_ansi(bytes);
+    let text = if info.head.is_empty() {
+        None
+    } else {
+        decode_text(&info.head, &decode).map(|(text, encoding)| {
+            let marks = Path::new(&name)
+                .extension()
+                .and_then(|e| e.to_str())
+                .and_then(arke_core::highlight::lang_for)
+                .map_or_default(|lang| arke_core::highlight::highlight(&text, lang));
+            (split_lines(&text, &marks), encoding)
+        })
+    };
+    PreviewData::Gzip {
+        inner: GzipInner {
+            name,
+            size: info.size,
+        },
+        text,
+    }
+}
+
+/// The line the pane and Quick Look show for a `.gz` whose content isn't text.
+fn gzip_summary(inner: &GzipInner) -> String {
+    match inner.size {
+        Some(size) => format!("{} ({})", inner.name, format_size(size)),
+        None => inner.name.clone(),
+    }
+}
+
 /// Read and decode on a background thread.
 fn load(
     fs: &dyn Fs,
@@ -416,6 +653,7 @@ fn load(
     show_hidden: bool,
     sort: arke_core::SortSpec,
     pdf_target: (u32, u32),
+    svg: &gpui::SvgRenderer,
 ) -> PreviewData {
     let kind = file_kind(entry);
     let size = entry.size;
@@ -451,7 +689,12 @@ fn load(
             &decode,
         ));
     }
+    // A plain gzip file: `.tar.gz` was listed above as an archive.
+    if entry.extension() == "gz" {
+        return load_gzip(fs, shell, path, entry);
+    }
     match kind {
+        FileKind::Image if entry.extension() == "svg" => load_svg(fs, svg, path, size),
         FileKind::Image if size <= arke_core::filetype::MAX_THUMBNAIL_SOURCE => {
             let Ok(bytes) = fs.read(path, arke_core::filetype::MAX_THUMBNAIL_SOURCE) else {
                 return PreviewData::Nothing;
@@ -643,6 +886,7 @@ impl Explorer {
         let fs = Arc::clone(&self.services.fs);
         let shell = Arc::clone(&self.services.shell);
         let tx = self.events_tx.clone();
+        let svg = cx.svg_renderer();
         self.preview_task = Some(cx.spawn(async move |this, cx| {
             if !PREVIEW_DELAY.is_zero() {
                 cx.background_executor().timer(PREVIEW_DELAY).await;
@@ -673,6 +917,7 @@ impl Explorer {
                     show_hidden,
                     sort,
                     pdf_target,
+                    &svg,
                 );
                 let _ = tx.send(AppEvent::Preview { generation, data });
             });
@@ -686,14 +931,14 @@ impl Explorer {
             Some(Preview {
                 body: PreviewBody::Image { image, .. },
                 ..
-            }) => cx.drop_image(image, None),
+            }) => crate::media::drop_image_later(image, cx),
             // The cache keeps the pixels; only the GPU copy goes.
             Some(Preview {
                 body: PreviewBody::Pdf(view),
                 ..
             }) => {
                 view.pane.release(cx);
-                cx.drop_image(view.render.image, None);
+                crate::media::drop_image_later(view.render.image, cx);
             }
             Some(Preview {
                 body: PreviewBody::Slides(view),
@@ -720,7 +965,7 @@ impl Explorer {
                 PreviewData::Image { image, .. }
                 | PreviewData::Slides {
                     thumb: Some(image), ..
-                } => cx.drop_image(image, None),
+                } => crate::media::drop_image_later(image, cx),
                 _ => {}
             }
             return;
@@ -747,6 +992,15 @@ impl Explorer {
                 PreviewData::Text { lines, encoding } => PreviewBody::Text {
                     lines: Arc::new(lines),
                     encoding,
+                    inner: None,
+                },
+                PreviewData::Gzip { inner, text } => match text {
+                    Some((lines, encoding)) => PreviewBody::Text {
+                        lines: Arc::new(lines),
+                        encoding,
+                        inner: Some(inner),
+                    },
+                    None => PreviewBody::Gzip(inner),
                 },
                 PreviewData::Pdf {
                     page,
@@ -967,6 +1221,18 @@ impl Explorer {
         (width * PDF_FRAME_RATIO).min(self.screen.0.height * 0.55)
     }
 
+    /// Pixel size of what the body draws as one picture (images, SVG, video thumbnails, a
+    /// single-page PDF); `None` for everything else, which fills its frame.
+    const fn content_size(body: &PreviewBody) -> Option<(u32, u32)> {
+        match body {
+            PreviewBody::Image { width, height, .. } => Some((*width, *height)),
+            PreviewBody::Pdf(view) if view.render.pages <= 1 => {
+                Some((view.render.width, view.render.height))
+            }
+            _ => None,
+        }
+    }
+
     /// Height of the pane's frame for images and text: the image ratio, but in a pane dragged
     /// wide it stops growing so the name and details stay on screen.
     fn image_frame_h(&self, width: Pixels) -> Pixels {
@@ -992,7 +1258,7 @@ impl Explorer {
             view.page = page;
             view.target = target;
             view.pending = None;
-            cx.drop_image(old.image, None);
+            crate::media::drop_image_later(old.image, cx);
             cx.notify();
             return;
         }
@@ -1031,7 +1297,7 @@ impl Explorer {
                     view.page = *page;
                     view.target = *target;
                     view.pending = None;
-                    cx.drop_image(old.image, None);
+                    crate::media::drop_image_later(old.image, cx);
                     cx.notify();
                 }
             }
@@ -1248,19 +1514,16 @@ impl Explorer {
                     .debug_selector(move || format!("pane-info-value-{ix}"))
                     .min_w_0()
                     .text_color(theme::text_muted())
-                    .map(|d| match date.map(|t| self.date_parts(t)) {
-                        // A path wraps at its separators, so all of it shows.
-                        None if key == location => d.child(wrappable_path(&value)),
-                        None => d.child(value),
-                        Some((short, None)) => d.child(short),
-                        // "Today 06:06" first, the full date and time dimmed after it (on the next
-                        // line when there's no room).
-                        Some((short, Some(full))) => d
-                            .flex()
-                            .flex_wrap()
-                            .gap_x(theme::s_6())
-                            .child(short)
-                            .child(div().text_color(subtle).child(full)),
+                    // A path wraps at its separators, so all of it shows.
+                    .map(|d| {
+                        if let Some(time) = date {
+                            // Once: the list's short form, or the full one with "full dates".
+                            d.child(self.date_text(Some(time), crate::prefs::full_dates()))
+                        } else if key == location {
+                            d.child(wrappable_path(&value))
+                        } else {
+                            d.child(value)
+                        }
                     });
                 // A label column of fixed width with the value right after it, so the eye doesn't
                 // cross the pane to pair them.
@@ -1311,23 +1574,6 @@ impl Explorer {
             .into_any_element()
     }
 
-    /// A date as the Info list shows it: the list's short form ("Today 06:06") and, when that
-    /// leaves something out, the full date and time to dim after it. Only the full form with the
-    /// "full dates" setting on.
-    fn date_parts(&self, time: std::time::SystemTime) -> (String, Option<String>) {
-        let shell = &self.services.shell;
-        let full = shell.format_time(time);
-        if crate::prefs::full_dates() {
-            return (full, None);
-        }
-        let short = shell.format_time_short(time);
-        if short == full {
-            (full, None)
-        } else {
-            (short, Some(full))
-        }
-    }
-
     fn preview_details(&self, preview: &Preview) -> Vec<(String, String)> {
         let shell = &self.services.shell;
         let mut rows = vec![(t!("col.type").to_string(), type_label(&preview.entry))];
@@ -1341,6 +1587,8 @@ impl Explorer {
             ..
         } = &preview.body
             && file_kind(&preview.entry) != FileKind::Video
+            // A drawing has no pixel size of its own; the render's is not its.
+            && preview.entry.extension() != "svg"
         {
             rows.push((
                 t!("preview.dimensions").to_string(),
@@ -1357,6 +1605,16 @@ impl Explorer {
                         rows.push((t!(key).into_owned(), value.clone()));
                     }
                 }
+            }
+        }
+        if let PreviewBody::Gzip(inner)
+        | PreviewBody::Text {
+            inner: Some(inner), ..
+        } = &preview.body
+        {
+            rows.push((t!("preview.gzip_name").to_string(), inner.name.clone()));
+            if let Some(size) = inner.size {
+                rows.push((t!("preview.gzip_size").to_string(), format_size(size)));
             }
         }
         if let PreviewBody::Text { encoding, .. } = &preview.body {
@@ -1443,17 +1701,20 @@ impl Explorer {
             .into_any_element()
     }
 
+    /// `frame_ratio`: width over height of the frame the body is drawn in.
     fn preview_body(
         preview: &Preview,
         scroll: &gpui::ScrollHandle,
         bars: office::SheetBars,
+        frame_ratio: f32,
     ) -> AnyElement {
         match &preview.body {
             // Give the element the frame's aspect ratio; otherwise GPUI sizes by the image's own
-            // ratio and portrait photos overflow.
+            // ratio and portrait photos overflow (and a frame hugging a wide picture would cut
+            // it off).
             PreviewBody::Image { image, .. } => img(Arc::clone(image))
                 .size_full()
-                .aspect_ratio(PANE_IMAGE_RATIO)
+                .aspect_ratio(frame_ratio)
                 .object_fit(ObjectFit::Contain)
                 .rounded(theme::r_8())
                 .into_any_element(),
@@ -1465,6 +1726,22 @@ impl Explorer {
                 code_view(lines, false, !Self::is_table_text(preview), scroll)
             }
             PreviewBody::Archive(listing) => Self::archive_list(listing, scroll),
+            PreviewBody::Gzip(inner) => div()
+                .size_full()
+                .flex()
+                .flex_col()
+                .items_center()
+                .justify_center()
+                .gap(theme::s_8())
+                .px(theme::s_12())
+                .text_size(theme::fs_12())
+                .text_color(theme::text_subtle())
+                .child(kind_icon(
+                    file_kind(&preview.entry),
+                    crate::theme::scaled_px(64.),
+                ))
+                .child(div().text_center().child(gzip_summary(inner)))
+                .into_any_element(),
             PreviewBody::Markdown(text) => div()
                 .id("preview-markdown")
                 .size_full()
@@ -1883,6 +2160,116 @@ impl Explorer {
         cx.notify();
     }
 
+    /// The frame height from the share the user dragged the boundary to (`None`: automatic, or the
+    /// column isn't measured yet).
+    fn dragged_frame_h(&self) -> Option<Pixels> {
+        let share = crate::prefs::preview_split()?;
+        let column = self.pane_split.get().column;
+        (column > px(0.)).then(|| (column * share).max(pane_frame_min_h()))
+    }
+
+    /// A strip along the bottom of the preview content: drag it to give the content more or less
+    /// of the pane's height (kept as a share of it, app-wide), double click for the automatic
+    /// height again.
+    fn preview_split_handle(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        // Its own row between the frame and the title, taking no height: the negative margin
+        // cancels the column's gap above it. It lies in the gap under the frame, so it never
+        // covers the content's scrollbars at the frame's bottom edge.
+        div()
+            .h_0()
+            .mt(-theme::s_12())
+            .relative()
+            .child(self.preview_split_strip(cx))
+    }
+
+    fn preview_split_strip(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let dragging = self.pane_split.get().unsaved && cx.has_active_drag();
+        div()
+            .id("preview-split")
+            .absolute()
+            .left_0()
+            .right_0()
+            .top_0()
+            .h(theme::s_12())
+            .cursor_row_resize()
+            .group("preview-split")
+            .debug_selector(|| "preview-split".into())
+            .child(
+                div()
+                    .absolute()
+                    .left_0()
+                    .right_0()
+                    .top_0()
+                    .h(px(2.))
+                    .when(dragging, |d| d.bg(theme::signal()))
+                    .when(!dragging, |d| {
+                        d.group_hover("preview-split", |s| s.bg(theme::signal_line()))
+                    }),
+            )
+            // Where the press landed relative to the frame's bottom edge: the drag then moves the
+            // edge by as much as the cursor moved.
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, e: &MouseDownEvent, _, _| {
+                    let mut split = this.pane_split.get();
+                    let bottom = split.top + this.pane_frame_h.get().unwrap_or_default();
+                    split.grab = e.position.y - bottom;
+                    this.pane_split.set(split);
+                }),
+            )
+            .on_drag(DraggedPreviewSplit(cx.entity_id()), |_, _, _, cx| {
+                cx.new(|_| super::details::ColumnDragView)
+            })
+            .on_drag_move(cx.listener(Self::drag_preview_split))
+            .on_click(cx.listener(|this, e: &ClickEvent, _, cx| {
+                if e.click_count() < 2 {
+                    return;
+                }
+                crate::prefs::set_preview_split(None);
+                let mut split = this.pane_split.get();
+                split.unsaved = true;
+                this.pane_split.set(split);
+                this.save_preview_split(cx);
+            }))
+    }
+
+    /// The boundary moved during a drag: the frame's bottom edge follows the cursor, kept as a
+    /// share of the pane's height within the limits in `prefs`.
+    fn drag_preview_split(
+        &mut self,
+        e: &gpui::DragMoveEvent<DraggedPreviewSplit>,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if e.drag(cx).0 != cx.entity_id() {
+            return;
+        }
+        let mut split = self.pane_split.get();
+        if split.column <= px(0.) {
+            return;
+        }
+        let height = e.event.position.y - split.grab - split.top;
+        crate::prefs::set_preview_split(Some(f32::from(height) / f32::from(split.column)));
+        split.unsaved = true;
+        self.pane_split.set(split);
+        cx.notify();
+    }
+
+    /// After dragging the boundary (or resetting it): save the share to settings (all windows).
+    pub(super) fn save_preview_split(&mut self, cx: &mut Context<Self>) {
+        let mut split = self.pane_split.get();
+        if !std::mem::take(&mut split.unsaved) {
+            return;
+        }
+        self.pane_split.set(split);
+        let share = crate::prefs::stored_preview_split();
+        log::info!("preview split: {share:?}");
+        crate::settings::SettingsStore::global(cx).update(cx, |store, cx| {
+            store.update(|st| st.preview_split = share, cx);
+        });
+        cx.notify();
+    }
+
     /// The side preview (pane or the column view's last column) is on and fits at this width.
     pub(super) fn preview_shown(&self) -> bool {
         (self.preview_pane || self.columns_active()) && self.fit.preview
@@ -1936,6 +2323,13 @@ impl Explorer {
         reason = "Layouts for each kind (no selection, archive, folder, other) are kept together for easy comparison"
     )]
     pub(super) fn preview_column(&self, pane: gpui::Div, cx: &mut Context<Self>) -> AnyElement {
+        // The boundary between the content and the details was released: save its share (app-wide).
+        if self.pane_split.get().unsaved && !cx.has_active_drag() {
+            let this = cx.entity().downgrade();
+            cx.defer(move |cx| {
+                let _ = this.update(cx, Self::save_preview_split);
+            });
+        }
         // Several selected: previewing the cursor item means little, show a summary instead.
         if self.selection.len() > 1 && !self.search_mode {
             return self.selection_summary(pane);
@@ -1949,43 +2343,51 @@ impl Explorer {
                 .child(t!("preview.nothing_selected").to_string())
                 .into_any_element();
         };
-        // Archive: name and summary, with the contents filling the column below.
-        if let PreviewBody::Archive(listing) = &preview.body {
-            return pane
-                .child(
-                    div()
-                        .font_weight(theme::FW_STRONG)
-                        .text_size(theme::fs_15())
-                        .child(SharedString::from(
-                            arke_core::tree::leaf(&preview.entry.name).to_owned(),
-                        )),
-                )
-                .child(
-                    div()
-                        .text_size(theme::fs_12())
-                        .text_color(theme::text_subtle())
-                        .child(archive_summary(listing)),
-                )
-                .child(div().flex_1().min_h_0().child(Self::with_preview_scrollbar(
-                    Self::archive_list(listing, &self.preview_scroll),
-                    &self.preview_scroll,
-                    &self.preview_scrollbar,
-                )))
-                .into_any_element();
-        }
-        // Folder: name and item count, with the contents below (click to enter and select).
-        if let PreviewBody::Folder { entries, total } = &preview.body {
+        // Folders and archives: name and summary, the contents filling the column, and the same
+        // details as a file's below. Loading has the same layout, so nothing jumps or disappears
+        // when the contents come in (#290).
+        let contents = match &preview.body {
+            PreviewBody::Archive(_) | PreviewBody::Folder { .. } => true,
+            PreviewBody::Loading(_) => {
+                preview.entry.is_dir_like() || archive_kind(&preview.entry.name).is_some()
+            }
+            _ => false,
+        };
+        if contents {
+            let summary = match &preview.body {
+                PreviewBody::Archive(listing) => archive_summary(listing),
+                PreviewBody::Folder { total, .. } => tn!("info.items", *total).into_owned(),
+                // Keeps the line, so the list doesn't move up and back.
+                _ => "\u{a0}".to_owned(),
+            };
+            let (scroll, drag) = (
+                self.preview_scroll.clone(),
+                Rc::clone(&self.preview_scrollbar),
+            );
+            let list = match &preview.body {
+                PreviewBody::Archive(listing) => Self::with_preview_scrollbar(
+                    Self::archive_list(listing, &scroll),
+                    &scroll,
+                    &drag,
+                ),
+                PreviewBody::Folder { entries, total } => Self::with_preview_scrollbar(
+                    Self::folder_list(&preview.path, entries, *total, &scroll, Some(cx)),
+                    &scroll,
+                    &drag,
+                ),
+                PreviewBody::Loading(since) => loading_skeleton(*since),
+                _ => div().into_any_element(),
+            };
             return pane
                 .child(
                     div()
                         .flex()
                         .items_start()
                         .gap(theme::s_8())
-                        .child(
-                            div()
-                                .flex_none()
-                                .child(kind_icon(FileKind::Folder, crate::theme::scaled_px(20.))),
-                        )
+                        .child(div().flex_none().child(kind_icon(
+                            file_kind(&preview.entry),
+                            crate::theme::scaled_px(20.),
+                        )))
                         .child(
                             // Wraps like a file's name, so a narrow pane shows all of it.
                             div()
@@ -2002,19 +2404,15 @@ impl Explorer {
                     div()
                         .text_size(theme::fs_12())
                         .text_color(theme::text_subtle())
-                        .child(tn!("info.items", *total).into_owned()),
+                        .child(summary),
                 )
-                .child({
-                    let (scroll, drag) = (
-                        self.preview_scroll.clone(),
-                        Rc::clone(&self.preview_scrollbar),
-                    );
-                    let list = Self::folder_list(&preview.path, entries, *total, &scroll, Some(cx));
+                .child(
                     div()
                         .flex_1()
-                        .min_h_0()
-                        .child(Self::with_preview_scrollbar(list, &scroll, &drag))
-                })
+                        .min_h(crate::theme::scaled_px(96.))
+                        .child(list),
+                )
+                .child(self.pane_info_block(preview, cx))
                 .into_any_element();
         }
         // The pane's width follows the window or the user's drag, so the frame keeps the image
@@ -2024,11 +2422,20 @@ impl Explorer {
         // PDFs get a page-shaped frame from the start, so the layout doesn't jump once it renders.
         let paged =
             file_kind(&preview.entry) == FileKind::Pdf || office::page_shaped(&preview.entry);
-        let frame_h = if paged && !matches!(preview.body, PreviewBody::Cloud) {
+        let auto_h = if paged && !matches!(preview.body, PreviewBody::Cloud) {
             self.pdf_frame_h(frame_w)
         } else {
             self.image_frame_h(frame_w)
         };
+        // The height the user dragged the boundary to replaces the automatic one.
+        let dragged = self.dragged_frame_h();
+        // A picture with a known shape doesn't get a frame taller than it is at this width, so
+        // the boundary handle sits right under it.
+        let frame_h = hugged_frame_h(
+            dragged.unwrap_or(auto_h),
+            frame_w,
+            Self::content_size(&preview.body),
+        );
         // The frame takes up to `frame_h` and gives height back in a short window, so the name and
         // details below it stay on screen. PDF pages fit the height it got (measured at the last
         // layout; drawn once more when that changes).
@@ -2039,8 +2446,14 @@ impl Explorer {
                 .map_or(frame_h, |h| h.clamp(pane_frame_min_h(), frame_h)),
         );
         let measured = std::rc::Rc::clone(&self.pane_frame_h);
+        let frame_split = Rc::clone(&self.pane_split);
         let measure = gpui::canvas(
-            move |bounds, _, _| measured.set(Some(bounds.size.height)),
+            move |bounds, _, _| {
+                measured.set(Some(bounds.size.height));
+                let mut split = frame_split.get();
+                split.top = bounds.origin.y;
+                frame_split.set(split);
+            },
             move |bounds, (), window, _| {
                 if bounds.size.height.clamp(pane_frame_min_h(), frame_h) != shown.height {
                     window.refresh();
@@ -2051,76 +2464,112 @@ impl Explorer {
         .top_0()
         .left_0()
         .size_full();
-        pane.child(
-            div()
-                .relative()
-                .flex_1()
-                .min_h(pane_frame_min_h())
-                .max_h(frame_h)
-                .overflow_hidden()
-                .child(measure)
-                .child({
-                    if let PreviewBody::Pdf(view) = &preview.body {
-                        if view.render.pages > 1 {
-                            self.pane_pdf_pages(view, shown, cx)
+        // The whole column's height, which the dragged share is of. It is known only after the
+        // first layout and changes with the window: draw again when it differs from the one used.
+        let used_column = self.pane_split.get().column;
+        let column_split = Rc::clone(&self.pane_split);
+        let share_set = crate::prefs::preview_split().is_some();
+        let column_measure = gpui::canvas(
+            move |bounds, _, _| {
+                let mut split = column_split.get();
+                split.column = bounds.size.height;
+                column_split.set(split);
+            },
+            move |bounds, (), window, _| {
+                if share_set && bounds.size.height != used_column {
+                    window.refresh();
+                }
+            },
+        )
+        .absolute()
+        .top_0()
+        .left_0()
+        .size_full();
+        pane.relative()
+            .child(column_measure)
+            .child(
+                div()
+                    .relative()
+                    .min_h(pane_frame_min_h())
+                    .overflow_hidden()
+                    .debug_selector(|| "preview-frame".into())
+                    .map(|d| {
+                        if dragged.is_some() {
+                            // The dragged height, giving way first when the window is too short.
+                            d.h(frame_h).flex_shrink(1.)
                         } else {
-                            Self::pdf_page_view(&view.render, shown, false)
+                            d.flex_1().max_h(frame_h)
                         }
-                    } else if let PreviewBody::Slides(view) = &preview.body
-                        && view.deck.slides.len() > 1
-                    {
-                        Self::with_preview_scrollbar(
-                            office::slides_list(view, frame_w, &self.preview_scroll),
-                            &self.preview_scroll,
-                            &self.preview_scrollbar,
-                        )
-                    } else {
-                        let body = Self::preview_body(
-                            preview,
-                            &self.preview_scroll,
-                            (
-                                Rc::clone(&self.preview_scrollbar),
-                                Rc::clone(&self.preview_hscrollbar),
-                            ),
-                        );
-                        if Self::scrolls(&preview.body) {
-                            // A table reaches past the frame sideways: its own bar.
-                            Self::with_preview_scrollbars(
-                                body,
+                    })
+                    .child(measure)
+                    .child({
+                        if let PreviewBody::Pdf(view) = &preview.body {
+                            if view.render.pages > 1 {
+                                self.pane_pdf_pages(view, shown, cx)
+                            } else {
+                                Self::pdf_page_view(&view.render, shown, false)
+                            }
+                        } else if let PreviewBody::Slides(view) = &preview.body
+                            && view.deck.slides.len() > 1
+                        {
+                            Self::with_preview_scrollbar(
+                                office::slides_list(view, frame_w, &self.preview_scroll),
                                 &self.preview_scroll,
                                 &self.preview_scrollbar,
-                                Self::is_table_text(preview).then_some(&self.preview_hscrollbar),
                             )
                         } else {
-                            body
+                            let body = Self::preview_body(
+                                preview,
+                                &self.preview_scroll,
+                                (
+                                    Rc::clone(&self.preview_scrollbar),
+                                    Rc::clone(&self.preview_hscrollbar),
+                                ),
+                                f32::from(shown.width) / f32::from(shown.height).max(1.),
+                            );
+                            if Self::scrolls(&preview.body) {
+                                // A table reaches past the frame sideways: its own bar.
+                                Self::with_preview_scrollbars(
+                                    body,
+                                    &self.preview_scroll,
+                                    &self.preview_scrollbar,
+                                    Self::is_table_text(preview)
+                                        .then_some(&self.preview_hscrollbar),
+                                )
+                            } else {
+                                body
+                            }
                         }
-                    }
-                }),
-        )
-        .child(div().flex_none().child(Self::pane_title(preview, cx)))
-        .child(
-            // Only in a window too short for even the smallest frame: the details scroll.
-            div()
-                .relative()
-                .flex()
-                .flex_col()
-                .flex_shrink(1.)
-                .min_h_0()
-                .child(
-                    div()
-                        .id("pane-info-scroll")
-                        .flex_initial()
-                        .min_h_0()
-                        .overflow_y_scroll()
-                        .track_scroll(&self.pane_info_scroll.0)
-                        .child(self.pane_info(preview, false, cx)),
-                )
-                .child(crate::scrollbar::scrollbar(
-                    self.pane_info_scroll.0.clone(),
-                    Rc::clone(&self.pane_info_scroll.1),
-                )),
-        )
-        .into_any_element()
+                    }),
+            )
+            .child(self.preview_split_handle(cx))
+            .child(div().flex_none().child(Self::pane_title(preview, cx)))
+            .child(self.pane_info_block(preview, cx))
+            .into_any_element()
+    }
+
+    /// The details under the preview. Only in a window too short for the rest: they scroll.
+    fn pane_info_block(&self, preview: &Preview, cx: &mut Context<Self>) -> AnyElement {
+        div()
+            .relative()
+            .flex()
+            .flex_col()
+            .flex_shrink(1.)
+            .min_h_0()
+            .child(
+                div()
+                    .id("pane-info-scroll")
+                    .flex_initial()
+                    .min_h_0()
+                    .overflow_y_scroll()
+                    .track_scroll(&self.pane_info_scroll.0)
+                    .child(self.pane_info(preview, false, cx)),
+            )
+            .child(crate::scrollbar::scrollbar(
+                self.pane_info_scroll.0.clone(),
+                Rc::clone(&self.pane_info_scroll.1),
+            ))
+            .into_any_element()
     }
 
     /// Quick Look: a large card over the dimmed window. Images and PDFs sit edge to edge on a
@@ -2237,7 +2686,10 @@ impl Explorer {
         if self.zoom.doc == DOC_ZOOM_NORMAL
             || matches!(
                 preview.body,
-                PreviewBody::Image { .. } | PreviewBody::Loading(_) | PreviewBody::Nothing
+                PreviewBody::Image { .. }
+                    | PreviewBody::Loading(_)
+                    | PreviewBody::Nothing
+                    | PreviewBody::Gzip(_)
             )
         {
             return None;
@@ -2745,6 +3197,8 @@ fn detail_icon(key: &str) -> Option<crate::assets::Icon> {
         ("preview.lens", Icon::Lens),
         ("preview.exposure", Icon::Sun),
         ("preview.encoding", Icon::Font),
+        ("preview.gzip_name", Icon::FtArchive),
+        ("preview.gzip_size", Icon::Zip),
         ("preview.pages", Icon::PageLine),
         ("preview.sheets", Icon::FtSheet),
         ("preview.slides", Icon::FtSlides),
@@ -3014,12 +3468,47 @@ const PANE_IMAGE_RATIO: f32 = 268. / 200.;
 /// drag; only the one it started in resizes).
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct DraggedPreviewEdge(pub(super) gpui::EntityId);
+
+/// The boundary between the preview content and the details below it being dragged, in this pane.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct DraggedPreviewSplit(pub(super) gpui::EntityId);
+
+/// Where the side preview was drawn at the last layout, and the drag of the boundary between its
+/// content frame and its details. Measured while drawing and read by the drag, which works from
+/// the cursor's position, so it is a `Cell` shared with the drawing callbacks.
+#[derive(Clone, Copy, Default)]
+pub(crate) struct PaneSplit {
+    /// Window y of the frame's top edge.
+    top: Pixels,
+    /// Height of the whole pane column, padding included.
+    column: Pixels,
+    /// How far below the frame's bottom edge the press landed, so the edge doesn't jump to the
+    /// cursor.
+    grab: Pixels,
+    /// Dragged or reset but not saved yet (saved when the mouse is released).
+    unsaved: bool,
+}
 /// Pane frame for PDFs: height to width, a little squatter than A4 so details still fit
 const PDF_FRAME_RATIO: f32 = 1.3;
 /// The least height the side preview's frame keeps when the window is short (it gives up the rest
 /// so the name and details stay on screen).
 fn pane_frame_min_h() -> gpui::Pixels {
     crate::theme::scaled_px(96.)
+}
+/// The frame height for a picture of `content` pixels (`None`: not a picture): `frame_h`, or less
+/// when the picture fitted to `frame_w` is shorter, but never below the smallest frame.
+fn hugged_frame_h(
+    frame_h: gpui::Pixels,
+    frame_w: gpui::Pixels,
+    content: Option<(u32, u32)>,
+) -> gpui::Pixels {
+    match content {
+        Some((w, h)) if w > 0 && h > 0 => {
+            let fitted = frame_w * (h as f32 / w as f32);
+            frame_h.min(fitted).max(pane_frame_min_h().min(frame_h))
+        }
+        _ => frame_h,
+    }
 }
 /// Long side of the high-res image for "actual size" (4096² × 4 ≈ 64 MB)
 const ZOOM_SIDE: u32 = 4096;
@@ -3093,7 +3582,7 @@ impl Explorer {
     /// Back to fit-to-window, dropping the high-res image.
     pub(super) fn reset_zoom(&mut self, cx: &mut Context<Self>) {
         if let Some(image) = self.zoom.full.take() {
-            cx.drop_image(image, None);
+            crate::media::drop_image_later(image, cx);
         }
         self.zoom.on = false;
         self.zoom.press = None;
@@ -3109,11 +3598,11 @@ impl Explorer {
         match image {
             Some(image) if generation == self.zoom.generation && self.zoom.on => {
                 if let Some(old) = self.zoom.full.replace(image) {
-                    cx.drop_image(old, None);
+                    crate::media::drop_image_later(old, cx);
                 }
                 cx.notify();
             }
-            Some(image) => cx.drop_image(image, None),
+            Some(image) => crate::media::drop_image_later(image, cx),
             None => {}
         }
     }
@@ -3517,6 +4006,19 @@ impl Explorer {
                     .into_any_element();
                 return Self::with_preview_scrollbar(page, &self.look_scroll, &self.look_scrollbar);
             }
+            PreviewBody::Gzip(inner) => {
+                let detail = format!(
+                    "{} · {} · {}",
+                    type_label(&preview.entry),
+                    format_size(preview.entry.size),
+                    gzip_summary(inner)
+                );
+                return look_empty(
+                    kind_icon(kind, theme::icon_hero()),
+                    Some(detail.into()),
+                    open(),
+                );
+            }
             PreviewBody::Nothing => {
                 let mut detail = type_label(&preview.entry);
                 if !preview.entry.is_dir_like() {
@@ -3590,6 +4092,7 @@ impl Explorer {
                             Rc::clone(&self.look_scrollbar),
                             Rc::clone(&self.look_hscrollbar),
                         ),
+                        PANE_IMAGE_RATIO,
                     ),
                 };
                 let body = if Self::scrolls(&preview.body) {
@@ -3835,7 +4338,7 @@ mod pdf_tests {
 
     #[test]
     fn cache_keeps_the_most_recent_pages() {
-        let mut cache = PdfCache::default();
+        let mut cache = PdfCache;
         let entry = Entry::new("a.pdf", arke_core::EntryKind::File, 10, None, 0);
         let image = crate::media::to_render_image(arke_core::thumbs::Thumbnail {
             width: 1,
@@ -3850,7 +4353,7 @@ mod pdf_tests {
             pages: 40,
         };
         let key = |n| PdfKey::new(Path::new(r"C:.pdf"), &entry, n, (100, 100));
-        for n in 0..20 {
+        for n in 0..30 {
             cache.put(key(n), page.clone());
         }
         assert!(cache.get(&key(0)).is_none(), "oldest pages are dropped");
@@ -3864,6 +4367,36 @@ mod pdf_tests {
         other = key(19);
         other.size = 11;
         assert!(cache.get(&other).is_none());
+    }
+
+    /// All tabs share one cache with a byte limit: big pages push older ones out well before the
+    /// page count does, and the page just rendered always stays.
+    #[test]
+    fn cache_holds_at_most_its_bytes() {
+        let page = |side: u32| PdfPage {
+            image: crate::media::to_render_image(arke_core::thumbs::Thumbnail {
+                width: 1,
+                height: 1,
+                rgba: vec![255; 4],
+            })
+            .unwrap(),
+            width: side,
+            height: side,
+            pages: 40,
+        };
+        let entry = Entry::new("big.pdf", arke_core::EntryKind::File, 10, None, 0);
+        let key = |n| PdfKey::new(Path::new(r"C:big.pdf"), &entry, n, (100, 100));
+        // About 30 MB each: three fit in 96 MB, a fourth pushes the oldest out.
+        let (mut one, mut two) = (PdfCache, PdfCache);
+        for n in 0..4 {
+            one.put(key(n), page(2800));
+        }
+        assert!(two.get(&key(0)).is_none(), "the oldest went, for every tab");
+        assert!(two.get(&key(3)).is_some(), "shared by the tabs");
+        // One page bigger than the whole budget is still kept.
+        one.put(key(9), page(6000));
+        assert!(two.get(&key(9)).is_some());
+        assert!(two.get(&key(3)).is_none());
     }
 }
 
@@ -4294,4 +4827,37 @@ where
         },
     )
     .into_any_element()
+}
+
+#[cfg(test)]
+mod svg_guard_tests {
+    use super::svg_is_self_contained as ok;
+
+    #[test]
+    fn external_images_are_refused() {
+        assert!(ok(
+            b"<svg><rect/><image href=\"data:image/png;base64,AAAA\"/></svg>"
+        ));
+        assert!(ok(
+            b"<svg><image xlink:href='#other'/><a href=\"https://x\"/></svg>"
+        ));
+        assert!(!ok(b"<svg><image href=\"C:\\Users\\a\\b.png\"/></svg>"));
+        assert!(!ok(b"<svg><image xlink:href = 'photo.png'/></svg>"));
+        assert!(!ok(b"<svg><feImage href=\"..\\x.png\"/></svg>"));
+        assert!(!ok(b"<svg><image id=\">\" href=\"x.png\"/></svg>"));
+        assert!(!ok(b"<svg><image href=\"&h;\"/></svg>"));
+        // A namespace prefix is the same tag.
+        assert!(!ok(
+            b"<svg xmlns:s=\"http://www.w3.org/2000/svg\"><s:image href=\"x.png\"/></svg>"
+        ));
+        assert!(!ok(b"<svg><svg:feImage href=\"x.png\"/></svg>"));
+        assert!(ok(b"<svg><imageset/><s:images href=\"x\"/></svg>"));
+    }
+
+    #[test]
+    fn absurdly_many_tags_are_refused() {
+        let many = "<g/>".repeat(super::SVG_MAX_TAGS + 1);
+        assert!(!ok(format!("<svg>{many}</svg>").as_bytes()));
+        assert!(ok(b"<svg><g/></svg>"));
+    }
 }
