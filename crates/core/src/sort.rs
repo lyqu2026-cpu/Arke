@@ -1367,10 +1367,14 @@ mod tests {
             assert!(key(&w[0]) <= key(&w[1]), "{:?}", names(&v));
         }
         assert_eq!(names(&v)[0], "c.t331d", "Latin text first");
-        // Simplified Chinese, as on hzhbest's machine.
-        let zh = |t: &str| crate::collate::key_for("zh-CN", t).unwrap();
-        assert!(zh("配置设置") < zh("应用程序"));
-        assert!(zh("dwg 文件") < zh("配置设置"));
+        // Simplified Chinese, as on hzhbest's machine. `key_for` only exists on Windows
+        // (`collate::imp` is Windows-only), so this stays out of the Linux test build.
+        #[cfg(windows)]
+        {
+            let zh = |t: &str| crate::collate::key_for("zh-CN", t).unwrap();
+            assert!(zh("配置设置") < zh("应用程序"));
+            assert!(zh("dwg 文件") < zh("配置设置"));
+        }
     }
 
     /// Three keys over 100k entries: a total order (every neighbor pair in order), and quick.
