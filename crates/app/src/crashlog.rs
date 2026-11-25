@@ -298,9 +298,14 @@ mod tests {
 
     #[test]
     fn a_panic_that_ends_the_process_leaves_its_lines_in_the_file() {
-        let dir = std::env::temp_dir().join(format!("arke-crashlog-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
+        // The log lives in the fork's portable data dir next to the exe, not under
+        // %LOCALAPPDATA% as upstream's test assumes; parent and child are the same
+        // binary, so they share the path.
+        let log = crate::settings::data_dir()
+            .expect("a data dir next to the test binary")
+            .join("arke.log");
+        // A previous run's lines would pass the test without the child writing any.
+        let _ = std::fs::remove_file(&log);
         let status = std::process::Command::new(std::env::current_exe().unwrap())
             .args([
                 "--exact",
@@ -308,7 +313,6 @@ mod tests {
                 "--ignored",
                 "--nocapture",
             ])
-            .env("LOCALAPPDATA", &dir)
             .env(TEST_CHILD, "1")
             .env_remove("ARKE_LOG_STDERR")
             .env_remove("RUST_LOG")
@@ -316,8 +320,7 @@ mod tests {
             .stderr(std::process::Stdio::null())
             .status()
             .unwrap();
-        let text = std::fs::read_to_string(dir.join("Arke").join("arke.log")).unwrap_or_default();
-        let _ = std::fs::remove_dir_all(&dir);
+        let text = std::fs::read_to_string(&log).unwrap_or_default();
         assert!(!status.success(), "the child should end with the panic");
         assert!(
             text.contains("before the panic 1999"),
