@@ -15,7 +15,9 @@ use minisign_verify::{PublicKey, Signature};
 
 /// Arke's update keys (minisign public keys). While a key is being replaced, the old and the new
 /// one are both here for a few releases.
-const KEYS: [&str; 1] = ["RWTaWSr3SFSSunIocrKdQcaM3w3q2qEHs+gw6rfwWnfmm41uuixOzGNm"];
+/// Fork key: generated 2026-11-26 for lyqu2026-cpu/Arke; replaces upstream's key (no signed
+/// fork build was ever published, so no transition period is needed).
+const KEYS: [&str; 1] = ["RWSjMvui5iMvF5W+OjXrQP/gOStCcFZCSKJbRCrBZMK/YaLShsJe+MgE"];
 
 /// Why a download wasn't accepted.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
