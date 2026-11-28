@@ -24,15 +24,13 @@ Arke's default shortcuts do not use Insert or Caps Lock, the modifier keys of NV
 
 | Keys | Action |
 | --- | --- |
-| F6 | Go to the next area: file list, sidebar, path bar, search box, then back to the list |
+| F6 | Go to the next area: file list, sidebar, path bar, toolbar, search box, then back to the list |
 | Shift+F6 | Go to the previous area |
+| Tab · Shift+Tab | Go to the next · previous stop: each pane's file list (the other pane of a split view is the next stop), the sidebar, the path bar, each button of the toolbar, the search box and its panel, then back to the list. On the Home page each section (favorites, drives, network, recent files) is a stop. Menus, dialogs, rename and the Settings pages keep their own Tab |
 | Ctrl+B | Show or hide the sidebar (F6 skips the sidebar while it is hidden) |
 | Ctrl+L or Alt+D | Go straight to the path bar |
 | Ctrl+F | Go straight to the search box |
-| Esc | In the sidebar or the search panel: go back toward the file list |
-
-The toolbar buttons cannot be reached with Tab yet. Use the shortcuts in this guide, or the command
-palette, instead.
+| Esc | In the sidebar, the toolbar or the search panel: go back toward the file list |
 
 ## File list
 
@@ -106,6 +104,19 @@ screen reader announces the row under it.
 | Enter or Space | Open the row; the keyboard then goes to the file list |
 | Esc | Go back to the file list without opening anything |
 
+## Toolbar
+
+The toolbar is the row of buttons beside the path bar (Up, New folder, Sort, the views, Preview
+pane, Split and the selection's actions). Press F6 until it is reached; it is one stop, and the
+keyboard starts on its first button, which a screen reader announces.
+
+| Keys | Action |
+| --- | --- |
+| Left, Right | Previous or next button |
+| Home, End | First or last button |
+| Space or Enter | Press the button |
+| Esc | Close the Sort or View options panel if it is open, otherwise go back to the file list |
+
 ## Tabs and windows
 
 | Keys | Action |
@@ -119,7 +130,7 @@ screen reader announces the row under it.
 | Ctrl+1 … Ctrl+8 | Tab 1 to 8 |
 | Ctrl+9 | Last tab |
 
-"New tab" and "Workspaces" have no key by default; use the command palette.
+"New tab", "Workspaces" and "Setup guide" have no key by default; use the command palette.
 
 ## Path bar
 
@@ -178,7 +189,7 @@ Text boxes have a context menu too; open it with Shift+F10 or the Menu key and u
 
 | Keys | Action |
 | --- | --- |
-| Tab or Shift+Tab | Switch to the other pane (while the file list has the keyboard) |
+| Tab · Shift+Tab | The other pane's file list is the next stop after this one's: Tab goes to it from the left pane, Shift+Tab from the right |
 | Alt+C | Copy the selection to the other pane |
 | Alt+M | Move the selection to the other pane |
 | Ctrl+Shift+S | Synchronized browsing |
@@ -191,8 +202,9 @@ Open a folder in a split from Go to folder with Shift+Enter.
 | Keys | Action |
 | --- | --- |
 | Ctrl+, | Open Settings |
-| Up, Down, Enter | In an open dropdown: move and choose |
-| Esc | Close Settings |
+| Ctrl+F | Find a setting (the search box at the top) |
+| Up, Down, Enter | In an open dropdown or the settings found: move and choose |
+| Esc | Clear the search box, or close Settings |
 
 Sections that expand and dropdowns open with Enter, or with the screen reader's default action.
 
@@ -211,7 +223,7 @@ Sections that expand and dropdowns open with Enter, or with the screen reader's 
 
 The path bar, search box, rename box and other text boxes use the usual Windows keys: Left and
 Right, Ctrl+Left and Ctrl+Right by word, Home and End, Shift to select, Ctrl+A, Ctrl+C, Ctrl+X,
-Ctrl+V, Ctrl+Z, Backspace, Delete, and Ctrl+Backspace or Ctrl+Delete by word. Enter confirms and
+Ctrl+V (or Ctrl+Shift+V, which pastes plain text the same way), Ctrl+Z, Backspace, Delete, and Ctrl+Backspace or Ctrl+Delete by word. Enter confirms and
 Esc cancels.
 
 ## Reporting a problem

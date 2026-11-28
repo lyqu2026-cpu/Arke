@@ -673,3 +673,638 @@ fn the_path_bar_lists_the_drives_before_the_first_segment(cx: &mut TestAppContex
         "Home opens"
     );
 }
+
+/// Whether the menu's access keys are underlined, and how many submenus are open.
+fn cues_and_depth(view: &Entity<Explorer>, cx: &mut VisualTestContext) -> Option<(bool, usize)> {
+    view.update(cx, |v, _| {
+        v.context_menu
+            .as_ref()
+            .map(|m| (m.cues_shown_for_test(), m.depth()))
+    })
+}
+
+/// A menu opened with the mouse has no underlines until a key is pressed in it. A letter nothing
+/// has does nothing else; the letter of a submenu opens it (#422).
+#[gpui::test]
+fn a_menu_opened_with_the_mouse_shows_its_access_keys_once_a_key_is_pressed(
+    cx: &mut TestAppContext,
+) {
+    let fs = FakeFs::new();
+    fs.insert_dir(r"C:\m", vec![file("a.txt", 1)]);
+    let (view, cx) = setup(cx, fs, Arc::default(), r"C:\m");
+    wait_until(cx, &view, "load", loaded(r"C:\m"));
+    open_menu_at(&view, cx, point(px(300.), px(200.)));
+    assert_eq!(cues_and_depth(&view, cx), Some((false, 0)));
+    cx.simulate_keystrokes("z");
+    assert_eq!(cues_and_depth(&view, cx), Some((true, 0)));
+    // "New" is the one with W.
+    cx.simulate_keystrokes("w");
+    assert_eq!(cues_and_depth(&view, cx), Some((true, 1)));
+}
+
+/// A menu opened from the keyboard (Shift+F10) has them from the start.
+#[gpui::test]
+fn a_menu_opened_from_the_keyboard_shows_its_access_keys(cx: &mut TestAppContext) {
+    let fs = FakeFs::new();
+    fs.insert_dir(r"C:\m", vec![file("a.txt", 1)]);
+    let (view, cx) = setup(cx, fs, Arc::default(), r"C:\m");
+    wait_until(cx, &view, "load", loaded(r"C:\m"));
+    cx.update(|window, cx| {
+        view.update(cx, |v, cx| {
+            v.open_context_menu_by_keyboard_for_test(window, cx);
+        });
+    });
+    cx.run_until_parked();
+    assert_eq!(cues_and_depth(&view, cx), Some((true, 0)));
+}
+
+/// Open in Terminal is picked with T, as in File Explorer (#422): the menu runs it and closes.
+#[gpui::test]
+fn open_in_terminal_is_picked_with_t(cx: &mut TestAppContext) {
+    let fs = FakeFs::new();
+    fs.insert_dir(r"C:\m", vec![file("a.txt", 1)]);
+    let (view, cx) = setup(cx, fs, Arc::default(), r"C:\m");
+    wait_until(cx, &view, "load", loaded(r"C:\m"));
+    open_menu_at(&view, cx, point(px(300.), px(200.)));
+    assert!(cues_and_depth(&view, cx).is_some());
+    cx.simulate_keystrokes("t");
+    assert_eq!(cues_and_depth(&view, cx), None);
+}
+
+/// Shift with Delete's key in a file's menu is Shift+Delete: it asks before deleting for good and
+/// leaves the Recycle Bin alone. A fake shell stands in for it, so nothing real is touched.
+#[gpui::test]
+fn shift_with_deletes_key_asks_to_delete_permanently(cx: &mut TestAppContext) {
+    let fs = FakeFs::new();
+    fs.insert_dir(r"C:\m", vec![file("a.txt", 1)]);
+    let shell = Arc::new(FakeShell::default());
+    apply_to_fake_fs(&fs, &shell);
+    let (view, cx) = setup(cx, Arc::clone(&fs), Arc::clone(&shell), r"C:\m");
+    wait_until(cx, &view, "load", loaded(r"C:\m"));
+    cx.simulate_keystrokes("down");
+    cx.update(|window, cx| {
+        view.update(cx, |v, cx| {
+            v.open_context_menu_by_keyboard_for_test(window, cx);
+        });
+    });
+    cx.run_until_parked();
+    assert!(cues_and_depth(&view, cx).is_some());
+    cx.simulate_keystrokes("shift-d");
+    view.update(cx, |v, _| {
+        assert_eq!(
+            v.confirm_title().as_deref(),
+            Some(&*t!("recycle.confirm_purge_title"))
+        );
+    });
+    assert!(shell.ops().is_empty(), "nothing is deleted before the yes");
+    cx.simulate_keystrokes("escape");
+    cx.run_until_parked();
+    assert!(shell.ops().is_empty());
+}
+
+/// Clicks the menu's Delete button, with `modifiers` held, in a menu opened on `a.txt`.
+fn click_menu_delete(view: &Entity<Explorer>, cx: &mut VisualTestContext, modifiers: Modifiers) {
+    right_click(view, cx, Some(0));
+    let (popup, _) = level_popup(view, cx, 0).unwrap();
+    let mut popup_cx = VisualTestContext::from_window(popup, &cx.cx);
+    let at = popup_cx
+        .debug_bounds("menu-action-Delete")
+        .expect("Delete drawn in the menu window")
+        .center();
+    popup_cx.simulate_mouse_down(at, MouseButton::Left, modifiers);
+    popup_cx.simulate_mouse_up(at, MouseButton::Left, modifiers);
+    popup_cx.run_until_parked();
+    cx.run_until_parked();
+}
+
+/// Shift+click on the menu's Delete button deletes permanently after asking, as in File Explorer:
+/// nothing is recycled. Space then confirms and the file is purged.
+#[gpui::test]
+fn shift_click_on_the_menus_delete_button_asks_to_delete_permanently(cx: &mut TestAppContext) {
+    let fs = FakeFs::new();
+    fs.insert_dir(r"C:\m", vec![file("a.txt", 1)]);
+    let shell = Arc::new(FakeShell::default());
+    apply_to_fake_fs(&fs, &shell);
+    let (view, cx) = setup(cx, Arc::clone(&fs), Arc::clone(&shell), r"C:\m");
+    wait_until(cx, &view, "load", loaded(r"C:\m"));
+    click_menu_delete(&view, cx, Modifiers::shift());
+    view.update(cx, |v, _| {
+        assert_eq!(
+            v.confirm_title().as_deref(),
+            Some(&*t!("recycle.confirm_purge_title"))
+        );
+    });
+    assert!(shell.ops().is_empty(), "nothing is deleted before the yes");
+
+    // Escape still cancels.
+    cx.simulate_keystrokes("escape");
+    cx.run_until_parked();
+    view.update(cx, |v, _| assert!(v.confirm_title().is_none()));
+    assert!(shell.ops().is_empty());
+
+    // Space confirms.
+    click_menu_delete(&view, cx, Modifiers::shift());
+    cx.simulate_keystrokes("space");
+    wait_until(cx, &view, "purged", |v| {
+        v.ops_running == 0 && names(v).is_empty()
+    });
+    assert_eq!(
+        shell.ops(),
+        [FileOp::Delete {
+            paths: vec![PathBuf::from(r"C:\m\a.txt")],
+            recycle: false,
+        }]
+    );
+}
+
+/// A plain click on the menu's Delete button still recycles, without asking.
+#[gpui::test]
+fn a_plain_click_on_the_menus_delete_button_recycles(cx: &mut TestAppContext) {
+    let fs = FakeFs::new();
+    fs.insert_dir(r"C:\m", vec![file("a.txt", 1)]);
+    let shell = Arc::new(FakeShell::default());
+    apply_to_fake_fs(&fs, &shell);
+    let (view, cx) = setup(cx, Arc::clone(&fs), Arc::clone(&shell), r"C:\m");
+    wait_until(cx, &view, "load", loaded(r"C:\m"));
+    click_menu_delete(&view, cx, Modifiers::none());
+    wait_until(cx, &view, "recycled", |v| {
+        v.ops_running == 0 && names(v).is_empty()
+    });
+    assert_eq!(
+        shell.ops(),
+        [FileOp::Delete {
+            paths: vec![PathBuf::from(r"C:\m\a.txt")],
+            recycle: true,
+        }]
+    );
+}
+
+/// Shift+click on the selection bar's Delete button asks to delete permanently too.
+#[gpui::test]
+fn shift_click_on_the_selection_bars_delete_button_asks_to_delete_permanently(
+    cx: &mut TestAppContext,
+) {
+    let fs = FakeFs::new();
+    fs.insert_dir(r"C:\m", vec![file("a.txt", 1)]);
+    let shell = Arc::new(FakeShell::default());
+    apply_to_fake_fs(&fs, &shell);
+    let (view, cx) = setup(cx, Arc::clone(&fs), Arc::clone(&shell), r"C:\m");
+    wait_until(cx, &view, "load", loaded(r"C:\m"));
+    cx.simulate_keystrokes("down");
+    cx.run_until_parked();
+    let at = cx
+        .debug_bounds("sel-delete")
+        .expect("Delete drawn in the selection bar")
+        .center();
+    cx.simulate_click(at, Modifiers::shift());
+    cx.run_until_parked();
+    view.update(cx, |v, _| {
+        assert_eq!(
+            v.confirm_title().as_deref(),
+            Some(&*t!("recycle.confirm_purge_title"))
+        );
+    });
+    assert!(shell.ops().is_empty());
+}
+
+/// In a folder's menu, Cut's button takes no letter, so T is Open in Terminal's alone: it runs
+/// at once, and nothing is cut (#422).
+#[gpui::test]
+fn in_a_folders_menu_t_opens_the_terminal(cx: &mut TestAppContext) {
+    let fs = FakeFs::new();
+    fs.insert_dir(r"C:\m", vec![dir("sub")]);
+    let shell = Arc::new(FakeShell::default());
+    apply_to_fake_fs(&fs, &shell);
+    let (view, cx) = setup(cx, Arc::clone(&fs), Arc::clone(&shell), r"C:\m");
+    wait_until(cx, &view, "load", loaded(r"C:\m"));
+    cx.simulate_keystrokes("down");
+    cx.update(|window, cx| {
+        view.update(cx, |v, cx| {
+            v.open_context_menu_by_keyboard_for_test(window, cx);
+        });
+    });
+    cx.run_until_parked();
+    assert!(cues_and_depth(&view, cx).is_some());
+    cx.simulate_keystrokes("t");
+    cx.run_until_parked();
+    assert_eq!(cues_and_depth(&view, cx), None);
+    assert!(shell.clipboard().is_none(), "T did not cut");
+}
+
+/// The icon buttons of the menu, each with the text it draws and the key beside its icon.
+fn icon_row(view: &Entity<Explorer>, cx: &mut VisualTestContext) -> Vec<(String, Option<char>)> {
+    view.update(cx, |v, _| {
+        v.context_menu
+            .as_ref()
+            .expect("the menu is open")
+            .icon_row_for_test()
+    })
+}
+
+/// Where the menu's window last drew `selector`, drawn afresh.
+fn drawn_in(
+    popup_cx: &mut VisualTestContext,
+    selector: &'static str,
+) -> Option<Bounds<gpui::Pixels>> {
+    popup_cx.update(|window, _| window.refresh());
+    popup_cx.run_until_parked();
+    popup_cx.debug_bounds(selector)
+}
+
+/// In Chinese the icon buttons' text is the label alone, never "剪下(T)", which crowds them. The
+/// key shows beside the top of the icon once the underlines do, with a gap, without moving the
+/// button, and works whether it is shown or not (#422).
+#[gpui::test]
+fn icon_buttons_show_their_key_beside_the_icon_only_with_the_underlines(cx: &mut TestAppContext) {
+    let fs = FakeFs::new();
+    fs.insert_dir(r"C:\m", vec![file("a.txt", 1)]);
+    let shell = Arc::new(FakeShell::default());
+    let (view, cx) = setup(cx, fs, Arc::clone(&shell), r"C:\m");
+    wait_until(cx, &view, "load", loaded(r"C:\m"));
+    rust_i18n::set_locale("zh-TW");
+    let labels: Vec<String> = ["menu.cut", "menu.copy", "menu.rename", "menu.delete"]
+        .iter()
+        .map(|key| t!(*key).to_string())
+        .collect();
+    let with = |keys: [Option<char>; 4]| -> Vec<(String, Option<char>)> {
+        labels.iter().cloned().zip(keys).collect()
+    };
+
+    // Opened with the mouse: the labels alone, and no key drawn.
+    right_click(&view, cx, Some(0));
+    assert_eq!(icon_row(&view, cx), with([None; 4]));
+    assert!(
+        icon_row(&view, cx)
+            .iter()
+            .all(|(text, _)| !text.contains('('))
+    );
+    let (popup, _) = level_popup(&view, cx, 0).expect("the menu has a window");
+    let mut popup_cx = VisualTestContext::from_window(popup, &cx.cx);
+    let cut = drawn_in(&mut popup_cx, "menu-action-Cut").expect("Cut drawn");
+    assert!(drawn_in(&mut popup_cx, "menu-action-key-Cut").is_none());
+
+    // A key pressed shows the underlines: the keys come beside the icons, the text stays the label
+    // and the button doesn't move or change size.
+    cx.simulate_keystrokes("z");
+    assert_eq!(
+        icon_row(&view, cx),
+        with([Some('T'), Some('C'), Some('M'), Some('D')])
+    );
+    let key = drawn_in(&mut popup_cx, "menu-action-key-Cut").expect("Cut's key drawn");
+    assert_eq!(drawn_in(&mut popup_cx, "menu-action-Cut"), Some(cut));
+    assert!(
+        key.is_contained_within(&cut),
+        "the key is in the button: {key:?} {cut:?}"
+    );
+    // The icon is centered at the button's top: the key starts past its right edge, with a gap,
+    // and sits by its upper half.
+    let icon = crate::theme::icon();
+    let icon_top = cut.top() + crate::theme::s_6();
+    assert!(
+        key.left() >= cut.center().x + icon / 2. + crate::theme::s_2(),
+        "the key is right of the icon: {key:?} {cut:?}"
+    );
+    assert!(
+        key.top() < icon_top + icon / 2.,
+        "the key is by the icon's top: {key:?} {cut:?}"
+    );
+    cx.simulate_keystrokes("escape");
+    assert!(view.update(cx, |v, _| v.context_menu.is_none()));
+
+    // The key works while it isn't shown: C copies at once.
+    right_click(&view, cx, Some(0));
+    assert_eq!(icon_row(&view, cx), with([None; 4]));
+    cx.simulate_keystrokes("c");
+    wait_shell_in(cx, "copied", || shell.clipboard().is_some_and(|c| !c.cut));
+    assert!(view.update(cx, |v, _| v.context_menu.is_none()));
+
+    // And while it is: opened from the keyboard, T cuts.
+    cx.update(|window, cx| {
+        view.update(cx, |v, cx| {
+            v.open_context_menu_by_keyboard_for_test(window, cx);
+        });
+    });
+    cx.run_until_parked();
+    assert_eq!(
+        icon_row(&view, cx),
+        with([Some('T'), Some('C'), Some('M'), Some('D')])
+    );
+    cx.simulate_keystrokes("t");
+    wait_shell_in(cx, "cut", || shell.clipboard().is_some_and(|c| c.cut));
+    rust_i18n::set_locale("en");
+}
+
+/// How far the rows of menu level `level` are scrolled, how far they can be, and the box they
+/// scroll in (in that level's window).
+fn rows_scroll(
+    view: &Entity<Explorer>,
+    cx: &mut VisualTestContext,
+    level: usize,
+) -> (gpui::Pixels, gpui::Pixels, Bounds<gpui::Pixels>) {
+    view.update(cx, |v, _| {
+        v.context_menu.as_ref().unwrap().rows_scroll_for_test(level)
+    })
+}
+
+/// Where row `ix` of level `level` is drawn now, as scrolled.
+fn row_drawn(
+    view: &Entity<Explorer>,
+    cx: &mut VisualTestContext,
+    level: usize,
+    ix: usize,
+) -> Bounds<gpui::Pixels> {
+    view.update(cx, |v, _| {
+        v.context_menu
+            .as_ref()
+            .unwrap()
+            .row_drawn_for_test(level, ix)
+    })
+    .expect("row drawn")
+}
+
+/// The highlighted row of the innermost menu level.
+fn highlighted(view: &Entity<Explorer>, cx: &mut VisualTestContext) -> Option<usize> {
+    view.update(cx, |v, _| {
+        v.context_menu.as_ref().unwrap().highlighted_for_test()
+    })
+}
+
+fn assert_row_in_view(rows: Bounds<gpui::Pixels>, row: Bounds<gpui::Pixels>, what: &str) {
+    assert!(
+        row.top() >= rows.top() - px(0.5) && row.bottom() <= rows.bottom() + px(0.5),
+        "{what}: {row:?} in {rows:?}"
+    );
+}
+
+/// One notch of the mouse wheel down (Windows scrolls three lines a notch) over `at`.
+fn wheel_down(popup_cx: &mut VisualTestContext, at: gpui::Point<gpui::Pixels>) {
+    popup_cx.simulate_event(gpui::ScrollEvent {
+        position: at,
+        delta: gpui::ScrollDelta::Lines(point(0., -3.)),
+        ..gpui::ScrollEvent::default()
+    });
+    popup_cx.run_until_parked();
+}
+
+/// A menu taller than the screen (here a short one, under a short window) is capped to it and
+/// kept on it; its rows scroll by the wheel a notch at a time and by the keys, every row can be
+/// reached, and the buttons at its bottom stay in view below them.
+#[gpui::test]
+#[allow(
+    clippy::too_many_lines,
+    reason = "one menu, reached by the wheel and by each key in turn"
+)]
+fn a_menu_taller_than_the_screen_fits_on_it_and_every_row_can_be_reached(cx: &mut TestAppContext) {
+    let work = ScreenRect::new(0, 0, 1600, 300);
+    crate::popup::set_test_monitors(one_monitor(work));
+    let fs = FakeFs::new();
+    fs.insert_dir(r"C:\m", vec![file("a.txt", 1)]);
+    let (view, cx) = setup(cx, fs, Arc::default(), r"C:\m");
+    wait_until(cx, &view, "load", loaded(r"C:\m"));
+    cx.simulate_resize(size(px(700.), px(280.)));
+    cx.run_until_parked();
+    right_click(&view, cx, Some(0));
+    let (popup, placed) = level_popup(&view, cx, 0).expect("placed");
+    assert!(
+        placed.top >= work.top && placed.bottom <= work.bottom,
+        "on the screen: {placed:?}"
+    );
+    let (offset, max, rows) = rows_scroll(&view, cx, 0);
+    assert_eq!(offset, px(0.));
+    assert!(max > px(0.), "taller than the screen: its rows scroll");
+    let mut popup_cx = VisualTestContext::from_window(popup, &cx.cx);
+    let viewport = popup_cx.update(|window, _| window.viewport_size());
+    let panel = view
+        .update(cx, |v, _| {
+            v.context_menu.as_ref().unwrap().panel_for_test(0).0
+        })
+        .expect("drawn");
+    assert!(panel.bottom() <= viewport.height, "{panel:?} {viewport:?}");
+    let buttons = |popup_cx: &mut VisualTestContext| {
+        popup_cx.debug_bounds("menu-action-Cut").expect("Cut drawn")
+    };
+    let cut = buttons(&mut popup_cx);
+    assert!(
+        cut.top() >= rows.bottom() && cut.bottom() <= panel.bottom(),
+        "the buttons are below the rows, in the panel: {cut:?} {rows:?} {panel:?}"
+    );
+
+    // The wheel: a notch moves by more than a few pixels, and notches reach the end.
+    wheel_down(&mut popup_cx, rows.center());
+    let (one, max, _) = rows_scroll(&view, cx, 0);
+    assert!(
+        one <= px(-20.) || one == -max,
+        "a notch scrolls a normal amount: {one:?}"
+    );
+    for _ in 0..40 {
+        wheel_down(&mut popup_cx, rows.center());
+    }
+    let (end, max, rows) = rows_scroll(&view, cx, 0);
+    assert_eq!(end, -max, "scrolled to the end");
+    let (selectable, footer) =
+        view.update(cx, |v, _| v.context_menu.as_ref().unwrap().rows_for_test(0));
+    assert_row_in_view(rows, row_drawn(&view, cx, 0, footer - 1), "the last row");
+    assert_eq!(buttons(&mut popup_cx), cut, "the buttons didn't move");
+
+    // Home goes back to the first row, at the top.
+    let first = *selectable.first().unwrap();
+    let last = *selectable.last().unwrap();
+    cx.simulate_keystrokes("home");
+    cx.run_until_parked();
+    assert_eq!(highlighted(&view, cx), Some(first));
+    let (_, _, rows) = rows_scroll(&view, cx, 0);
+    assert_row_in_view(
+        rows,
+        row_drawn(&view, cx, 0, first),
+        "the first row, by Home",
+    );
+    // Down, row by row, reaches the last one, which is in view when highlighted.
+    for _ in 1..selectable.len() {
+        cx.simulate_keystrokes("down");
+        cx.run_until_parked();
+    }
+    assert_eq!(highlighted(&view, cx), Some(last));
+    let (offset, _, rows) = rows_scroll(&view, cx, 0);
+    assert!(offset < px(0.), "scrolled along: {offset:?}");
+    assert_row_in_view(rows, row_drawn(&view, cx, 0, last), "the last row, by Down");
+    // Back with Home, then End: the last row again.
+    cx.simulate_keystrokes("home");
+    cx.run_until_parked();
+    cx.simulate_keystrokes("end");
+    cx.run_until_parked();
+    assert_eq!(highlighted(&view, cx), Some(last));
+    let (_, _, rows) = rows_scroll(&view, cx, 0);
+    assert_row_in_view(rows, row_drawn(&view, cx, 0, last), "the last row, by End");
+    // Home, then Up wraps around to it.
+    cx.simulate_keystrokes("home");
+    cx.run_until_parked();
+    cx.simulate_keystrokes("up");
+    cx.run_until_parked();
+    assert_eq!(highlighted(&view, cx), Some(last));
+    let (_, _, rows) = rows_scroll(&view, cx, 0);
+    assert_row_in_view(rows, row_drawn(&view, cx, 0, last), "the last row, by Up");
+
+    // Opened from the keyboard (Shift+F10) too: on the screen, the buttons whole in the panel.
+    cx.simulate_keystrokes("escape");
+    assert!(view.update(cx, |v, _| v.context_menu.is_none()));
+    cx.update(|window, cx| {
+        view.update(cx, |v, cx| {
+            v.open_context_menu_by_keyboard_for_test(window, cx);
+        });
+    });
+    cx.run_until_parked();
+    let (popup, placed) = level_popup(&view, cx, 0).expect("placed");
+    assert!(
+        placed.top >= work.top && placed.bottom <= work.bottom,
+        "on the screen: {placed:?}"
+    );
+    let mut popup_cx = VisualTestContext::from_window(popup, &cx.cx);
+    let panel = view
+        .update(cx, |v, _| {
+            v.context_menu.as_ref().unwrap().panel_for_test(0).0
+        })
+        .expect("drawn");
+    let cut = buttons(&mut popup_cx);
+    assert!(cut.bottom() <= panel.bottom(), "{cut:?} {panel:?}");
+}
+
+/// Right-clicks the first file and opens "Show more options", once it has loaded: level 1.
+fn open_more_options(view: &Entity<Explorer>, cx: &mut VisualTestContext) {
+    right_click(view, cx, Some(0));
+    wait_until(cx, view, "more options loaded", |v| {
+        v.context_menu.as_ref().is_some_and(|m| m.shell_state().0)
+    });
+    let more = format!("{} ›", t!("menu.more_options"));
+    let slot = menu_labels(view, cx)
+        .unwrap()
+        .iter()
+        .position(|l| *l == more)
+        .unwrap();
+    view.update(cx, |v, cx| {
+        v.context_menu.as_mut().unwrap().highlight_for_test(slot);
+        cx.notify();
+    });
+    cx.simulate_keystrokes("right");
+    cx.run_until_parked();
+    assert_eq!(
+        view.update(cx, |v, _| v.context_menu.as_ref().unwrap().depth()),
+        1
+    );
+}
+
+/// A shell whose "Show more options" has `extra` commands of its own after the usual ones.
+fn shell_with_extra_commands(extra: u32) -> Arc<FakeShell> {
+    let shell = Arc::new(FakeShell::default());
+    *shell.extra_menu.lock() = (0..extra)
+        .map(|n| crate::shell::ShellMenuEntry::Item {
+            id: 100 + n,
+            verb: None,
+            label: format!("Command {n}"),
+            access: None,
+            enabled: true,
+            checked: false,
+            default: false,
+            icon: None,
+        })
+        .collect();
+    shell
+}
+
+/// "Show more options" with more commands than the screen has room for: kept on the screen,
+/// capped to it, and End reaches its last command, in view.
+#[gpui::test]
+fn a_submenu_taller_than_the_screen_is_capped_and_scrolls(cx: &mut TestAppContext) {
+    let work = ScreenRect::new(0, 0, 1600, 500);
+    crate::popup::set_test_monitors(one_monitor(work));
+    let fs = FakeFs::new();
+    fs.insert_dir(r"C:\m", vec![file("a.txt", 1)]);
+    let (view, cx) = setup(cx, fs, shell_with_extra_commands(40), r"C:\m");
+    wait_until(cx, &view, "load", loaded(r"C:\m"));
+    cx.simulate_resize(size(px(800.), px(450.)));
+    cx.run_until_parked();
+    open_more_options(&view, cx);
+    let (popup, placed) = level_popup(&view, cx, 1).expect("level 1 placed");
+    assert!(
+        placed.top >= work.top && placed.bottom <= work.bottom,
+        "on the screen: {placed:?}"
+    );
+    let (offset, max, _) = rows_scroll(&view, cx, 1);
+    assert_eq!(offset, px(0.));
+    assert!(max > px(0.), "capped: its rows scroll");
+    let mut popup_cx = VisualTestContext::from_window(popup, &cx.cx);
+    let viewport = popup_cx.update(|window, _| window.viewport_size());
+    let panel = view
+        .update(cx, |v, _| {
+            v.context_menu.as_ref().unwrap().panel_for_test(1).0
+        })
+        .expect("drawn");
+    assert!(panel.bottom() <= viewport.height, "{panel:?} {viewport:?}");
+
+    cx.simulate_keystrokes("end");
+    cx.run_until_parked();
+    let (selectable, _) = view.update(cx, |v, _| v.context_menu.as_ref().unwrap().rows_for_test(1));
+    let last = *selectable.last().unwrap();
+    assert_eq!(highlighted(&view, cx), Some(last));
+    let (offset, _, rows) = rows_scroll(&view, cx, 1);
+    assert!(offset < px(0.), "scrolled: {offset:?}");
+    assert_row_in_view(rows, row_drawn(&view, cx, 1, last), "the last command");
+}
+
+/// "Show more options" that fits the screen but would run past its bottom where its row is: it
+/// moves up whole, as a Windows submenu does, not squeezed and not scrolling.
+#[gpui::test]
+fn a_submenu_that_would_run_past_the_bottom_moves_up(cx: &mut TestAppContext) {
+    crate::popup::set_test_monitors(one_monitor(ScreenRect::new(0, 0, 1600, 3000)));
+    let fs = FakeFs::new();
+    fs.insert_dir(r"C:\m", vec![file("a.txt", 1)]);
+    let (view, cx) = setup(cx, fs, shell_with_extra_commands(4), r"C:\m");
+    wait_until(cx, &view, "load", loaded(r"C:\m"));
+    open_more_options(&view, cx);
+    let (_, roomy) = level_popup(&view, cx, 1).expect("level 1 placed");
+    let (_, roomy_parent) = level_popup(&view, cx, 0).expect("level 0 placed");
+    cx.simulate_keystrokes("escape escape");
+    assert!(view.update(cx, |v, _| v.context_menu.is_none()));
+
+    // The screen ends halfway down the submenu, still below the top level.
+    let bottom = (roomy.top + roomy.height() / 2).max(roomy_parent.bottom + 1);
+    assert!(bottom < roomy.bottom, "the submenu runs past it");
+    let work = ScreenRect::new(0, 0, 1600, bottom);
+    crate::popup::set_test_monitors(one_monitor(work));
+    open_more_options(&view, cx);
+    let (_, placed) = level_popup(&view, cx, 1).expect("level 1 placed");
+    assert!(
+        placed.top >= work.top && placed.bottom <= work.bottom,
+        "on the screen: {placed:?}"
+    );
+    assert!(placed.top < roomy.top, "moved up: {placed:?} {roomy:?}");
+    assert_eq!(placed.height(), roomy.height(), "whole, not squeezed");
+    assert_eq!(rows_scroll(&view, cx, 1).1, px(0.), "nothing to scroll");
+}
+
+/// A menu that fits is laid out as before: the same size on a screen just big enough for it as on
+/// a large one, at the pointer, and nothing to scroll (not even by its padding).
+#[gpui::test]
+fn a_menu_that_fits_is_not_capped_and_does_not_scroll(cx: &mut TestAppContext) {
+    crate::popup::set_test_monitors(one_monitor(ScreenRect::new(0, 0, 1600, 3000)));
+    let fs = FakeFs::new();
+    fs.insert_dir(r"C:\m", vec![file("a.txt", 1)]);
+    let (view, cx) = setup(cx, fs, Arc::default(), r"C:\m");
+    wait_until(cx, &view, "load", loaded(r"C:\m"));
+    right_click(&view, cx, Some(0));
+    let (_, roomy) = level_popup(&view, cx, 0).expect("placed");
+    let at = cx.update(|window, _| crate::popup::to_screen(window, point(px(300.), px(200.))));
+    assert_eq!((roomy.left, roomy.top), at, "at the pointer");
+    assert_eq!(rows_scroll(&view, cx, 0).1, px(0.), "nothing to scroll");
+    cx.simulate_keystrokes("escape");
+
+    // A screen with just room for it below the pointer, and its shadow.
+    let work = ScreenRect::new(0, 0, 1600, roomy.bottom + 60);
+    crate::popup::set_test_monitors(one_monitor(work));
+    right_click(&view, cx, Some(0));
+    let (_, placed) = level_popup(&view, cx, 0).expect("placed");
+    assert_eq!(placed, roomy, "same place and size");
+    let (offset, max, rows) = rows_scroll(&view, cx, 0);
+    assert_eq!((offset, max), (px(0.), px(0.)), "nothing to scroll");
+    let (_, footer) = view.update(cx, |v, _| v.context_menu.as_ref().unwrap().rows_for_test(0));
+    assert_row_in_view(rows, row_drawn(&view, cx, 0, footer - 1), "the last row");
+}

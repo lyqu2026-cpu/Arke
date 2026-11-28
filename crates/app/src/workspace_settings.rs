@@ -27,6 +27,7 @@ use super::{Workspace, chosen_accent};
 use crate::a11y::A11yExt as _;
 use crate::assets::Icon;
 use crate::explorer::ViewMode;
+use crate::keynav::KeyStop;
 use crate::scrollbar::ScrollbarDrag;
 use crate::settings::{
     Accent, DarkShade, Density, FolderOrder, Language, LastTabAction, Material, NavScope,
@@ -35,6 +36,9 @@ use crate::settings::{
 use crate::text_input::{InputEvent, TextInput};
 use crate::theme::{self, UiFont as _};
 
+#[path = "workspace_settings_search.rs"]
+mod search;
+
 actions!(
     workspace,
     [
@@ -42,7 +46,10 @@ actions!(
         CloseSettings,
         DropdownUp,
         DropdownDown,
-        DropdownAccept
+        DropdownAccept,
+        NextControl,
+        PrevControl,
+        OtherArea
     ]
 );
 
@@ -68,12 +75,20 @@ pub(super) fn bind_keys(cx: &mut App) {
         KeyBinding::new("up", DropdownUp, Some("SettingsPage")),
         KeyBinding::new("down", DropdownDown, Some("SettingsPage")),
         KeyBinding::new("enter", DropdownAccept, Some("SettingsPage")),
+        KeyBinding::new("tab", NextControl, Some("SettingsPage")),
+        KeyBinding::new("shift-tab", PrevControl, Some("SettingsPage")),
+        KeyBinding::new("f6", OtherArea, Some("SettingsPage")),
+        KeyBinding::new("shift-f6", OtherArea, Some("SettingsPage")),
     ]);
 }
 
 /// Open Settings page: which tab owns it and the folder that tab was on (closes if it changes).
 pub(super) struct SettingsPage {
     pub(super) focus: FocusHandle,
+    /// The categories, one tab stop: Up and Down pick the category (#322).
+    nav_focus: FocusHandle,
+    /// The theme, accent and tint tile groups, one tab stop each (#322).
+    radios: [FocusHandle; 3],
     /// Settings is a tab, as in Files; this is the owning tab.
     pub(super) owner: super::pages::Owner,
     scroll: ScrollHandle,
@@ -102,6 +117,11 @@ pub(super) struct SettingsPage {
     /// About › Updates: the download route (`update_route.rs`).
     pub(super) route_input: Entity<TextInput>,
     _route_input: Subscription,
+    /// The external copy and preview programs' command lines (`external.rs`).
+    copy_input: Entity<TextInput>,
+    _copy_input: Subscription,
+    preview_input: Entity<TextInput>,
+    _preview_input: Subscription,
     /// Keyboard shortcuts: search and the key being recorded.
     pub(super) shortcuts: super::shortcuts::Page,
     pub(super) backup: Option<super::backup::BackupNote>,
@@ -122,6 +142,8 @@ pub(super) struct SettingsPage {
     slider_drag: std::rc::Rc<std::cell::Cell<bool>>,
     /// "Remove Arke from this PC" confirmation, when open.
     pub(super) uninstall: Option<super::uninstall_page::UninstallAsk>,
+    /// The search box in the title bar and what it found (#400).
+    search: search::Search,
 }
 
 /// The background image card's thumbnail.
@@ -278,6 +300,21 @@ fn accent_color(accent: Accent) -> u32 {
     chosen_accent(accent).unwrap_or(theme::ARKE_ACCENT)
 }
 
+/// A focus handle Tab stops at (#322): a tracked handle is a tab stop by its own setting, not
+/// the element's.
+fn stop_handle(cx: &mut App) -> FocusHandle {
+    cx.focus_handle().tab_index(0).tab_stop(true)
+}
+
+/// Index of each category, in the order `settings_sections` lists them; the search notes each
+/// page's rows under its index (#400).
+const APPEARANCE: usize = 0;
+const FILES: usize = 1;
+const SORTING: usize = 2;
+const STARTUP: usize = 3;
+const SEARCH: usize = 4;
+const CONTEXT_MENU: usize = 5;
+const SHORTCUTS: usize = 6;
 /// Index of the About category; the "Import Arke settings" context menu opens it directly.
 pub(super) const ABOUT: usize = 7;
 
@@ -287,14 +324,16 @@ pub(super) fn set(cx: &mut App, f: impl FnOnce(&mut Settings)) {
 }
 
 impl Workspace {
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the page's whole state is made here, field by field"
+    )]
     pub(super) fn open_settings(
         &mut self,
         _: &OpenSettings,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        // QuickLook may have been started (or quit) since the last check.
-        Self::recheck_quicklook(cx);
         // Already open: switch to that tab.
         let existing = self.settings_panel.as_ref().map(|p| p.owner.clone());
         if self.go_to_page(existing.as_ref(), window, cx) {
@@ -308,7 +347,7 @@ impl Workspace {
         let owner = self.owner_here(true, cx);
         let accent = SettingsStore::global(cx).read(cx).settings.accent;
         let accent_input = cx.new(|cx| {
-            let mut input = TextInput::new("#RRGGBB", cx);
+            let mut input = TextInput::new("#RRGGBB", cx).key_stop();
             input.set_text(Accent::hex(accent_color(accent)), cx);
             input
         });
@@ -319,15 +358,17 @@ impl Workspace {
             .background_image
             .clone();
         let image_input = cx.new(|cx| {
-            let mut input = TextInput::new(t!("settings.background_path").to_string(), cx);
+            let mut input =
+                TextInput::new(t!("settings.background_path").to_string(), cx).key_stop();
             input.set_text(image.map_or_default(|p| p.display().to_string()), cx);
             input
         });
         let image_sub = cx.subscribe_in(&image_input, window, Self::on_image_input);
         let import_input =
-            cx.new(|cx| TextInput::new(t!("backup.import_placeholder").to_string(), cx));
+            cx.new(|cx| TextInput::new(t!("backup.import_placeholder").to_string(), cx).key_stop());
         let import_sub = cx.subscribe_in(&import_input, window, Self::on_import_input);
-        let app_input = cx.new(|cx| TextInput::new(t!("openwith.placeholder").to_string(), cx));
+        let app_input =
+            cx.new(|cx| TextInput::new(t!("openwith.placeholder").to_string(), cx).key_stop());
         let app_sub = cx.subscribe_in(&app_input, window, Self::on_app_input);
         let route = SettingsStore::global(cx)
             .read(cx)
@@ -335,12 +376,38 @@ impl Workspace {
             .update_route
             .clone();
         let route_input = cx.new(|cx| {
-            let mut input = TextInput::new(t!("update.route_placeholder").to_string(), cx);
+            let mut input =
+                TextInput::new(t!("update.route_placeholder").to_string(), cx).key_stop();
             input.set_text(route, cx);
             input
         });
         let route_sub = cx.subscribe_in(&route_input, window, Self::on_route_input);
+        let (copy_line, preview_line) = {
+            let settings = &SettingsStore::global(cx).read(cx).settings;
+            (
+                settings.external_copy.clone(),
+                settings.external_preview.clone(),
+            )
+        };
+        let copy_input = cx.new(|cx| {
+            let mut input = TextInput::new(COPY_PLACEHOLDER.to_owned(), cx).key_stop();
+            input.set_text(copy_line, cx);
+            input
+        });
+        let copy_sub = cx.subscribe_in(&copy_input, window, |this, input, event, window, cx| {
+            this.on_command_input(input, event, |s| &mut s.external_copy, window, cx);
+        });
+        let preview_input = cx.new(|cx| {
+            let mut input = TextInput::new(PREVIEW_PLACEHOLDER.to_owned(), cx).key_stop();
+            input.set_text(preview_line, cx);
+            input
+        });
+        let preview_sub =
+            cx.subscribe_in(&preview_input, window, |this, input, event, window, cx| {
+                this.on_command_input(input, event, |s| &mut s.external_preview, window, cx);
+            });
         let shortcuts = super::shortcuts::Page::new(window, cx);
+        let search = search::Search::new(window, cx);
         // List fonts in the background; there can be hundreds.
         let text_system = Arc::clone(cx.text_system());
         cx.spawn(async move |this, cx| {
@@ -364,6 +431,8 @@ impl Workspace {
         .detach();
         self.settings_panel = Some(SettingsPage {
             focus,
+            nav_focus: stop_handle(cx),
+            radios: std::array::from_fn(|_| stop_handle(cx)),
             owner,
             scroll: ScrollHandle::new(),
             scrollbar_drag: ScrollbarDrag::default(),
@@ -384,6 +453,10 @@ impl Workspace {
             _app_input: app_sub,
             route_input,
             _route_input: route_sub,
+            copy_input,
+            _copy_input: copy_sub,
+            preview_input,
+            _preview_input: preview_sub,
             shortcuts,
             backup: None,
             dropdown: None,
@@ -394,6 +467,7 @@ impl Workspace {
             backdrop: None,
             slider_drag: std::rc::Rc::default(),
             uninstall: None,
+            search,
         });
         self.sync_backdrop_thumb(cx);
         cx.notify();
@@ -656,6 +730,30 @@ impl Workspace {
         }
     }
 
+    /// An external program's command line: saved as typed (it is only read when a copy starts or
+    /// Space is pressed); Enter and Esc return to the page.
+    fn on_command_input(
+        &mut self,
+        input: &Entity<TextInput>,
+        event: &InputEvent,
+        field: fn(&mut Settings) -> &mut String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let text = input.read(cx).committed_text().trim().to_owned();
+        set(cx, move |s| {
+            let line = field(s);
+            if *line != text {
+                *line = text;
+            }
+        });
+        if matches!(event, InputEvent::Confirm | InputEvent::Cancel)
+            && let Some(page) = &self.settings_panel
+        {
+            window.focus(&page.focus, cx);
+        }
+    }
+
     fn on_image_input(
         &mut self,
         input: &Entity<TextInput>,
@@ -793,12 +891,17 @@ impl Workspace {
     }
 
     /// Arrow keys move and Enter selects while a dropdown is open.
-    fn dropdown_move(&mut self, down: bool, cx: &mut Context<Self>) {
+    fn dropdown_move(&mut self, down: bool, window: &Window, cx: &mut Context<Self>) {
         let Some(dropdown) = self
             .settings_panel
             .as_mut()
             .and_then(|p| p.dropdown.as_mut())
         else {
+            // No list open: the arrow moves through the search's hits, or is for the control with
+            // the focus (#322).
+            if !self.settings_search_move(down, window, cx) {
+                cx.propagate();
+            }
             return;
         };
         let last = dropdown.options.len().saturating_sub(1);
@@ -816,22 +919,84 @@ impl Workspace {
         cx.notify();
     }
 
-    fn dropdown_up(&mut self, _: &DropdownUp, _: &mut Window, cx: &mut Context<Self>) {
-        self.dropdown_move(false, cx);
+    fn dropdown_up(&mut self, _: &DropdownUp, window: &mut Window, cx: &mut Context<Self>) {
+        self.dropdown_move(false, window, cx);
     }
 
-    fn dropdown_down(&mut self, _: &DropdownDown, _: &mut Window, cx: &mut Context<Self>) {
-        self.dropdown_move(true, cx);
+    fn dropdown_down(&mut self, _: &DropdownDown, window: &mut Window, cx: &mut Context<Self>) {
+        self.dropdown_move(true, window, cx);
     }
 
     fn dropdown_accept(&mut self, _: &DropdownAccept, _: &mut Window, cx: &mut Context<Self>) {
         let Some(dropdown) = self.settings_panel.as_mut().and_then(|p| p.dropdown.take()) else {
+            // No list open: Enter presses the control with the focus (#322).
+            cx.propagate();
             return;
         };
         if let Some(apply) = dropdown.options.get(dropdown.cursor).cloned() {
             apply(cx);
         }
         cx.notify();
+    }
+
+    /// Tab: the next control on the page; an open list closes first, as in Windows.
+    fn next_control(&mut self, _: &NextControl, window: &mut Window, cx: &mut Context<Self>) {
+        self.close_dropdown(cx);
+        crate::keynav::next(window, cx);
+    }
+
+    /// Shift+Tab: the previous control on the page.
+    fn prev_control(&mut self, _: &PrevControl, window: &mut Window, cx: &mut Context<Self>) {
+        self.close_dropdown(cx);
+        crate::keynav::prev(window, cx);
+    }
+
+    /// F6 and Shift+F6: between the categories and the page's controls.
+    fn other_area(&mut self, _: &OtherArea, window: &mut Window, cx: &mut Context<Self>) {
+        self.close_dropdown(cx);
+        let Some(page) = &self.settings_panel else {
+            return;
+        };
+        if page.nav_focus.is_focused(window) {
+            // The categories come first in Tab order: the next stop is the page's first control.
+            crate::keynav::next(window, cx);
+        } else {
+            window.focus(&page.nav_focus, cx);
+        }
+    }
+
+    fn close_dropdown(&mut self, cx: &mut Context<Self>) {
+        if let Some(page) = &mut self.settings_panel
+            && page.dropdown.take().is_some()
+        {
+            cx.notify();
+        }
+    }
+
+    /// Up and Down on the categories (Home and End too): selects that category and shows its
+    /// page, as Windows Settings does.
+    fn nav_key(&mut self, key: &str, count: usize, cx: &mut Context<Self>) -> bool {
+        let Some(page) = &mut self.settings_panel else {
+            return false;
+        };
+        let last = count.saturating_sub(1);
+        let at = page.category.min(last);
+        let to = match key {
+            "up" => at.saturating_sub(1),
+            "down" => (at + 1).min(last),
+            "home" => 0,
+            "end" => last,
+            _ => return false,
+        };
+        page.search.left(cx);
+        if to != page.category {
+            page.category = to;
+            page.dropdown = None;
+            LAST_TOGGLE.set(None);
+            page.scroll.set_offset(point(px(0.), px(0.)));
+            cx.notify();
+        }
+        true
     }
 
     /// Whether the active tab is showing Settings.
@@ -865,9 +1030,10 @@ impl Workspace {
             .a11y(gpui::Role::Link, t!("settings.title"))
             .relative()
             .flex_none()
-            .h(theme::h_row())
+            .h(theme::h_row_side())
             .mx(theme::s_8())
-            .mb(theme::s_8())
+            // Its bottom lines up with the paper's.
+            .mb(theme::paper_gap())
             .pl(theme::s_8())
             .flex()
             .items_center()
@@ -919,13 +1085,43 @@ impl Workspace {
             .as_ref()
             .filter(|p| self.shows(&p.owner))?;
         let s = SettingsStore::global(cx).read(cx).settings.clone();
-        let top_bar = Self::render_settings_top_bar(window, cx);
+        let search_box = search::search_box(&page.search, window, cx);
+        let top_bar = Self::render_settings_top_bar(search_box, window, cx);
         let compact = self.last_viewport_width < nav_compact_below();
+        // While a query is typed every row notes itself as it is built, and the hits show in
+        // place of the page.
+        let query = page.search.query(cx);
+        page.search.begin(&query, page.category);
         let mut categories = Self::settings_sections(&s, page, window, cx);
+        let found = search::finish();
         let selected = page.category.min(categories.len().saturating_sub(1));
+        let count = categories.len();
+        // The ring goes on the selected category rather than round the whole column.
+        // The control with the focus went (a row's button that closed with what it did): the page
+        // takes the focus, so the keys keep working (#322).
+        if window.focused(cx).is_none() {
+            let focus = page.focus.clone();
+            cx.defer_in(window, move |_, window, cx| {
+                if window.focused(cx).is_none() {
+                    window.focus(&focus, cx);
+                }
+            });
+        }
+        let nav_held = page.nav_focus.is_focused(window);
+        let nav_ring = nav_held && window.last_input_was_keyboard();
+        crate::keynav::set_view(Some(page.scroll.clone()));
         let nav = div()
             .id("settings-nav")
             .a11y(gpui::Role::TabList, t!("settings.title"))
+            .track_focus(&page.nav_focus)
+            .key_stop_plain()
+            .on_key_down(cx.listener(move |this, event: &gpui::KeyDownEvent, _, cx| {
+                if !event.keystroke.modifiers.modified()
+                    && this.nav_key(&event.keystroke.key, count, cx)
+                {
+                    cx.stop_propagation();
+                }
+            }))
             .flex_none()
             .w(if compact { nav_w_compact() } else { nav_w() })
             .h_full()
@@ -945,6 +1141,10 @@ impl Workspace {
                             .id(("settings-category", ix))
                             .a11y_lazy(gpui::Role::Tab, || title.to_string())
                             .aria_selected(on)
+                            // Read as focused while the categories have the focus, not while a
+                            // control on the page under them does.
+                            .when(on && nav_held, gpui::StatefulInteractiveElement::aria_active_descendant)
+                            .when(on && nav_ring, |d| d.shadow(crate::keynav::ring()))
                             .relative()
                             .h(theme::h_row() + theme::s_4())
                             .px(theme::s_12())
@@ -982,21 +1182,52 @@ impl Workspace {
                                 )
                             })
                             .on_click(cx.listener(move |this, _, _, cx| {
-                                if let Some(page) = &mut this.settings_panel
-                                    && page.category != ix
-                                {
-                                    page.category = ix;
-                                    page.dropdown = None;
-                                    LAST_TOGGLE.set(None);
-                                    // Start at the top when switching category.
-                                    page.scroll.set_offset(point(px(0.), px(0.)));
+                                if let Some(page) = &mut this.settings_panel {
+                                    page.search.left(cx);
+                                    if page.category != ix {
+                                        page.category = ix;
+                                        page.dropdown = None;
+                                        LAST_TOGGLE.set(None);
+                                        // Start at the top when switching category.
+                                        page.scroll.set_offset(point(px(0.), px(0.)));
+                                    }
                                 }
                                 cx.notify();
                             }))
                     })
                     .collect::<Vec<_>>(),
             );
-        let (title, _, cards) = categories.swap_remove(selected);
+        let content: Vec<AnyElement> = if query.is_empty() {
+            let (title, _, cards) = categories.swap_remove(selected);
+            let title = SharedString::from(title.into_owned());
+            vec![
+                div()
+                    .id("settings-page-title")
+                    .a11y(gpui::Role::Heading, title.clone())
+                    .aria_level(1)
+                    .pb(theme::s_4())
+                    .text_size(theme::fs_24())
+                    .font_weight(theme::FW_STRONG)
+                    .child(title)
+                    .into_any_element(),
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap(theme::s_8())
+                    .children(cards)
+                    .with_animation(("settings-category-body", selected), anim(), |el, t| {
+                        crate::motion::slide_in(el, t, 0., ANIM_SLIDE)
+                    })
+                    .into_any_element(),
+            ]
+        } else {
+            let pages: Vec<(SharedString, Icon)> = categories
+                .iter()
+                .map(|(title, icon, _)| (SharedString::from(title.to_string()), *icon))
+                .collect();
+            let focused = page.search.input.focus_handle(cx).is_focused(window);
+            vec![page.search.results(&query, found, &pages, focused, cx)]
+        };
         let body = div()
             .id("settings-scroll")
             .size_full()
@@ -1020,29 +1251,7 @@ impl Workspace {
                             .flex()
                             .flex_col()
                             .gap(theme::s_4())
-                            .child({
-                                let title = SharedString::from(title.into_owned());
-                                div()
-                                    .id("settings-page-title")
-                                    .a11y(gpui::Role::Heading, title.clone())
-                                    .aria_level(1)
-                                    .pb(theme::s_4())
-                                    .text_size(theme::fs_24())
-                                    .font_weight(theme::FW_STRONG)
-                                    .child(title)
-                            })
-                            .child(
-                                div()
-                                    .flex()
-                                    .flex_col()
-                                    .gap(theme::s_8())
-                                    .children(cards)
-                                    .with_animation(
-                                        ("settings-category-body", selected),
-                                        anim(),
-                                        |el, t| crate::motion::slide_in(el, t, 0., ANIM_SLIDE),
-                                    ),
-                            ),
+                            .children(content),
                     ),
             );
         Some(
@@ -1055,6 +1264,10 @@ impl Workspace {
                 .on_action(cx.listener(Self::dropdown_up))
                 .on_action(cx.listener(Self::dropdown_down))
                 .on_action(cx.listener(Self::dropdown_accept))
+                .on_action(cx.listener(Self::next_control))
+                .on_action(cx.listener(Self::prev_control))
+                .on_action(cx.listener(Self::other_area))
+                .on_action(cx.listener(Self::focus_settings_search))
                 .flex_1()
                 .min_w_0()
                 .h_full()
@@ -1070,9 +1283,9 @@ impl Workspace {
                         .flex_col()
                         .flex_1()
                         .min_h_0()
-                        .mr(theme::s_8())
-                        .mb(theme::s_8())
-                        .rounded(theme::r_12())
+                        .mr(theme::paper_gap())
+                        .mb(theme::paper_gap())
+                        .rounded(theme::r_paper())
                         .bg(theme::paper())
                         .shadow(theme::elev_2())
                         .overflow_hidden()
@@ -1093,8 +1306,9 @@ impl Workspace {
         )
     }
 
-    /// Settings top bar: title, drag area, caption buttons.
+    /// Settings top bar: title, the search box between drag areas, caption buttons.
     fn render_settings_top_bar(
+        search_box: AnyElement,
         window: &Window,
         cx: &mut Context<Self>,
     ) -> impl IntoElement + use<> {
@@ -1125,6 +1339,8 @@ impl Workspace {
                     ),
             )
             .child(super::drag_area("settings-drag", cx).flex_1().h_full())
+            .child(search_box)
+            .child(super::drag_area("settings-drag-end", cx).flex_1().h_full())
             .child(crate::explorer::caption_buttons(window))
     }
 
@@ -1151,6 +1367,13 @@ impl Workspace {
             buttons: Rc::clone(&page.dropdown_buttons),
         };
         let ui = &ui;
+        // Whether a tile group has the focus, and by keyboard (the picked tile shows the ring).
+        let keys = |focus: &FocusHandle| {
+            let focused = focus.is_focused(window);
+            (focused, focused && window.last_input_was_keyboard())
+        };
+        // Each page notes its rows under its own index, for the search (#400).
+        search::page(APPEARANCE);
         let material = theme::mica_available().then(|| {
             card(
                 Icon::Window,
@@ -1176,7 +1399,7 @@ impl Workspace {
             t!("settings.theme_desc"),
             text_summary(theme_label(s.theme, s.dark_shade)),
             page.expanded.contains("theme"),
-            theme_body(s),
+            theme_body(s, &page.radios[0], keys(&page.radios[0])),
             cx,
         )];
         appearance.extend(material);
@@ -1188,7 +1411,7 @@ impl Workspace {
                 t!("settings.accent_desc"),
                 look_summary(theme::signal(), accent_label(s.accent)),
                 page.expanded.contains("accent"),
-                accent_body(s, &page.accent_input, window, cx),
+                accent_body(s, &page.accent_input, &page.radios[1], window, cx),
                 cx,
             ),
             expander(
@@ -1198,7 +1421,7 @@ impl Workspace {
                 t!("settings.tint_desc"),
                 look_summary(theme::tint_preview(tint_color(s)), tint_label(s.tint)),
                 page.expanded.contains("tint"),
-                tint_body(s),
+                tint_body(s, &page.radios[2], keys(&page.radios[2])),
                 cx,
             ),
             expander(
@@ -1267,6 +1490,7 @@ impl Workspace {
                 ),
             ),
         ]);
+        search::page(FILES);
         let files = vec![
             card(
                 Icon::EyeOff,
@@ -1355,11 +1579,12 @@ impl Workspace {
                     st.double_click_up = !st.double_click_up;
                 }),
             ),
-            card(
-                Icon::Preview,
-                t!("settings.preview"),
-                Some(t!("settings.preview_desc")),
-                preview_controls(s),
+            preview_card(
+                s,
+                (
+                    &page.preview_input,
+                    page.preview_input.focus_handle(cx).is_focused(window),
+                ),
             ),
             card(
                 Icon::ArrowLeft,
@@ -1404,6 +1629,7 @@ impl Workspace {
                 ))
                 .into_any_element(),
         ];
+        search::page(SORTING);
         let sorting = vec![
             wrapping_card(
                 "columns-card",
@@ -1518,10 +1744,7 @@ impl Workspace {
                 None,
                 choice(
                     "folders",
-                    &[
-                        (FolderOrder::First, t!("settings.folders_first")),
-                        (FolderOrder::Mixed, t!("settings.folders_mixed")),
-                    ],
+                    &folder_order_options(),
                     s.folders,
                     |st, v| st.folders = v,
                     ui,
@@ -1529,6 +1752,7 @@ impl Workspace {
             ),
             folder_views_card(s, cx),
         ];
+        search::page(STARTUP);
         let mut startup = vec![
             card(
                 Icon::WindowStart,
@@ -1620,8 +1844,11 @@ impl Workspace {
         // The installer made its own Start menu shortcut; Arke's would only duplicate it.
         if crate::update::installed_by_setup() {
             startup.remove(0);
+            search::forget(&t!("settings.start_menu"));
         }
+        search::page(SEARCH);
         let search = search_page(s, cx);
+        search::page(ABOUT);
         let route_focused = page.route_input.focus_handle(cx).is_focused(window);
         let update = super::update_page::update_card(
             s,
@@ -1666,6 +1893,18 @@ impl Workspace {
                 ),
             ),
             card(
+                Icon::Explorer,
+                t!("onboarding.settings_title"),
+                Some(t!("onboarding.settings_desc")),
+                text_button(
+                    "setup-guide-open",
+                    t!("onboarding.settings_open"),
+                    cx.listener(|_, _: &ClickEvent, window, cx| {
+                        super::welcome::open_guide(window, cx);
+                    }),
+                ),
+            ),
+            card(
                 Icon::Bolt,
                 t!("whats_new.auto"),
                 Some(t!("whats_new.auto_desc")),
@@ -1687,11 +1926,14 @@ impl Workspace {
             super::uninstall_page::uninstall_card(cx),
         ];
         // Theme and colors first (material is Windows 11 only); the last five are layout.
+        // The groups' headings are noted too.
+        search::page(APPEARANCE);
         let layout = appearance.split_off(appearance.len() - 5);
         let appearance = vec![
             group(Some(t!("settings.group_colors")), appearance),
             group(Some(t!("settings.group_layout")), layout),
         ];
+        search::page(FILES);
         let mut files = regroup(
             files,
             &[
@@ -1703,7 +1945,12 @@ impl Workspace {
                 (Some(t!("settings.group_confirm")), &[9, 10]),
             ],
         );
-        files.push(group(Some(t!("settings.group_file_ops")), file_ops_rows(s)));
+        let copy_focused = page.copy_input.focus_handle(cx).is_focused(window);
+        files.push(group(
+            Some(t!("settings.group_file_ops")),
+            file_ops_rows(s, (&page.copy_input, copy_focused)),
+        ));
+        search::page(SORTING);
         let sorting = regroup(
             sorting,
             &[
@@ -1712,43 +1959,24 @@ impl Workspace {
                 (Some(t!("settings.group_details")), &[0, 1, 2, 6, 7]),
             ],
         );
+        search::page(STARTUP);
         let startup = regroup(startup, &[(None, &[3, 4, 5, 6, 7, 0, 1, 2])]);
+        search::page(ABOUT);
         let about = vec![about_header(), group(None, about)];
+        search::page(CONTEXT_MENU);
+        let menu = super::menuprefs::menu_section(s, &page.app_input, window, cx);
+        search::page(SHORTCUTS);
+        let shortcuts = super::shortcuts::section(&s.shortcuts, &page.shortcuts, window, cx);
         vec![
             (t!("settings.appearance"), Icon::Theme, appearance),
             (t!("settings.files"), Icon::FileExt, files),
             (t!("settings.sorting"), Icon::Sort, sorting),
             (t!("settings.startup"), Icon::Power, startup),
             (t!("settings.search"), Icon::Search, search),
-            (
-                t!("settings.context_menu"),
-                Icon::Menu,
-                super::menuprefs::menu_section(s, &page.app_input, window, cx),
-            ),
-            (
-                t!("settings.shortcuts"),
-                Icon::Bolt,
-                super::shortcuts::section(&s.shortcuts, &page.shortcuts, window, cx),
-            ),
+            (t!("settings.context_menu"), Icon::Menu, menu),
+            (t!("settings.shortcuts"), Icon::Bolt, shortcuts),
             (t!("settings.about"), Icon::Info, about),
         ]
-    }
-
-    /// Checks again whether QuickLook is running or installed, in the background, and redraws if
-    /// that changes what Settings offers. Cheap (see `quicklook.rs`), so it runs on every window
-    /// activation.
-    pub(super) fn recheck_quicklook(cx: &mut Context<Self>) {
-        // A thread of its own: the search may set up COM to read shortcuts.
-        let (tx, rx) = flume::bounded(1);
-        crate::explorer::spawn_thread("quicklook-recheck", move || {
-            let _ = tx.send(crate::quicklook::recheck());
-        });
-        cx.spawn(async move |this, cx| {
-            if rx.recv_async().await.unwrap_or(false) {
-                let _ = this.update(cx, |_, cx| cx.notify());
-            }
-        })
-        .detach();
     }
 
     /// "Open folder": selects the settings file in Windows Explorer, on a background thread.
@@ -1836,20 +2064,34 @@ fn single_click_card(s: &Settings) -> AnyElement {
 
 /// A line under a card's title row for one more of its choices: lined up with the title, without
 /// an icon of its own.
-fn sub_row(title: Cow<'static, str>, control: AnyElement) -> gpui::Div {
+fn sub_row(title: Cow<'static, str>, control: AnyElement) -> AnyElement {
+    sub_row_with(title, None, control)
+}
+
+/// [`sub_row`] with a second line under the title.
+fn sub_row_with(
+    title: Cow<'static, str>,
+    desc: Option<Cow<'static, str>>,
+    control: AnyElement,
+) -> AnyElement {
     let a11y = crate::a11y::active();
     let title = SharedString::from(title.into_owned());
-    div()
+    let spoken = desc.as_ref().map(|d| SharedString::from(d.to_string()));
+    let lit = search::note(&title, spoken.as_deref());
+    let row = div()
         .pl(theme::s_16() + icon_col() + theme::s_16())
         .pr(theme::s_16())
         .pb(theme::s_12())
         .flex()
         .items_center()
         .gap(theme::s_16())
-        .when(a11y, |d| d.child(crate::a11y::label_scope(title.clone())))
-        .child(row_text(title, None))
+        .when(a11y, |d| {
+            d.child(crate::a11y::described_scope(title.clone(), spoken))
+        })
+        .child(row_text(title, desc.map(row_desc)))
         .child(div().flex_none().child(control))
-        .when(a11y, |d| d.child(crate::a11y::end_label_scope()))
+        .when(a11y, |d| d.child(crate::a11y::end_label_scope()));
+    search::light(row, lit)
 }
 
 /// Tabs: where they go, then lines under it for one tab per folder, what Ctrl+T and closing the
@@ -1922,50 +2164,51 @@ fn tabs_card(s: &Settings, ui: &Ui) -> AnyElement {
         .into_any_element()
 }
 
-/// The preview pane switch, and when QuickLook (QL-Win) is running or installed, a chip beside it
-/// that hands Space to QuickLook (kept in this row rather than a row of its own).
-fn preview_controls(s: &crate::settings::Settings) -> AnyElement {
-    let toggle = switch("preview", s.preview_pane, |st| {
-        st.preview_pane = !st.preview_pane;
-    });
-    if !crate::quicklook::available() {
-        return toggle;
-    }
-    let on = s.space_quicklook;
-    let tip = SharedString::from(match crate::quicklook::exe() {
-        Some(exe) => t!("settings.space_quicklook_tip", path = exe.display()).into_owned(),
-        None => t!("settings.space_quicklook_tip_running").into_owned(),
-    });
-    let chip = div()
-        .id("space-quicklook")
-        .a11y_toggle(tip.clone(), on)
-        .h(theme::s_24())
-        .px(theme::s_12())
-        .flex()
-        .items_center()
-        .rounded(theme::R_FULL)
-        .border_1()
-        .cursor_pointer()
-        .text_size(theme::fs_12())
-        .tooltip(super::tooltip(tip))
-        .when(on, |d| {
-            d.bg(theme::signal_wash())
-                .border_color(theme::signal_line())
-                .text_color(theme::text())
-        })
-        .when(!on, |d| {
-            d.border_color(theme::line_strong())
-                .text_color(theme::text_subtle())
-                .hover(|s| s.bg(theme::wash()))
-        })
-        .child(t!("settings.space_quicklook").into_owned())
-        .on_click(|_, _, cx| set(cx, |st| st.space_quicklook = !st.space_quicklook));
+/// What the external copy program's empty field shows: its syntax by example (`external.rs`).
+const COPY_PLACEHOLDER: &str = "program.exe {op} {sources} {dest}";
+/// The same for the external preview program.
+const PREVIEW_PLACEHOLDER: &str = "program.exe {file}";
+
+/// The preview pane switch, and under it the external preview program for Space: a line of the
+/// same card, so the field doesn't squeeze the description beside the switch.
+fn preview_card(s: &crate::settings::Settings, input: (&Entity<TextInput>, bool)) -> AnyElement {
     div()
         .flex()
+        .flex_col()
+        .child(card(
+            Icon::Preview,
+            t!("settings.preview"),
+            Some(t!("settings.preview_desc")),
+            switch("preview", s.preview_pane, |st| {
+                st.preview_pane = !st.preview_pane;
+            }),
+        ))
+        .child(sub_row_with(
+            t!("settings.external_preview"),
+            Some(t!("settings.external_preview_desc")),
+            command_field(input),
+        ))
+        .into_any_element()
+}
+
+/// A text box for an external program's command line (`external.rs`), as wide as the update
+/// route's.
+fn command_field((input, focused): (&Entity<TextInput>, bool)) -> AnyElement {
+    div()
+        .w(theme::scaled_px(240.))
+        .h(theme::h_ctl())
+        .px(theme::s_8())
+        .flex()
         .items_center()
-        .gap(theme::s_12())
-        .child(chip)
-        .child(toggle)
+        .rounded(theme::r_8())
+        .border_1()
+        .when(focused, |d| {
+            d.bg(theme::surface()).border_color(theme::signal_line())
+        })
+        .when(!focused, |d| {
+            d.bg(theme::wash()).border_color(theme::line())
+        })
+        .child(input.clone())
         .into_any_element()
 }
 
@@ -2007,8 +2250,24 @@ fn about_header() -> AnyElement {
                             .into_owned(),
                         ),
                 )
-                .child(about_legal()),
+                .child(about_legal())
+                .child(about_star()),
         )
+        .into_any_element()
+}
+
+/// "Star Arke on GitHub": only opens the repository in the browser. Nothing is recorded and
+/// nothing depends on it.
+fn about_star() -> AnyElement {
+    // A row of its own so the button keeps its width instead of filling the column.
+    div()
+        .pt(theme::s_8())
+        .flex()
+        .child(text_button(
+            "about-star",
+            t!("settings.star_on_github"),
+            |_, _, cx| super::update_page::open_url(crate::build_info::SOURCE_URL, cx),
+        ))
         .into_any_element()
 }
 
@@ -2046,6 +2305,7 @@ fn about_link(
         .id(id)
         .debug_selector(move || id.to_owned())
         .a11y(gpui::Role::Link, name)
+        .key_stop()
         .cursor_pointer()
         .text_color(theme::signal())
         .hover(Styled::underline)
@@ -2058,7 +2318,7 @@ fn about_link(
 /// PC can open (Notepad by default), and opens it. On a background thread.
 fn open_licenses() {
     crate::explorer::spawn_thread("open-licenses", || {
-        let Some(dir) = crate::settings::data_dir() else {
+        let Some(dir) = crate::paths::local_dir() else {
             return;
         };
         let path = dir.join("THIRD_PARTY_LICENSES.txt");
@@ -2100,10 +2360,12 @@ fn regroup(
     out
 }
 
-/// Copy and move engine: the same-drive queue, verify after copy, and TeraCopy (only offered when
-/// it is installed; found in the background at startup).
-fn file_ops_rows(s: &crate::settings::Settings) -> Vec<AnyElement> {
-    let mut rows = vec![
+/// Copy and move engine: the same-drive queue, verify after copy, and the external copy program.
+fn file_ops_rows(
+    s: &crate::settings::Settings,
+    copy: (&Entity<TextInput>, bool),
+) -> Vec<AnyElement> {
+    vec![
         card(
             Icon::Drive,
             t!("settings.queue_same_drive"),
@@ -2120,18 +2382,13 @@ fn file_ops_rows(s: &crate::settings::Settings) -> Vec<AnyElement> {
                 st.verify_copies = !st.verify_copies;
             }),
         ),
-    ];
-    if let Some(exe) = crate::teracopy::found() {
-        rows.push(card(
+        card(
             Icon::Copy,
-            t!("settings.use_teracopy"),
-            Some(t!("settings.use_teracopy_desc", path = exe.display())),
-            switch("use-teracopy", s.use_teracopy, |st| {
-                st.use_teracopy = !st.use_teracopy;
-            }),
-        ));
-    }
-    rows
+            t!("settings.external_copy"),
+            None,
+            command_field(copy),
+        ),
+    ]
 }
 
 /// A settings group: small heading, one box, hairlines between rows, as in Windows 11 Settings.
@@ -2151,8 +2408,12 @@ pub(super) fn group_with(
             .when(ix > 0, |d| d.border_t_1().border_color(theme::line()))
             .child(row)
     });
+    let title = title.map(|t| SharedString::from(t.into_owned()));
+    let lit = title
+        .as_ref()
+        .and_then(|t| search::note(t, note.as_deref()));
     let heading = (title.is_some() || note.is_some()).then(|| {
-        div()
+        let heading = div()
             .pt(theme::s_16())
             .pb(theme::s_8())
             .px(theme::s_4())
@@ -2160,7 +2421,6 @@ pub(super) fn group_with(
             .flex_col()
             .gap(theme::s_2())
             .children(title.map(|t| {
-                let t = SharedString::from(t.into_owned());
                 // A heading screen readers can jump between (#322).
                 div()
                     .id(SharedString::from(format!("group-title-{t}")))
@@ -2176,7 +2436,8 @@ pub(super) fn group_with(
                     .text_size(theme::fs_12())
                     .text_color(theme::text_subtle())
                     .child(SharedString::from(n.into_owned()))
-            }))
+            }));
+        search::light(heading, lit)
     });
     div()
         .flex()
@@ -2228,7 +2489,8 @@ fn row_with(
 ) -> AnyElement {
     // The switch or dropdown on the right is named after the row for screen readers.
     let a11y = crate::a11y::active();
-    div()
+    let lit = search::note(&title, spoken.as_deref());
+    let row = div()
         .min_h(card_min_h())
         .px(theme::s_16())
         .py(theme::s_12())
@@ -2241,8 +2503,8 @@ fn row_with(
         .child(row_icon(icon, theme::text_muted()))
         .child(row_text(title, desc))
         .child(div().flex_none().child(control))
-        .when(a11y, |d| d.child(crate::a11y::end_label_scope()))
-        .into_any_element()
+        .when(a11y, |d| d.child(crate::a11y::end_label_scope()));
+    search::light(row, lit)
 }
 
 /// A row whose control is a set of chips: they wrap to more lines as the row narrows, and the
@@ -2258,7 +2520,8 @@ fn wrapping_card(
     let title = title.into();
     let a11y = crate::a11y::active();
     let spoken = desc.as_ref().map(|d| SharedString::from(d.to_string()));
-    div()
+    let lit = search::note(&title, spoken.as_deref());
+    let row = div()
         .debug_selector(move || id.to_owned())
         .min_h(card_min_h())
         .px(theme::s_16())
@@ -2272,8 +2535,8 @@ fn wrapping_card(
         .child(row_icon(icon, theme::text_muted()))
         .child(row_text(title, desc.map(row_desc)).min_w(gpui::relative(1. / 3.)))
         .child(div().min_w_0().child(control))
-        .when(a11y, |d| d.child(crate::a11y::end_label_scope()))
-        .into_any_element()
+        .when(a11y, |d| d.child(crate::a11y::end_label_scope()));
+    search::light(row, lit)
 }
 
 /// Icon centered in the fixed icon column.
@@ -2311,6 +2574,18 @@ pub(super) fn row_desc(text: Cow<'static, str>) -> AnyElement {
         .text_color(theme::text_subtle())
         .child(SharedString::from(text.into_owned()))
         .into_any_element()
+}
+
+/// The "Folders" dropdown's options (#499): before files (File Explorer), always first, mixed.
+fn folder_order_options() -> [(FolderOrder, Cow<'static, str>); 3] {
+    [
+        (FolderOrder::First, t!("settings.folders_first")),
+        (
+            FolderOrder::AlwaysFirst,
+            t!("settings.folders_always_first"),
+        ),
+        (FolderOrder::Mixed, t!("settings.folders_mixed")),
+    ]
 }
 
 /// Dropdown for picking one of a few options. The button shows the current value; the list checks the selected one.
@@ -2368,6 +2643,7 @@ pub(super) fn choice_with<T: Copy + PartialEq + 'static>(
         .id(id)
         .debug_selector(move || id.to_owned())
         .a11y_combo(label.clone(), open)
+        .key_stop()
         .h(theme::h_ctl())
         .min_w(dropdown_min_w())
         .pl(theme::s_12())
@@ -2433,7 +2709,8 @@ pub(super) fn choice_with<T: Copy + PartialEq + 'static>(
     let button = button
         .on_click({
             let open_list = std::rc::Rc::clone(&open_list);
-            move |_, _, cx| open_list(false, cx)
+            // Opened by Space or Enter: the keyboard cursor shows in the list.
+            move |event: &ClickEvent, _, cx| open_list(event.is_keyboard(), cx)
         })
         .a11y_on_expand({
             let workspace = workspace.clone();
@@ -2620,7 +2897,8 @@ pub(super) fn expander(
     cx: &mut Context<Workspace>,
 ) -> AnyElement {
     let title: SharedString = title.into();
-    div()
+    let lit = search::note(&title, Some(&*desc));
+    let card = div()
         .flex()
         .flex_col()
         .child(
@@ -2640,6 +2918,7 @@ pub(super) fn expander(
                     }
                     cx.notify();
                 })
+                .key_stop()
                 .min_h(card_min_h())
                 .px(theme::s_16())
                 .py(theme::s_12())
@@ -2685,8 +2964,8 @@ pub(super) fn expander(
                         crate::motion::slide_in(el, t, 0., -ANIM_SLIDE)
                     }),
             )
-        })
-        .into_any_element()
+        });
+    search::light(card, lit)
 }
 
 /// Right side of an expander header: the current value as text.
@@ -2720,19 +2999,19 @@ fn look_summary(color: gpui::Rgba, label: String) -> AnyElement {
 
 /// Colors of a preview tile's mini window.
 #[derive(Clone, Copy)]
-struct TileLook {
-    frame: gpui::Rgba,
-    paper: gpui::Rgba,
+pub(super) struct TileLook {
+    pub(super) frame: gpui::Rgba,
+    pub(super) paper: gpui::Rgba,
     /// Selected row label.
-    ink: gpui::Rgba,
+    pub(super) ink: gpui::Rgba,
     /// Sidebar and secondary lines.
-    faint: gpui::Rgba,
-    accent: gpui::Rgba,
+    pub(super) faint: gpui::Rgba,
+    pub(super) accent: gpui::Rgba,
 }
 
 impl TileLook {
     /// Current theme with these surfaces (`frame`, `paper`) and accent.
-    fn current((frame, paper): (gpui::Rgba, gpui::Rgba), accent: gpui::Rgba) -> Self {
+    pub(super) fn current((frame, paper): (gpui::Rgba, gpui::Rgba), accent: gpui::Rgba) -> Self {
         Self {
             frame,
             paper,
@@ -2835,7 +3114,7 @@ fn look_tile(
     selected: bool,
     surfaces: (gpui::Rgba, gpui::Rgba),
     accent: gpui::Rgba,
-    apply: impl Fn(&mut Settings) + 'static,
+    pick: &Pick,
 ) -> AnyElement {
     let (width, height) = LOOK_TILE;
     let look = TileLook::current(surfaces, accent);
@@ -2845,8 +3124,84 @@ fn look_tile(
         selected,
         (width, height),
         mini_window(look, width).into_any_element(),
-        apply,
+        pick,
     )
+}
+
+/// What picking a tile sets, shared by its click and the arrow keys of its group; whether it is
+/// read as focused (its group has the focus and it is the picked one); whether it shows the
+/// ring (that, by keyboard).
+type Pick = (Apply, bool, bool);
+
+/// Sets what a tile stands for.
+type Apply = Rc<dyn Fn(&mut Settings)>;
+
+/// Whether a tile group has the focus, and whether by keyboard.
+pub(super) type Held = (bool, bool);
+
+/// What picking a tile does, when it is not a setting of its own (the setup guide's choices,
+/// held until a step is confirmed).
+pub(super) type OnPick = Rc<dyn Fn(&mut App)>;
+
+/// [`Pick`] for a tile setting `apply`, picked or not, in a group `held` as given.
+fn pick(apply: impl Fn(&mut Settings) + 'static, (focused, keys): Held, selected: bool) -> Pick {
+    (Rc::new(apply), focused && selected, keys && selected)
+}
+
+/// Tiles of one choice (theme, accent, tint), as a Windows radio group: one tab stop, the arrows
+/// pick the previous or next tile (round from the last to the first), Home and End the first and
+/// last, and a screen reader reads the picked tile as focused (#322).
+fn radio_group(
+    id: &'static str,
+    label: Cow<'static, str>,
+    focus: &FocusHandle,
+    picks: Vec<Apply>,
+    selected: Option<usize>,
+    tiles: Vec<AnyElement>,
+) -> gpui::Stateful<gpui::Div> {
+    let picks = picks
+        .into_iter()
+        .map(|apply| -> OnPick { Rc::new(move |cx: &mut App| set(cx, |s| apply(s))) })
+        .collect();
+    radio_group_with(id, label, focus, picks, selected, tiles)
+}
+
+/// [`radio_group`] whose tiles do `picks` instead of setting a setting each.
+pub(super) fn radio_group_with(
+    id: &'static str,
+    label: Cow<'static, str>,
+    focus: &FocusHandle,
+    picks: Vec<OnPick>,
+    selected: Option<usize>,
+    tiles: Vec<AnyElement>,
+) -> gpui::Stateful<gpui::Div> {
+    let count = picks.len();
+    div()
+        .id(id)
+        .a11y(gpui::Role::RadioGroup, label.into_owned())
+        .track_focus(focus)
+        .key_stop_plain()
+        .on_key_down(move |event: &gpui::KeyDownEvent, _, cx| {
+            if event.keystroke.modifiers.modified() || count == 0 {
+                return;
+            }
+            let at = selected.unwrap_or(0);
+            let to = match event.keystroke.key.as_str() {
+                // None picked yet (a custom color): the first.
+                "left" | "up" | "right" | "down" if selected.is_none() => 0,
+                "left" | "up" => (at + count - 1) % count,
+                "right" | "down" => (at + 1) % count,
+                "home" => 0,
+                "end" => count - 1,
+                _ => return,
+            };
+            cx.stop_propagation();
+            picks[to](cx);
+        })
+        .flex()
+        .flex_wrap()
+        .gap(theme::s_8())
+        .children(tiles)
 }
 
 /// Tile shared by the theme, accent and tint options: `preview` on top (`size` is its width and
@@ -2855,14 +3210,38 @@ fn tile(
     id: (&'static str, usize),
     label: String,
     selected: bool,
+    size: (f32, f32),
+    preview: AnyElement,
+    (apply, claim, ring): &Pick,
+) -> AnyElement {
+    let apply = Rc::clone(apply);
+    let on_pick: OnPick = Rc::new(move |cx: &mut App| {
+        let apply = Rc::clone(&apply);
+        set(cx, move |s| apply(s));
+    });
+    tile_with(id, label, selected, size, preview, (*claim, *ring), on_pick)
+}
+
+/// [`tile`] that does `on_pick` when picked; `(claim, ring)`: read as focused, and showing the
+/// keyboard ring (see [`Pick`]).
+pub(super) fn tile_with(
+    id: (&'static str, usize),
+    label: String,
+    selected: bool,
     (width, height): (f32, f32),
     preview: AnyElement,
-    apply: impl Fn(&mut Settings) + 'static,
+    (claim, ring): (bool, bool),
+    on_pick: OnPick,
 ) -> AnyElement {
-    div()
+    let tile = div()
         .id(id)
+        .debug_selector(move || format!("{}-{}", id.0, id.1))
         .a11y_lazy(gpui::Role::RadioButton, || label.clone())
         .aria_toggled(crate::a11y::toggled(selected))
+        .when(
+            claim,
+            gpui::StatefulInteractiveElement::aria_active_descendant,
+        )
         .w(px(width))
         .flex()
         .flex_col()
@@ -2894,13 +3273,33 @@ fn tile(
                         .child(label),
                 ),
         )
-        .on_click(move |_, _, cx| set(cx, |s| apply(s)))
+        .on_click(move |_, _, cx| on_pick(cx));
+    // The keyboard ring: outside the tile, whose preview covers its inside, and in the text color,
+    // as the accent already marks the picked tile. The frame is always there (clear when not
+    // shown) and its room is taken back with a negative margin, so nothing moves.
+    let room = px(4.);
+    div()
+        .m(-room)
+        .p(px(2.))
+        .rounded(theme::r_8() + room)
+        .border_2()
+        .border_color(if ring { theme::text() } else { theme::clear() })
+        .child(tile)
         .into_any_element()
 }
 
 /// Theme options: light, dark, and follow Windows (half light, half dark).
-fn theme_body(s: &Settings) -> AnyElement {
-    let (width, height) = THEME_TILE;
+fn theme_body(s: &Settings, focus: &FocusHandle, held: Held) -> AnyElement {
+    theme_tiles(s, focus, held, THEME_TILE)
+}
+
+/// The theme tiles at `size` (preview width and height), which the setup guide draws smaller.
+pub(super) fn theme_tiles(
+    s: &Settings,
+    focus: &FocusHandle,
+    held: Held,
+    (width, height): (f32, f32),
+) -> AnyElement {
     let window = |dark: bool, gray: bool| mini_window(TileLook::mode(dark, gray), width);
     // The dark half shows the right side of the same window, so the two halves line up.
     let half = width / 2.;
@@ -2951,33 +3350,38 @@ fn theme_body(s: &Settings) -> AnyElement {
         ),
         (ThemeMode::System, None, t!("settings.theme_system"), system),
     ];
-    div()
-        .flex()
-        .flex_wrap()
-        .gap(theme::s_8())
-        .children(
-            options
-                .into_iter()
-                .enumerate()
-                .map(|(ix, (mode, shade, label, preview))| {
-                    let selected =
-                        s.theme == mode && shade.is_none_or(|shade| s.dark_shade == shade);
-                    tile(
-                        ("theme", ix),
-                        label.into_owned(),
-                        selected,
-                        (width, height),
-                        preview,
-                        move |st| {
-                            st.theme = mode;
-                            if let Some(shade) = shade {
-                                st.dark_shade = shade;
-                            }
-                        },
-                    )
-                }),
-        )
-        .into_any_element()
+    let mut picks = Vec::new();
+    let mut at = None;
+    let tiles = options
+        .into_iter()
+        .enumerate()
+        .map(|(ix, (mode, shade, label, preview))| {
+            let selected = s.theme == mode && shade.is_none_or(|shade| s.dark_shade == shade);
+            if selected {
+                at = Some(ix);
+            }
+            let pick = pick(
+                move |st| {
+                    st.theme = mode;
+                    if let Some(shade) = shade {
+                        st.dark_shade = shade;
+                    }
+                },
+                held,
+                selected,
+            );
+            picks.push(Rc::clone(&pick.0));
+            tile(
+                ("theme", ix),
+                label.into_owned(),
+                selected,
+                (width, height),
+                preview,
+                &pick,
+            )
+        })
+        .collect();
+    radio_group("theme-tiles", t!("settings.theme"), focus, picks, at, tiles).into_any_element()
 }
 
 /// Right side of the Theme header: the current choice.
@@ -3028,47 +3432,73 @@ fn tint_color(s: &Settings) -> Option<u32> {
 }
 
 /// Accent options: a preview tile per swatch, plus custom (hue strip and hex input).
-fn accent_body(s: &Settings, input: &Entity<TextInput>, window: &Window, cx: &App) -> AnyElement {
+fn accent_body(
+    s: &Settings,
+    input: &Entity<TextInput>,
+    focus: &FocusHandle,
+    window: &Window,
+    cx: &App,
+) -> AnyElement {
     let frame = (
         theme::tint_preview(tint_color(s)),
         theme::paper_preview(tint_color(s)),
     );
     let current = s.accent;
-    let mut tiles = vec![look_tile(
+    let focused = focus.is_focused(window);
+    let held = (focused, focused && window.last_input_was_keyboard());
+    let mut options = vec![(
         ("accent", 0),
         t!("accent.arke").into_owned(),
-        current == Accent::Arke,
-        frame,
+        Accent::Arke,
         theme::accent_default(),
-        |st| st.accent = Accent::Arke,
     )];
-    tiles.extend(
+    options.extend(
         theme::ACCENT_PRESETS
             .iter()
             .enumerate()
             .map(|(ix, &(name, color))| {
-                look_tile(
+                (
                     ("accent", ix + 1),
                     accent_name(name).into_owned(),
-                    current == Accent::Color(color),
-                    frame,
+                    Accent::Color(color),
                     theme::accent_preview(color),
-                    move |st| st.accent = Accent::Color(color),
                 )
             }),
     );
     if let Some(system) = crate::win::system_accent() {
-        tiles.push(look_tile(
+        options.push((
             ("accent-windows", 0),
             t!("settings.accent_windows").into_owned(),
-            current == Accent::Windows,
-            frame,
+            Accent::Windows,
             theme::accent_preview(system),
-            |st| st.accent = Accent::Windows,
         ));
     }
+    let mut picks = Vec::new();
+    let mut at = None;
+    let tiles = options
+        .into_iter()
+        .enumerate()
+        .map(|(ix, (id, label, accent, preview))| {
+            let selected = current == accent;
+            if selected {
+                at = Some(ix);
+            }
+            let pick = pick(move |st| st.accent = accent, held, selected);
+            picks.push(Rc::clone(&pick.0));
+            look_tile(id, label, selected, frame, preview, &pick)
+        })
+        .collect();
+    let tiles = radio_group(
+        "accent-tiles",
+        t!("settings.accent"),
+        focus,
+        picks,
+        at,
+        tiles,
+    );
     let focused = input.focus_handle(cx).is_focused(window);
     let code = div()
+        .debug_selector(|| "accent-code".to_owned())
         .w(crate::theme::scaled_px(96.))
         .h(theme::h_ctl_sm())
         .px(theme::s_8())
@@ -3088,7 +3518,7 @@ fn accent_body(s: &Settings, input: &Entity<TextInput>, window: &Window, cx: &Ap
         .flex()
         .flex_col()
         .gap(theme::s_16())
-        .child(div().flex().flex_wrap().gap(theme::s_8()).children(tiles))
+        .child(tiles)
         .child(
             div()
                 .flex()
@@ -3108,54 +3538,41 @@ fn accent_body(s: &Settings, input: &Entity<TextInput>, window: &Window, cx: &Ap
 }
 
 /// Background tint options: neutral gray, follow accent, and a preview tile per swatch.
-fn tint_body(s: &Settings) -> AnyElement {
+fn tint_body(s: &Settings, focus: &FocusHandle, held: Held) -> AnyElement {
     let accent = theme::signal();
     let current = s.tint;
-    let mut tiles = vec![
-        look_tile(
-            ("tint", 0),
-            t!("tint.none").into_owned(),
-            current == Tint::None,
-            (theme::tint_preview(None), theme::paper_preview(None)),
-            accent,
-            |st| st.tint = Tint::None,
-        ),
-        look_tile(
-            ("tint", 1),
+    let surfaces = |color: Option<u32>| (theme::tint_preview(color), theme::paper_preview(color));
+    let mut options = vec![
+        (t!("tint.none").into_owned(), Tint::None, surfaces(None)),
+        (
             t!("tint.accent").into_owned(),
-            current == Tint::Accent,
-            (
-                theme::tint_preview(Some(accent_color(s.accent))),
-                theme::paper_preview(Some(accent_color(s.accent))),
-            ),
-            accent,
-            |st| st.tint = Tint::Accent,
+            Tint::Accent,
+            surfaces(Some(accent_color(s.accent))),
         ),
     ];
-    tiles.extend(
-        theme::ACCENT_PRESETS
-            .iter()
-            .enumerate()
-            .map(|(ix, &(name, color))| {
-                look_tile(
-                    ("tint", ix + 2),
-                    accent_name(name).into_owned(),
-                    current == Tint::Color(color),
-                    (
-                        theme::tint_preview(Some(color)),
-                        theme::paper_preview(Some(color)),
-                    ),
-                    accent,
-                    move |st| st.tint = Tint::Color(color),
-                )
-            }),
-    );
-    div()
-        .flex()
-        .flex_wrap()
-        .gap(theme::s_8())
-        .children(tiles)
-        .into_any_element()
+    options.extend(theme::ACCENT_PRESETS.iter().map(|&(name, color)| {
+        (
+            accent_name(name).into_owned(),
+            Tint::Color(color),
+            surfaces(Some(color)),
+        )
+    }));
+    let mut picks = Vec::new();
+    let mut at = None;
+    let tiles = options
+        .into_iter()
+        .enumerate()
+        .map(|(ix, (label, tint, look))| {
+            let selected = current == tint;
+            if selected {
+                at = Some(ix);
+            }
+            let pick = pick(move |st| st.tint = tint, held, selected);
+            picks.push(Rc::clone(&pick.0));
+            look_tile(("tint", ix), label, selected, look, accent, &pick)
+        })
+        .collect();
+    radio_group("tint-tiles", t!("settings.tint"), focus, picks, at, tiles).into_any_element()
 }
 
 /// Font: every installed font, with the default first.
@@ -3505,16 +3922,50 @@ fn background_body(
 /// Opacity slider, 0 to 100 %. Press anywhere on it to jump there, drag to adjust; the setting
 /// (and the list behind) follows while dragging.
 fn opacity_slider(value: u8, dragging: std::rc::Rc<std::cell::Cell<bool>>) -> AnyElement {
-    crate::slider::slider(
-        f32::from(value.min(100)) / 100.,
+    let value = value.min(100);
+    let track = crate::slider::slider(
+        f32::from(value) / 100.,
         dragging,
         // 0 to 1 in, 0 to 100 out: the cast can't truncate.
         std::rc::Rc::new(|fraction: f32, _: &mut Window, cx: &mut App| {
             set_backdrop_opacity((fraction * 100.).round() as u8, cx);
         }),
     )
-    .w(slider_w())
-    .into_any_element()
+    .w(slider_w());
+    // A tab stop of its own: Left and Right move it by 5, Page Up and Page Down by 20, Home and
+    // End to either end, as a Windows slider (#322).
+    div()
+        .id("backdrop-opacity")
+        .a11y(
+            gpui::Role::Slider,
+            t!("settings.background_opacity").into_owned(),
+        )
+        .a11y_node(move |node| {
+            node.set_numeric_value(f64::from(value));
+            node.set_min_numeric_value(0.);
+            node.set_max_numeric_value(100.);
+            node.set_numeric_value_step(5.);
+        })
+        .key_stop()
+        .rounded(theme::r_8())
+        .on_key_down(move |event: &gpui::KeyDownEvent, _, cx| {
+            if event.keystroke.modifiers.modified() {
+                return;
+            }
+            let to = match event.keystroke.key.as_str() {
+                "left" | "down" => value.saturating_sub(5),
+                "right" | "up" => value.saturating_add(5).min(100),
+                "pagedown" => value.saturating_sub(20),
+                "pageup" => value.saturating_add(20).min(100),
+                "home" => 0,
+                "end" => 100,
+                _ => return,
+            };
+            cx.stop_propagation();
+            set_backdrop_opacity(to, cx);
+        })
+        .child(track)
+        .into_any_element()
 }
 
 fn set_backdrop_opacity(value: u8, cx: &mut App) {
@@ -3537,6 +3988,7 @@ fn column_toggles(s: &Settings) -> AnyElement {
         div()
             .id(("col-chip", col as usize))
             .a11y_toggle(col.label().into_owned(), on)
+            .key_stop()
             .h(theme::s_24())
             .px(theme::s_12())
             .flex()
@@ -3613,6 +4065,25 @@ pub(crate) fn switch(
     on: bool,
     toggle: impl Fn(&mut Settings) + 'static,
 ) -> AnyElement {
+    switch_with(id, on, toggle, true)
+}
+
+/// [`switch`] that Tab doesn't stop at and a click doesn't focus, for a flyout over the folder:
+/// the keys stay with the folder (the view options' tree switch).
+pub(crate) fn flyout_switch(
+    id: &'static str,
+    on: bool,
+    toggle: impl Fn(&mut Settings) + 'static,
+) -> AnyElement {
+    switch_with(id, on, toggle, false)
+}
+
+fn switch_with(
+    id: &'static str,
+    on: bool,
+    toggle: impl Fn(&mut Settings) + 'static,
+    stop: bool,
+) -> AnyElement {
     // Track inner width is 32 (40 minus border and padding) and the thumb is 14, so it travels 18.
     const TRAVEL: f32 = 18.;
     let track_color = |on: bool| {
@@ -3661,6 +4132,7 @@ pub(crate) fn switch(
     let track = div()
         .id(id)
         .a11y_switch(on)
+        .when(stop, KeyStop::key_stop)
         .debug_selector(|| id.to_owned())
         .w(crate::theme::scaled_px(40.))
         .h(crate::theme::scaled_px(20.))
@@ -3789,6 +4261,7 @@ pub(super) fn text_button(
         .id(id)
         .debug_selector(move || id.to_owned())
         .a11y_row_button(label.clone())
+        .key_stop()
         .h(theme::h_ctl_sm())
         .px(theme::s_12())
         .flex()
@@ -4186,4 +4659,29 @@ fn network_row(
         )
         .child(div().flex_none().child(button))
         .into_any_element()
+}
+
+#[cfg(test)]
+mod folder_order_tests {
+    use super::*;
+
+    /// #499: the Folders dropdown has three choices, each with its own words and value.
+    #[test]
+    fn the_folders_dropdown_has_three_options() {
+        let options = folder_order_options();
+        let values: Vec<FolderOrder> = options.iter().map(|(v, _)| *v).collect();
+        assert_eq!(
+            values,
+            [
+                FolderOrder::First,
+                FolderOrder::AlwaysFirst,
+                FolderOrder::Mixed
+            ]
+        );
+        let mut labels: Vec<String> = options.iter().map(|(_, l)| l.to_string()).collect();
+        assert!(labels.iter().all(|l| !l.is_empty()));
+        labels.sort();
+        labels.dedup();
+        assert_eq!(labels.len(), 3, "three different labels");
+    }
 }

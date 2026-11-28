@@ -72,6 +72,10 @@ pub(crate) enum ShellError {
     /// There are no files to put on (or read from) the clipboard.
     #[error("{}", t!("clip.empty"))]
     ClipboardEmpty,
+    /// Remote items that couldn't go on the clipboard as virtual files are too large to download
+    /// for it.
+    #[error("{}", t!("clip.remote_too_large"))]
+    RemoteClipTooLarge,
     /// Clipboard memory could not be locked.
     #[error("{}", t!("clip.lock_failed"))]
     ClipboardLock,
@@ -359,6 +363,9 @@ pub(crate) enum ShellMenuEntry {
         #[serde(default)]
         verb: Option<String>,
         label: String,
+        /// Its access key (`&O` in Windows' text), kept apart from `label`.
+        #[serde(default)]
+        access: Option<crate::win_menu::Access>,
         enabled: bool,
         checked: bool,
         /// Default command (Windows draws it bold).
@@ -368,6 +375,8 @@ pub(crate) enum ShellMenuEntry {
     },
     Submenu {
         label: String,
+        #[serde(default)]
+        access: Option<crate::win_menu::Access>,
         enabled: bool,
         #[serde(with = "icon_wire")]
         icon: Option<arke_core::thumbs::Thumbnail>,
@@ -679,6 +688,9 @@ pub(crate) struct OpProgress {
     /// Work reported by Windows (done/total); total is 0 while still counting.
     pub(crate) work_done: std::sync::atomic::AtomicU64,
     pub(crate) work_total: std::sync::atomic::AtomicU64,
+    /// `work_done` and `work_total` count bytes (or work weighted by bytes), not items: until
+    /// some is done, the total is no count of items to show.
+    pub(crate) work_in_bytes: std::sync::atomic::AtomicBool,
     /// Bytes of files finished copying or moving across volumes, for speed. Same-volume moves are renames and do not count.
     pub(crate) bytes: std::sync::atomic::AtomicU64,
     /// Total size to copy, computed in the background at start (0 if unknown or too many to count).
@@ -978,6 +990,34 @@ pub(crate) trait Shell: Send + Sync + 'static {
     ) -> Result<Option<crate::win_virtual_drop::VirtualDrop>, ShellError> {
         Ok(None)
     }
+    /// Puts remote items on the clipboard as virtual files (#529): other programs read their
+    /// bytes from the server as they paste. Returns the clipboard sequence number. Downloads and
+    /// lists nothing. Background thread.
+    fn set_clipboard_remote(
+        &self,
+        items: &Arc<crate::remote_shell::RemoteItems>,
+    ) -> Result<u32, ShellError> {
+        let _ = items;
+        Err(ShellError::Unsupported)
+    }
+    /// Whether the remote items [`Shell::set_clipboard_remote`] put there with sequence number
+    /// `seq` are still on the clipboard (programs reading a format can move the number on).
+    /// Does not open the clipboard or block; UI thread safe.
+    fn clipboard_is_remote(&self, seq: u32) -> bool {
+        let _ = seq;
+        false
+    }
+    /// Drags remote items into another program as virtual files, offering copy only; like
+    /// [`Shell::drag_out`]. Their listing must be made already. UI thread.
+    fn drag_out_remote(
+        &self,
+        items: &Arc<crate::remote_shell::RemoteItems>,
+        image: Option<&DragImage>,
+        after_lost_press: bool,
+    ) -> Result<DragOutEnd, ShellError> {
+        let _ = (items, image, after_lost_press);
+        Ok(DragOutEnd::Finished)
+    }
     /// Clears the clipboard after a cut and paste, only if the sequence is still `seq` so later copies survive. Background thread.
     fn clear_clipboard_if(&self, seq: u32);
     /// Clipboard sequence number; changes on every content change. Does not open the clipboard or block; UI thread safe.
@@ -985,8 +1025,11 @@ pub(crate) trait Shell: Send + Sync + 'static {
     /// Whether the clipboard has files, virtual ones included (format check only, clipboard not opened). UI thread safe.
     fn clipboard_has_files(&self) -> bool;
 
-    /// Whether the path is on a fixed local disk (thumbnails and system icons are local only). Background thread.
+    /// Whether the path is on a local disk: internal, USB stick, SD card or RAM disk, but not a
+    /// network or optical drive (thumbnails, folder sizes and cloud status are local only). Background thread.
     fn is_local_disk(&self, path: &Path) -> bool;
+    /// Whether the path is on an internal fixed disk (not removable). Background thread.
+    fn is_fixed_disk(&self, path: &Path) -> bool;
     /// Whether deleting `path` can go to the Recycle Bin. Windows has none on network shares, USB
     /// sticks and optical discs, and deletes there permanently. Reads local drive info only, so
     /// it is fine on the UI thread.
@@ -999,8 +1042,9 @@ pub(crate) trait Shell: Send + Sync + 'static {
 
     /// The icon Windows has for files of type `ext` (lowercase, no dot) from the program
     /// registered for it; `None` when none is registered (the theme icon stays). Reads no file.
-    /// Background thread.
-    fn type_icon(&self, _ext: &str) -> Option<arke_core::thumbs::Thumbnail> {
+    /// `px` is the physical size it will be drawn at (the system's own frame for it is used when
+    /// it has one; 0 for the largest available). Background thread.
+    fn type_icon(&self, _ext: &str, _px: u32) -> Option<arke_core::thumbs::Thumbnail> {
         None
     }
 
@@ -1171,10 +1215,17 @@ pub(crate) trait Shell: Send + Sync + 'static {
         let _ = (command_line, dir);
         Err(ShellError::Unsupported)
     }
-    /// Toggles QuickLook's preview of `item` (see `quicklook.rs`): over its pipe when it's running,
-    /// otherwise by starting `exe` (if found) with it. Returns once handed off. Background thread.
-    fn run_quicklook(&self, exe: Option<&Path>, item: &Path) -> Result<(), ShellError> {
-        let _ = (exe, item);
+    /// Starts `program` with `args` as its command line, as is (`external.rs` quotes the paths in
+    /// it): directly, never through a shell. Returns once it has started. Background thread.
+    fn run_program(&self, program: &Path, args: &std::ffi::OsStr) -> Result<(), ShellError> {
+        let _ = (program, args);
+        Err(ShellError::Unsupported)
+    }
+    /// Writes one line to the named pipe `pipe` (`\\.\pipe\...`) and closes it, for the external
+    /// preview program (`external.rs`). A pipe that doesn't exist is `Io` with `NotFound`, at
+    /// once; a busy one is waited for a short while. Background thread.
+    fn write_pipe(&self, pipe: &str, line: &str) -> Result<(), ShellError> {
+        let _ = (pipe, line);
         Err(ShellError::Unsupported)
     }
     /// Local (year, month, day, hour, minute, second), for archive modification times. Pure.
@@ -1184,6 +1235,13 @@ pub(crate) trait Shell: Send + Sync + 'static {
     }
     /// Decodes non-UTF-8 archive entry names with the system ANSI code page (Big5 on Traditional Chinese Windows). Pure.
     fn decode_ansi(&self, bytes: &[u8]) -> String;
+    /// The local drive holding `path` is solid state, where reading or writing many files at once
+    /// beats one after another (a zip is extracted on several threads). `false` when unknown.
+    /// Background thread.
+    fn solid_state(&self, path: &Path) -> bool {
+        let _ = path;
+        false
+    }
 
     /// Network location checks (probing servers, mapped drives). `None` disables probing and network folder tracking (tests).
     fn net_probe(&self) -> Option<std::sync::Arc<dyn arke_core::net::NetProbe>> {
@@ -1199,10 +1257,6 @@ pub(crate) trait Shell: Send + Sync + 'static {
     fn net_disconnect(&self, drive: &Path) -> Result<(), ShellError> {
         let _ = drive;
         Err(ShellError::Unsupported)
-    }
-    /// Installed programs suitable for "Open with" (name, exe). Background thread (checks that files exist).
-    fn editor_apps(&self) -> Vec<(String, PathBuf)> {
-        Vec::new()
     }
     /// Start at Windows sign-in by adding or removing a shortcut in the user's Startup folder, no registry.
     /// Background thread.
@@ -1265,6 +1319,37 @@ pub(crate) trait Shell: Send + Sync + 'static {
         let _ = (dir, items);
         CloudScan::default()
     }
+    /// Of `plain` (items of `dir`, a folder inside a sync root, whose listed attributes say they
+    /// aren't placeholders), the ones that really aren't (not synced), and the placeholders among
+    /// them the sync client hasn't marked in sync. A listing can give a placeholder without its
+    /// reparse point attribute (#319). Reads placeholder info only, nothing is downloaded.
+    /// Background thread.
+    fn cloud_verify(&self, dir: &Path, plain: Vec<Arc<str>>) -> (Vec<Arc<str>>, Vec<Arc<str>>) {
+        let _ = dir;
+        (plain, Vec::new())
+    }
+    /// Tells the shell that the pane `slot` shows `visit.dir`, a folder inside a cloud sync root,
+    /// the way File Explorer announces every folder it opens: some sync clients only fill a folder
+    /// with its online-only items once a shell window shows it (#319, `win_folder_visit.rs`). The
+    /// announcement lasts until the next call for the same pane; `None`: the pane left the folder
+    /// (or closed). Names the folder only, nothing is downloaded. Returns at once (the
+    /// announcement runs on its own thread), so it may be called on the UI thread.
+    fn folder_visit(&self, slot: u64, visit: Option<FolderVisit>) {
+        let _ = (slot, visit);
+    }
+}
+
+/// A folder a pane shows, for [`Shell::folder_visit`]. The callbacks run on another thread.
+pub(crate) struct FolderVisit {
+    /// The pane's window (`HWND`); `None` when it has none (tests).
+    pub(crate) window: Option<isize>,
+    pub(crate) dir: PathBuf,
+    /// Something hints that the folder's items changed (a sync client may have added
+    /// placeholders without a watcher event): list it again.
+    pub(crate) changed: Box<dyn Fn() + Send>,
+    /// A "Show in folder" caller that found the announcement selected these items of the folder
+    /// (all of them so far, in order).
+    pub(crate) select: Box<dyn Fn(Vec<Arc<str>>) + Send>,
 }
 
 /// A rendered PDF page.

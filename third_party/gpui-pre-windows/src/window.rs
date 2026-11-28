@@ -50,6 +50,10 @@ pub struct WindowsWindowState {
     pub border_offset: WindowBorderOffset,
     pub appearance: Cell<WindowAppearance>,
     pub background_appearance: Cell<WindowBackgroundAppearance>,
+    /// zed#63821: whether the window is active, tracked from `WM_ACTIVATE`. Decides
+    /// whether the inactive top border is shown; see
+    /// [`WindowsWindowInner::update_top_border`].
+    pub active: Cell<bool>,
     pub scale_factor: Cell<f32>,
     pub restore_from_minimized: Cell<Option<Box<dyn FnMut(RequestFrameOptions)>>>,
 
@@ -182,6 +186,8 @@ impl WindowsWindowState {
             border_offset,
             appearance: Cell::new(appearance),
             background_appearance: Cell::new(WindowBackgroundAppearance::Opaque),
+            // zed#63821
+            active: Cell::new(false),
             scale_factor: Cell::new(scale_factor),
             restore_from_minimized: Cell::new(restore_from_minimized),
             min_size,
@@ -238,9 +244,13 @@ impl WindowsWindowState {
                 length: std::mem::size_of::<WINDOWPLACEMENT>() as u32,
                 ..Default::default()
             };
-            GetWindowPlacement(self.hwnd, &mut placement)
-                .context("failed to get window placement")
-                .log_err();
+            // A window being destroyed has no placement any more: only a live one is worth an
+            // error in the log (Arke: these filled the log on every close).
+            if GetWindowPlacement(self.hwnd, &mut placement).is_err()
+                && IsWindow(Some(self.hwnd)).as_bool()
+            {
+                log::error!("failed to get window placement");
+            }
             placement
         };
         (
@@ -632,7 +642,8 @@ impl WindowsWindow {
 
         if popup.is_some() {
             set_non_rude_hwnd(hwnd, true);
-            configure_dwm_dark_mode(hwnd, appearance);
+            // zed#63821: always false for a popup, see `needs_win10_top_border`.
+            configure_dwm_dark_mode(hwnd, appearance, this.needs_win10_top_border());
             this.state.border_offset.update(hwnd)?;
             if params.show {
                 // Returns whether it was visible before, not an error.
@@ -643,7 +654,8 @@ impl WindowsWindow {
 
         register_drag_drop(&this)?;
         set_non_rude_hwnd(hwnd, true);
-        configure_dwm_dark_mode(hwnd, appearance);
+        // zed#63821: a dark DWM frame for the Windows 10 top border.
+        configure_dwm_dark_mode(hwnd, appearance, this.needs_win10_top_border());
         this.state.border_offset.update(hwnd)?;
         let placement =
             retrieve_window_placement(hwnd, display, params.bounds, &this.state.border_offset)?;
@@ -775,9 +787,11 @@ impl PlatformWindow for WindowsWindow {
         let scale_factor = self.scale_factor();
         let point = unsafe {
             let mut point: POINT = std::mem::zeroed();
-            GetCursorPos(&mut point)
-                .context("unable to get cursor position")
-                .log_err();
+            // Fails while the screen is locked (another desktop has the cursor): not an error
+            // (Arke: logged as one on every lock).
+            if let Err(err) = GetCursorPos(&mut point) {
+                log::debug!("no cursor position: {err}");
+            }
             ScreenToClient(self.0.hwnd, &mut point).ok().log_err();
             point
         };
@@ -1142,10 +1156,16 @@ impl PlatformWindow for WindowsWindow {
     }
 
     fn draw(&self, scene: &Scene) {
+        // zed#63821: the renderer keeps the Windows 10 top border row clear.
+        let top_border_height = self.top_border_height();
         self.state
             .renderer
             .borrow_mut()
-            .draw(scene, self.state.background_appearance.get())
+            .draw(
+                scene,
+                self.state.background_appearance.get(),
+                top_border_height,
+            )
             .log_err();
         // Arke: a window that presented gets one more tick, which serves anything GPUI deferred
         // meanwhile (a request that came in during a synchronous draw) before it goes idle.
@@ -1189,8 +1209,34 @@ impl PlatformWindow for WindowsWindow {
     }
 
     fn a11y_init(&self, callbacks: gpui::A11yCallbacks) {
+        // Arke: without uiautomationcore.dll (missing on some stripped Windows installs) the
+        // adapter could never answer a screen reader, and its first call into the DLL, which is
+        // delay-loaded, would end the process. With no adapter every a11y path here is a no-op.
+        // See third_party/README.md.
+        // SAFETY: maps the DLL as data from the system folder only (nothing runs, so it is
+        // cheap) and unmaps it again; nothing is called in it.
+        match unsafe {
+            LoadLibraryExW(
+                windows::core::w!("uiautomationcore.dll"),
+                None,
+                LOAD_LIBRARY_SEARCH_SYSTEM32 | LOAD_LIBRARY_AS_DATAFILE,
+            )
+        } {
+            Ok(module) => {
+                let _ = unsafe { FreeLibrary(module) };
+            }
+            Err(_) => {
+                log::info!("uiautomationcore.dll is missing; screen reader support is off");
+                return;
+            }
+        }
         let action_handler = A11yActionHandler(callbacks.action);
-        let is_focused = unsafe { GetForegroundWindow() } == self.0.hwnd;
+        // Whether the window is active, as `WM_ACTIVATE` will report it from now on. The first
+        // `WM_ACTIVATE` usually comes before this, while there is no adapter to tell, and the
+        // window isn't always the foreground one yet at this point; when it becomes so, no second
+        // `WM_ACTIVATE` follows. Asking for the foreground window here left the adapter thinking
+        // the window never had focus, so screen readers were given no focused element at all.
+        let is_focused = self.is_active();
 
         let adapter = accesskit_windows::Adapter::new(
             accesskit_windows::HWND(self.0.hwnd.0),

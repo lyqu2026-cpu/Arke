@@ -3,9 +3,11 @@
 //! Both show the item under the cursor.
 //! - Images: decoded in the background to 1600 px on the long side (own decoder, no third-party
 //!   thumbnail handlers).
-//! - Text and code: first 64 KB with encoding detection (UTF-8, UTF-16, legacy system code pages
-//!   like Big5); binary-looking files are skipped. Code gets line numbers and basic highlighting
-//!   (`arke_core::highlight`); Markdown is parsed (`arke_core::markdown`) and laid out like GitHub.
+//! - Text and code: the first 64 KB with encoding detection (UTF-8, UTF-16, legacy system code
+//!   pages like Big5); binary-looking files are skipped. Code gets line numbers and basic
+//!   highlighting (`arke_core::highlight`). Scrolled past that, the rest of a local file is read
+//!   as it comes into view, and only the lines on screen are laid out (`explorer_text.rs`).
+//!   Markdown is parsed (`arke_core::markdown`) and laid out like GitHub.
 //! - PDFs: rendered by Windows (`win_pdf.rs`), sized for the space in device pixels. The pane
 //!   scrolls through every page (`explorer_pdf_pane.rs`), Quick Look turns them (Left/Right, Page
 //!   Up/Down, Home/End). Recent Quick Look pages are cached per tab.
@@ -59,10 +61,17 @@ use office::{SlidesView, WorkbookView, load_office};
 mod office;
 #[path = "explorer_pdf_pane.rs"]
 mod pdf_pane;
+#[path = "explorer_text.rs"]
+mod text;
 use crate::a11y::A11yExt as _;
 use crate::shell::Shell;
+use crate::splitter::{DragEnd, Splitter};
 use crate::theme::{self, UiFont as _};
 pub(crate) use pdf_pane::RenderedPage;
+#[cfg(test)]
+pub(crate) use text::take_built_rows_for_test;
+use text::{Reader, TextHead, TextSource};
+pub(crate) use text::{TextDoc, TextUpdate};
 
 /// Delay after the cursor stops before reading, so holding an arrow key doesn't read every row. The
 /// test clock doesn't advance on its own, so tests skip the delay.
@@ -76,9 +85,9 @@ const LOADING_GRACE: Duration = Duration::from_millis(250);
 const SKELETON_PULSE: Duration = Duration::from_millis(1200);
 /// Long side of image previews
 const IMAGE_SIDE: u32 = 1600;
-/// Bytes read for text previews
+/// Bytes read for text previews (scrolled past, the rest of the file is read as needed)
 const TEXT_HEAD: u64 = 64 * 1024;
-/// Max lines in text previews
+/// Max lines in Markdown previews
 const TEXT_LINES: usize = 400;
 /// Max folder preview entries (beyond that only the total is shown)
 const FOLDER_ITEMS: usize = 500;
@@ -94,9 +103,18 @@ pub(crate) struct CodeLine {
 /// Split text into lines and distribute highlight ranges per line (multi-line comments and strings
 /// are marked on each line).
 fn split_lines(text: &str, marks: &[(std::ops::Range<usize>, Token)]) -> Vec<CodeLine> {
+    lines_with_marks(text, line_spans(text), marks)
+}
+
+/// The lines of `text` at `spans` (byte ranges, in order), each with the parts of `marks` in it.
+fn lines_with_marks(
+    text: &str,
+    spans: impl Iterator<Item = (usize, usize)>,
+    marks: &[(std::ops::Range<usize>, Token)],
+) -> Vec<CodeLine> {
     let mut lines = Vec::new();
     let mut next = 0;
-    for (start, end) in line_spans(text).take(TEXT_LINES) {
+    for (start, end) in spans {
         // Skip ranges that ended before this line.
         while marks.get(next).is_some_and(|(r, _)| r.end <= start) {
             next += 1;
@@ -166,9 +184,9 @@ pub(crate) enum PreviewBody {
         /// Capture info (photos only)
         info: Option<PhotoInfo>,
     },
-    /// Text and code: lines with highlight ranges
+    /// Text and code: lines with highlight ranges, read as they come into view
     Text {
-        lines: Arc<Vec<CodeLine>>,
+        doc: Rc<TextDoc>,
         encoding: TextEncoding,
         /// Set for the text inside a `.gz` file (its details are listed with the file's)
         inner: Option<GzipInner>,
@@ -226,10 +244,7 @@ pub(crate) enum PreviewData {
         /// Capture info (photos only)
         info: Option<PhotoInfo>,
     },
-    Text {
-        lines: Vec<CodeLine>,
-        encoding: TextEncoding,
-    },
+    Text(TextHead),
     /// A PDF page rendered for `target`
     Pdf {
         page: u32,
@@ -742,17 +757,51 @@ fn load(
             if is_markdown(path) {
                 return PreviewData::Markdown(arke_core::markdown::parse(&markdown_lines(&text)));
             }
-            let marks = path
+            let lang = path
                 .extension()
                 .and_then(|e| e.to_str())
-                .and_then(arke_core::highlight::lang_for)
-                .map_or_default(|lang| arke_core::highlight::highlight(&text, lang));
-            PreviewData::Text {
+                .and_then(arke_core::highlight::lang_for);
+            let marks = lang.map_or_default(|lang| arke_core::highlight::highlight(&text, lang));
+            // A local file may go on past its head: the rest is read as it is scrolled to. A
+            // file on a server or a network share is read only this far, as before: indexing
+            // would read all of it over the network.
+            let more = bytes.len() as u64 >= TEXT_HEAD
+                && !arke_core::remote::is_remote(path)
+                && !arke_core::fs::is_network_path(path);
+            PreviewData::Text(TextHead {
                 lines: split_lines(&text, &marks),
                 encoding,
-            }
+                source: more.then(|| TextSource {
+                    path: path.to_path_buf(),
+                    first: arke_core::text::bom_len(&bytes) as u64,
+                    encoding,
+                    lang,
+                }),
+            })
         }
         _ => PreviewData::Nothing,
+    }
+}
+
+/// How an item's list entry differs from the one a preview was made from.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Saved {
+    Same,
+    /// Only the details (attributes) differ
+    Details,
+    /// Size, last write or kind differ: the file was written or replaced
+    Content,
+}
+
+/// Compares what an editor's save changes: size and last write time (a replaced file has its own
+/// times too, whatever way it got its name), then the other details.
+pub(crate) fn saved_since(shown: &Entry, now: &Entry) -> Saved {
+    if shown.size != now.size || shown.modified != now.modified || shown.kind != now.kind {
+        Saved::Content
+    } else if shown.attributes != now.attributes {
+        Saved::Details
+    } else {
+        Saved::Same
     }
 }
 
@@ -770,8 +819,12 @@ impl Explorer {
     /// it isn't selected (Quick Look).
     fn item_target(&self, follow_cursor: bool) -> Option<(PathBuf, Entry)> {
         if self.search_mode {
-            // Search results are single-select: the cursor is the selection.
-            let hit = self.search_hit(Some(self.current_cursor()?))?;
+            // The hit under the cursor, while it is selected (or asked for).
+            let ix = self.current_cursor()?;
+            let hit = self.search_hit(Some(ix))?;
+            if !follow_cursor && !self.hit_selected(ix, &hit) {
+                return None;
+            }
             let root = &self.search_results.as_ref()?.root;
             return Some((root.join(&*hit.rel), hit.entry.clone()));
         }
@@ -791,10 +844,6 @@ impl Explorer {
 
     /// Called on every render: when the preview is open and the cursor moved to another item,
     /// schedule a read.
-    #[allow(
-        clippy::too_many_lines,
-        reason = "One pass over what can happen on a frame (same PDF resized, cache hit, cloud, load); split up, the order of the checks would be harder to follow"
-    )]
     pub(super) fn sync_preview(&mut self, cx: &mut Context<Self>) {
         if !(self.quick_look || self.preview_shown() || self.hosts_shared_preview()) {
             return;
@@ -807,20 +856,57 @@ impl Explorer {
             return;
         };
         let pdf_target = self.pdf_target();
-        if let Some(preview) = self.preview.as_ref().filter(|p| p.path == path) {
-            // Same PDF, but Quick Look opened or closed or the window was resized: render the page
-            // again for the new space (the current one stays up meanwhile).
-            if let PreviewBody::Pdf(view) = &preview.body
-                && view.pending.is_none()
-                && !close_enough(view.target, pdf_target)
-            {
-                let page = view.page;
-                self.request_pdf_page(page, cx);
+        let mut same_item = false;
+        if let Some(preview) = self.preview.as_mut().filter(|p| p.path == path) {
+            // The same name, saved again (in place, or replaced by a temp file or a rename, which
+            // leaves a new file under the name): the list's entry has moved on, and the preview
+            // reads the file again. Only the two values compared here, so nothing is polled and
+            // nothing is read per frame (#434).
+            let change = saved_since(&preview.entry, &entry);
+            if change != Saved::Same {
+                let created = preview.entry.created;
+                preview.entry = entry.clone();
+                preview.entry.created = preview.entry.created.or(created);
             }
-            return;
+            if change != Saved::Content {
+                self.sync_same_item(pdf_target, change == Saved::Details, cx);
+                return;
+            }
+            same_item = true;
         }
-        // New item: reset "actual size" to fit.
-        self.reset_zoom(cx);
+        if !same_item {
+            // New item: reset "actual size" to fit.
+            self.reset_zoom(cx);
+        }
+        self.start_preview(path, entry, pdf_target, cx);
+    }
+
+    /// The preview already shows this item and its content stands: a PDF may need its page
+    /// rendered again for a new space; a change of the details alone redraws.
+    fn sync_same_item(&mut self, pdf_target: (u32, u32), details: bool, cx: &mut Context<Self>) {
+        if details {
+            cx.notify();
+        }
+        // Same PDF, but Quick Look opened or closed or the window was resized: render the page
+        // again for the new space (the current one stays up meanwhile).
+        if let Some(PreviewBody::Pdf(view)) = self.preview.as_ref().map(|p| &p.body)
+            && view.pending.is_none()
+            && !close_enough(view.target, pdf_target)
+        {
+            let page = view.page;
+            self.request_pdf_page(page, cx);
+        }
+    }
+
+    /// Shows `entry` as loading and reads it in the background. A result of an earlier read (an
+    /// older generation) is dropped when it arrives.
+    fn start_preview(
+        &mut self,
+        path: PathBuf,
+        entry: Entry,
+        pdf_target: (u32, u32),
+        cx: &mut Context<Self>,
+    ) {
         self.preview_gen += 1;
         let generation = self.preview_gen;
         let show_hidden = self.show_hidden;
@@ -989,14 +1075,30 @@ impl Explorer {
                     height,
                     info,
                 },
-                PreviewData::Text { lines, encoding } => PreviewBody::Text {
-                    lines: Arc::new(lines),
-                    encoding,
+                PreviewData::Text(head) => PreviewBody::Text {
+                    encoding: head.encoding,
+                    doc: Rc::new(TextDoc::new(
+                        generation,
+                        head,
+                        Some(Reader {
+                            fs: Arc::clone(&self.services.fs),
+                            shell: Arc::clone(&self.services.shell),
+                            tx: self.events_tx.clone(),
+                        }),
+                    )),
                     inner: None,
                 },
                 PreviewData::Gzip { inner, text } => match text {
                     Some((lines, encoding)) => PreviewBody::Text {
-                        lines: Arc::new(lines),
+                        doc: Rc::new(TextDoc::new(
+                            generation,
+                            TextHead {
+                                lines,
+                                encoding,
+                                source: None,
+                            },
+                            None,
+                        )),
                         encoding,
                         inner: Some(inner),
                     },
@@ -1033,6 +1135,24 @@ impl Explorer {
                 PreviewData::Unreadable(reason) => PreviewBody::Unreadable(reason.into()),
                 PreviewData::Nothing => PreviewBody::Nothing,
             };
+            cx.notify();
+        }
+    }
+
+    /// More of the text on screen, read by its document's reader thread.
+    pub(super) fn handle_preview_text(
+        &mut self,
+        generation: u64,
+        update: TextUpdate,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(Preview {
+            body: PreviewBody::Text { doc, .. },
+            ..
+        }) = &self.preview
+            && doc.generation == generation
+        {
+            doc.apply(update);
             cx.notify();
         }
     }
@@ -1088,36 +1208,52 @@ impl Explorer {
         }
     }
 
-    /// Space: the user's own QuickLook app when that setting is on and it's running or installed
-    /// (it toggles its preview itself, so Space again closes it), otherwise Arke's Quick Look.
+    /// Space: the external preview program when that setting is set (it toggles its own preview,
+    /// so Space again closes it, as QuickLook does), otherwise Arke's Quick Look. The setting is a
+    /// command line, or a line for a named pipe with a command line as its fallback
+    /// (`external.rs`). When neither works (exe gone, a pipe that isn't there and no fallback, a
+    /// setting it can't read), Arke's Quick Look opens instead.
     pub(super) fn space_preview(&mut self, cx: &mut Context<Self>) {
-        let on = crate::settings::SettingsStore::global(cx)
-            .read(cx)
-            .settings
-            .space_quicklook
-            && crate::quicklook::available();
-        // Servers (SFTP, WebDAV) are Arke's own; QuickLook can't read them.
-        let item = (on && !self.quick_look)
+        let program = crate::external::Preview::parse(
+            &crate::settings::SettingsStore::global(cx)
+                .read(cx)
+                .settings
+                .external_preview,
+        );
+        // Servers (SFTP, WebDAV) are Arke's own; another program can't read them.
+        let item = (program.is_some() && !self.quick_look)
             .then(|| self.item_target(true))
             .flatten()
             .filter(|(path, _)| !arke_core::remote::is_remote(path));
-        let Some((item, _)) = item else {
+        let (Some(program), Some((item, _))) = (program, item) else {
             self.toggle_quick_look(cx);
             return;
         };
-        let exe = crate::quicklook::exe();
-        let shell = Arc::clone(&self.services.shell);
-        let tx = self.events_tx.clone();
-        spawn_thread("quicklook", move || {
-            if let Err(e) = shell.run_quicklook(exe.as_deref(), &item) {
-                log::warn!("QuickLook did not start: {e}");
-                let _ = tx.send(AppEvent::Notice(Err(t!(
-                    "error.quicklook_failed",
-                    error = e
-                )
-                .into_owned())));
+        let program = match program {
+            Ok(program) => program,
+            Err(err) => {
+                log::info!("the external preview program setting can't be used, Quick Look: {err}");
+                self.toggle_quick_look(cx);
+                return;
             }
+        };
+        let shell = Arc::clone(&self.services.shell);
+        let (tx, rx) = flume::bounded(1);
+        spawn_thread("external-preview", move || {
+            let _ = tx.send(program.open(&*shell, &item));
         });
+        cx.spawn(async move |this, cx| {
+            let Ok(Err(err)) = rx.recv_async().await else {
+                return;
+            };
+            log::info!("the external preview program did not start, Quick Look: {err}");
+            let _ = this.update(cx, |this, cx| {
+                if !this.quick_look {
+                    this.toggle_quick_look(cx);
+                }
+            });
+        })
+        .detach();
     }
 
     /// Space: toggle Quick Look. Closing fades the card out; the item (and zoom) stay until the
@@ -1722,8 +1858,8 @@ impl Explorer {
                 .size_full()
                 .object_fit(ObjectFit::Contain)
                 .into_any_element(),
-            PreviewBody::Text { lines, .. } => {
-                code_view(lines, false, !Self::is_table_text(preview), scroll)
+            PreviewBody::Text { doc, .. } => {
+                text::code_view(doc, None, !Self::is_table_text(preview), scroll)
             }
             PreviewBody::Archive(listing) => Self::archive_list(listing, scroll),
             PreviewBody::Gzip(inner) => div()
@@ -2057,13 +2193,11 @@ impl Explorer {
         in_gap: bool,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
-        let dragging = (self.preview_resized
-            || self.view_column_resized == Some(crate::prefs::ViewColumn::Current))
-            && cx.has_active_drag();
-        let edge = DraggedPreviewEdge(cx.entity_id());
         let gap = super::layout::shared_gap();
-        div()
-            .id("preview-resize")
+        // Centered on the gap, and no narrower than the pane's own edge when the gap is thin
+        // (compact density): the rest reaches over the preview's edge.
+        let hit_w = gap.max(theme::s_8());
+        let hit = div()
             .absolute()
             .top_0()
             .bottom_0()
@@ -2072,40 +2206,30 @@ impl Explorer {
             .when(!in_gap, |d| d.left_0().w(theme::s_8()))
             // The gap lies over the right pane's box: keep the press from reaching that pane,
             // which would make it the active side and hand the preview (and this drag) over.
-            .when(in_gap, |d| d.left(-gap).w(gap).occlude())
-            .cursor_col_resize()
-            .group("preview-resize")
-            .child(
-                div()
-                    .absolute()
-                    .top(if in_gap { theme::r_12() } else { px(0.) })
-                    .bottom(if in_gap { theme::r_12() } else { px(0.) })
-                    .left(if in_gap { gap / 2. - px(1.) } else { px(0.) })
-                    .w(px(2.))
-                    .when(in_gap, |d| d.rounded(theme::R_FULL))
-                    .when(dragging, |d| d.bg(theme::signal()))
-                    .when(!dragging, |d| {
-                        d.group_hover("preview-resize", |s| s.bg(theme::signal_line()))
-                    }),
-            )
+            .when(in_gap, |d| d.left(-(gap + hit_w) / 2.).w(hit_w).occlude());
+        let line = div()
+            .absolute()
+            .top(if in_gap { theme::r_paper() } else { px(0.) })
+            .bottom(if in_gap { theme::r_paper() } else { px(0.) })
+            .left(if in_gap { hit_w / 2. - px(1.) } else { px(0.) })
+            .w(px(2.))
+            .when(in_gap, |d| d.rounded(theme::R_FULL));
+        Splitter::new("preview-resize", gpui::CursorStyle::ResizeColumn)
+            .round(in_gap)
+            .dragging(self.preview_drag_start.is_some())
             // Where the press started and the width then: the drag moves the edge by as much as
-            // the cursor moved, so it neither jumps to the cursor nor lags by the drag threshold.
-            .on_mouse_down(
-                MouseButton::Left,
-                cx.listener(move |this, e: &MouseDownEvent, _, _| {
-                    this.preview_drag_start = Some((e.position.x, this.preview_w()));
-                    // In the column view this edge is the current folder column's divider.
-                    this.view_column_drag = (this.columns_active() && !in_gap).then(|| {
-                        let current = crate::prefs::ViewColumn::Current;
-                        (current, e.position.x, this.view_column_shown_width(current))
-                    });
-                }),
-            )
-            .on_drag(edge, |_, _, _, cx| cx.new(|_| super::details::ColumnDragView))
-            .on_click(cx.listener(move |this, e: &ClickEvent, window, cx| {
-                if e.click_count() < 2 {
-                    return;
-                }
+            // the cursor moved, so it neither jumps to the cursor nor lags behind it.
+            .on_start(cx.listener(move |this, e: &MouseDownEvent, window, cx| {
+                this.pressed_preview(window, cx);
+                this.preview_drag_start = Some((e.position.x, this.preview_w()));
+                // In the column view this edge is the current folder column's divider.
+                this.view_column_drag = (this.columns_active() && !in_gap).then(|| {
+                    let current = crate::prefs::ViewColumn::Current;
+                    (current, e.position.x, this.view_column_shown_width(current))
+                });
+            }))
+            .on_double_click(cx.listener(move |this, _: &MouseDownEvent, window, cx| {
+                this.pressed_preview(window, cx);
                 if this.columns_active() && !in_gap {
                     this.fit_view_column(crate::prefs::ViewColumn::Current, window, cx);
                 } else {
@@ -2114,22 +2238,33 @@ impl Explorer {
                     this.save_preview_width(cx);
                 }
             }))
+            .on_drag(cx.listener(|this, e: &MouseMoveEvent, _, cx| {
+                this.drag_preview_edge(e.position.x, cx);
+            }))
+            .on_end(cx.listener(|this, _: &DragEnd, _, cx| {
+                if this.preview_drag_start.take().is_some() {
+                    this.view_column_drag = None;
+                    this.save_view_column_widths(cx);
+                    this.save_preview_width(cx);
+                    cx.notify();
+                }
+            }))
+            .render(hit, line)
     }
 
-    /// The preview's edge moved during a drag. The preview is anchored to the right edge:
+    /// A press on the preview's dividers, which go no further: what a press anywhere in the
+    /// preview does (it leaves the path and filter boxes), and in split view the side becomes
+    /// the active one.
+    fn pressed_preview(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.activate_on_press(cx);
+        self.cancel_path_edit(window, cx);
+    }
+
+    /// The preview's edge moved during a drag, to `x`. The preview is anchored to the right edge:
     /// dragging left widens it by as much as the cursor moved since the press.
-    pub(super) fn drag_preview_edge(
-        &mut self,
-        e: &gpui::DragMoveEvent<DraggedPreviewEdge>,
-        _: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        let pane = e.drag(cx).0;
-        if pane != cx.entity_id() {
-            return;
-        }
+    fn drag_preview_edge(&mut self, x: Pixels, cx: &mut Context<Self>) {
         if let Some((col, from, start)) = self.view_column_drag {
-            self.drag_view_column(col, start + e.event.position.x - from, cx);
+            self.drag_view_column(col, start + x - from, cx);
             return;
         }
         let Some((from, start)) = self.preview_drag_start else {
@@ -2141,7 +2276,7 @@ impl Explorer {
                 super::layout::preview_room(&self.fit_input(self.paper_width, self.screen.0.width))
             }
         };
-        let width = (start + from - e.event.position.x).clamp(super::layout::preview_min(), room);
+        let width = (start + from - x).clamp(super::layout::preview_min(), room);
         crate::prefs::set_preview_width(Some(width));
         self.preview_resized = true;
         cx.notify();
@@ -2183,76 +2318,64 @@ impl Explorer {
     }
 
     fn preview_split_strip(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let dragging = self.pane_split.get().unsaved && cx.has_active_drag();
-        div()
-            .id("preview-split")
-            .absolute()
-            .left_0()
-            .right_0()
-            .top_0()
-            .h(theme::s_12())
-            .cursor_row_resize()
-            .group("preview-split")
-            .debug_selector(|| "preview-split".into())
-            .child(
-                div()
-                    .absolute()
-                    .left_0()
-                    .right_0()
-                    .top_0()
-                    .h(px(2.))
-                    .when(dragging, |d| d.bg(theme::signal()))
-                    .when(!dragging, |d| {
-                        d.group_hover("preview-split", |s| s.bg(theme::signal_line()))
-                    }),
-            )
+        let hit = div().absolute().left_0().right_0().top_0().h(theme::s_12());
+        let line = div().absolute().left_0().right_0().top_0().h(px(2.));
+        Splitter::new("preview-split", gpui::CursorStyle::ResizeRow)
+            .dragging(self.pane_split.get().held)
             // Where the press landed relative to the frame's bottom edge: the drag then moves the
             // edge by as much as the cursor moved.
-            .on_mouse_down(
-                MouseButton::Left,
-                cx.listener(|this, e: &MouseDownEvent, _, _| {
-                    let mut split = this.pane_split.get();
-                    let bottom = split.top + this.pane_frame_h.get().unwrap_or_default();
-                    split.grab = e.position.y - bottom;
-                    this.pane_split.set(split);
-                }),
-            )
-            .on_drag(DraggedPreviewSplit(cx.entity_id()), |_, _, _, cx| {
-                cx.new(|_| super::details::ColumnDragView)
-            })
-            .on_drag_move(cx.listener(Self::drag_preview_split))
-            .on_click(cx.listener(|this, e: &ClickEvent, _, cx| {
-                if e.click_count() < 2 {
-                    return;
-                }
+            .on_start(cx.listener(|this, e: &MouseDownEvent, window, cx| {
+                this.pressed_preview(window, cx);
+                let mut split = this.pane_split.get();
+                let bottom = split.top + this.pane_frame_h.get().unwrap_or_default();
+                split.grab = e.position.y - bottom;
+                split.held = true;
+                this.pane_split.set(split);
+            }))
+            .on_double_click(cx.listener(|this, _: &MouseDownEvent, window, cx| {
+                this.pressed_preview(window, cx);
                 crate::prefs::set_preview_split(None);
                 let mut split = this.pane_split.get();
                 split.unsaved = true;
                 this.pane_split.set(split);
                 this.save_preview_split(cx);
             }))
+            .on_drag(cx.listener(|this, e: &MouseMoveEvent, _, cx| {
+                this.drag_preview_split(e.position.y, cx);
+            }))
+            .on_end(cx.listener(|this, _: &DragEnd, _, cx| {
+                let mut split = this.pane_split.get();
+                if std::mem::take(&mut split.held) {
+                    this.pane_split.set(split);
+                    this.save_preview_split(cx);
+                    cx.notify();
+                }
+            }))
+            .render(hit, line)
     }
 
-    /// The boundary moved during a drag: the frame's bottom edge follows the cursor, kept as a
-    /// share of the pane's height within the limits in `prefs`.
-    fn drag_preview_split(
-        &mut self,
-        e: &gpui::DragMoveEvent<DraggedPreviewSplit>,
-        _: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        if e.drag(cx).0 != cx.entity_id() {
-            return;
-        }
+    /// The boundary moved during a drag, to `y`: the frame's bottom edge follows the cursor, kept
+    /// as a share of the pane's height within the limits in `prefs`.
+    fn drag_preview_split(&mut self, y: Pixels, cx: &mut Context<Self>) {
         let mut split = self.pane_split.get();
-        if split.column <= px(0.) {
+        if !split.held || split.column <= px(0.) {
             return;
         }
-        let height = e.event.position.y - split.grab - split.top;
+        let height = y - split.grab - split.top;
         crate::prefs::set_preview_split(Some(f32::from(height) / f32::from(split.column)));
         split.unsaved = true;
         self.pane_split.set(split);
         cx.notify();
+    }
+
+    /// Tests: whether a divider of this pane (a Details column's, the column view's, the
+    /// preview's edge or its boundary) is being dragged.
+    #[cfg(test)]
+    pub(crate) fn divider_drag_for_test(&self) -> bool {
+        self.column_drag.is_some()
+            || self.view_column_drag.is_some()
+            || self.preview_drag_start.is_some()
+            || self.pane_split.get().held
     }
 
     /// After dragging the boundary (or resetting it): save the share to settings (all windows).
@@ -2323,13 +2446,6 @@ impl Explorer {
         reason = "Layouts for each kind (no selection, archive, folder, other) are kept together for easy comparison"
     )]
     pub(super) fn preview_column(&self, pane: gpui::Div, cx: &mut Context<Self>) -> AnyElement {
-        // The boundary between the content and the details was released: save its share (app-wide).
-        if self.pane_split.get().unsaved && !cx.has_active_drag() {
-            let this = cx.entity().downgrade();
-            cx.defer(move |cx| {
-                let _ = this.update(cx, Self::save_preview_split);
-            });
-        }
         // Several selected: previewing the cursor item means little, show a summary instead.
         if self.selection.len() > 1 && !self.search_mode {
             return self.selection_summary(pane);
@@ -3464,15 +3580,6 @@ const PDF_ZOOM_SIDE: f32 = 4096.;
 /// Preview pane frame ratio: pane width minus 32 padding, to height
 const PANE_IMAGE_RATIO: f32 = 268. / 200.;
 
-/// The preview pane's left edge being dragged, in this pane (in split view both panes see the
-/// drag; only the one it started in resizes).
-#[derive(Clone, Copy, Debug)]
-pub(crate) struct DraggedPreviewEdge(pub(super) gpui::EntityId);
-
-/// The boundary between the preview content and the details below it being dragged, in this pane.
-#[derive(Clone, Copy, Debug)]
-pub(crate) struct DraggedPreviewSplit(pub(super) gpui::EntityId);
-
 /// Where the side preview was drawn at the last layout, and the drag of the boundary between its
 /// content frame and its details. Measured while drawing and read by the drag, which works from
 /// the cursor's position, so it is a `Cell` shared with the drawing callbacks.
@@ -3487,6 +3594,8 @@ pub(crate) struct PaneSplit {
     grab: Pixels,
     /// Dragged or reset but not saved yet (saved when the mouse is released).
     unsaved: bool,
+    /// Pressed on the boundary and not released yet: a drag is under way.
+    held: bool,
 }
 /// Pane frame for PDFs: height to width, a little squatter than A4 so details still fit
 const PDF_FRAME_RATIO: f32 = 1.3;
@@ -3973,10 +4082,10 @@ impl Explorer {
                 ..
             } => (*width, *height, image),
             PreviewBody::Pdf(view) => return self.pdf_look(view, cx),
-            PreviewBody::Text { lines, .. } => {
+            PreviewBody::Text { doc, .. } => {
                 let wrap = !Self::is_table_text(preview);
                 return Self::with_preview_scrollbars(
-                    code_view_at(lines, Some(zoom), wrap, &self.look_scroll),
+                    text::code_view(doc, Some(zoom), wrap, &self.look_scroll),
                     &self.look_scroll,
                     &self.look_scrollbar,
                     (!wrap).then_some(&self.look_hscrollbar),
@@ -4506,114 +4615,6 @@ mod zoom_tests {
     }
 }
 
-/// Text and code: line numbers on the left; long lines wrap and the number stays aligned to the
-/// first row. `large` (Quick Look) fills the stage like an editor: a ruled gutter, roomier lines.
-/// Without `wrap` (tables) lines stay whole and the view scrolls sideways.
-fn code_view(
-    lines: &Arc<Vec<CodeLine>>,
-    large: bool,
-    wrap: bool,
-    scroll: &gpui::ScrollHandle,
-) -> AnyElement {
-    code_view_at(lines, large.then_some(1.), wrap, scroll)
-}
-
-/// [`code_view`]; `zoom` is Quick Look's text scale (`None` in the pane).
-fn code_view_at(
-    lines: &Arc<Vec<CodeLine>>,
-    zoom: Option<f32>,
-    wrap: bool,
-    scroll: &gpui::ScrollHandle,
-) -> AnyElement {
-    let large = zoom.is_some();
-    let zoom = zoom.unwrap_or(1.);
-    let digits = lines.len().max(1).to_string().len();
-    // Line numbers take about 8 px a digit at normal size.
-    let numbers = px((8. * digits as f32 + 8.) * zoom);
-    let rows: Vec<AnyElement> = lines
-        .iter()
-        .enumerate()
-        .map(|(ix, line)| {
-            let marks = line.marks.iter().map(|(range, token)| {
-                (
-                    range.clone(),
-                    gpui::HighlightStyle {
-                        color: Some(theme::code_color(*token).into()),
-                        ..gpui::HighlightStyle::default()
-                    },
-                )
-            });
-            let number = div()
-                .flex_none()
-                .flex()
-                .justify_end()
-                .text_color(theme::text_disabled())
-                .child((ix + 1).to_string());
-            let text = div()
-                .when(wrap, |d| d.flex_1().min_w_0())
-                .when(!wrap, |d| d.flex_none().whitespace_nowrap())
-                .child(gpui::StyledText::new(line.text.clone()).with_highlights(marks));
-            if large {
-                div()
-                    .flex()
-                    .child(
-                        number
-                            .w(numbers + theme::s_16() + theme::s_12())
-                            .pl(theme::s_16())
-                            .pr(theme::s_12())
-                            .border_r_1()
-                            .border_color(theme::line()),
-                    )
-                    .child(
-                        text.pl(theme::s_16())
-                            .pr(theme::s_24())
-                            .text_color(theme::text()),
-                    )
-                    .into_any_element()
-            } else {
-                div()
-                    .flex()
-                    .gap(theme::s_8())
-                    .child(number.w(numbers))
-                    .child(text.text_color(theme::text_muted()))
-                    .into_any_element()
-            }
-        })
-        .collect();
-    // Both axes scroll for a table, and the plain wheel still goes up and down: GPUI only turns
-    // the wheel sideways when x alone scrolls.
-    let area = div()
-        .id("preview-text")
-        .debug_selector(|| "preview-text".into())
-        .size_full();
-    let area = if wrap {
-        area.overflow_y_scroll()
-    } else {
-        area.overflow_scroll().flex().items_start()
-    };
-    area.track_scroll(scroll)
-        .font_family("Cascadia Mono")
-        .when(large, |d| {
-            d.py(theme::s_12())
-                .text_size(theme::fs_13() * zoom)
-                .line_height(gpui::relative(1.6))
-        })
-        .when(!large, |d| {
-            d.p(theme::s_8())
-                .map(theme::preview_sheet)
-                .text_size(theme::fs_12())
-        })
-        .child(
-            // Without wrapping the lines set the width, which may pass the frame's.
-            div()
-                .flex()
-                .flex_col()
-                .when(!wrap, |d| d.flex_none().min_w_full())
-                .children(rows),
-        )
-        .into_any_element()
-}
-
 /// "12 files, 3 folders · 4.2 MB unpacked"
 fn archive_summary(listing: &ArchiveListing) -> String {
     let mut text = t!(
@@ -4631,16 +4632,11 @@ fn archive_summary(listing: &ArchiveListing) -> String {
 
 #[cfg(test)]
 impl PreviewBody {
-    /// Tests: text preview content (lines joined by newlines).
+    /// Tests: text preview content, as far as it was read with the head (lines joined by
+    /// newlines).
     pub(crate) fn text(&self) -> Option<String> {
         match self {
-            Self::Text { lines, .. } => Some(
-                lines
-                    .iter()
-                    .map(|l| l.text.to_string())
-                    .collect::<Vec<_>>()
-                    .join("\n"),
-            ),
+            Self::Text { doc, .. } => Some(doc.head_text()),
             _ => None,
         }
     }

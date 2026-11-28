@@ -96,7 +96,11 @@ const WINDOW_CLASS: &str = "ArkeWindow";
 /// A parsed request.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum Request {
-    State,
+    State {
+        /// List each pane's selected items (`"selection": false` leaves them out: a launcher that
+        /// only wants the folders asks often, and thousands of selected items make a large reply)
+        selection: bool,
+    },
     Commands,
     Open {
         path: PathBuf,
@@ -187,7 +191,13 @@ pub(crate) fn parse(bytes: &[u8]) -> Result<Request, ApiError> {
         Some(_) => return Err(bad("\"cmd\" is not a string")),
     };
     match cmd {
-        "state" => Ok(Request::State),
+        "state" => match object.get("selection") {
+            None => Ok(Request::State { selection: true }),
+            Some(Value::Bool(selection)) => Ok(Request::State {
+                selection: *selection,
+            }),
+            Some(_) => Err(bad("\"selection\" is not true or false")),
+        },
         "commands" => Ok(Request::Commands),
         "open" => parse_open(object),
         "run" => match object.get("id") {
@@ -241,7 +251,10 @@ fn parse_open(object: &Map<String, Value>) -> Result<Request, ApiError> {
 /// A request as JSON again, to pass on to the resident Arke.
 pub(crate) fn encode_request(request: &Request) -> String {
     let value = match request {
-        Request::State => json!({ "v": VERSION, "cmd": "state" }),
+        Request::State { selection: true } => json!({ "v": VERSION, "cmd": "state" }),
+        Request::State { selection: false } => {
+            json!({ "v": VERSION, "cmd": "state", "selection": false })
+        }
         Request::Commands => json!({ "v": VERSION, "cmd": "commands" }),
         Request::Open {
             path,
@@ -329,8 +342,9 @@ fn location_json(location: &Location) -> Value {
     }
 }
 
-/// The `state` reply: windows front to back, the first being the one used last.
-pub(crate) fn state_json(snapshot: &Snapshot) -> Value {
+/// The `state` reply: windows front to back, the first being the one used last. Without
+/// `selection` the panes have no `selection` field.
+pub(crate) fn state_json(snapshot: &Snapshot, selection: bool) -> Value {
     let windows: Vec<Value> = snapshot
         .windows
         .iter()
@@ -346,11 +360,14 @@ pub(crate) fn state_json(snapshot: &Snapshot) -> Value {
                         .iter()
                         .enumerate()
                         .map(|(p, pane)| {
-                            json!({
+                            let mut value = json!({
                                 "active": p == tab.active_pane,
                                 "location": location_json(&pane.location),
-                                "selection": pane.selection,
-                            })
+                            });
+                            if selection {
+                                value["selection"] = json!(pane.selection);
+                            }
+                            value
                         })
                         .collect();
                     json!({ "active": t == window.active_tab, "panes": panes })
@@ -433,7 +450,7 @@ fn respond(
     env: &impl Env,
 ) -> Result<(Value, Option<Action>), ApiError> {
     match request {
-        Request::State => Ok((state_json(&env.snapshot()), None)),
+        Request::State { selection } => Ok((state_json(&env.snapshot(), selection), None)),
         Request::Commands => Ok((commands_json(), None)),
         Request::Open {
             path,
@@ -638,7 +655,9 @@ struct PaneKey {
     entries: (u64, u64),
     /// Which names are selected, for selections up to [`HASHED_MAX`] items
     names: usize,
-    search: Option<(usize, Option<usize>)>,
+    /// Search results shown: the hits, the cursor, and what is selected in them (picked, how
+    /// many, which, as for `names`).
+    search: Option<(usize, Option<usize>, bool, usize, usize)>,
 }
 
 /// Up to this many selected items, which ones they are is part of [`PaneKey`]; past it only
@@ -710,16 +729,22 @@ fn path_text(path: &Path) -> String {
     }
 }
 
-fn pane_key(pane: &PaneInput<'_>) -> PaneKey {
-    let explorer = pane.explorer;
-    let selection = &explorer.selection;
-    let names = if selection.len() <= HASHED_MAX {
+/// Which names `selection` has, for selections up to [`HASHED_MAX`] items (0 past it).
+fn names_hash(selection: &arke_core::Selection) -> usize {
+    if selection.len() <= HASHED_MAX {
         selection.names().fold(0usize, |hash, name| {
             hash ^ (Arc::as_ptr(name).cast::<u8>() as usize)
         })
     } else {
         0
-    };
+    }
+}
+
+fn pane_key(pane: &PaneInput<'_>) -> PaneKey {
+    let explorer = pane.explorer;
+    let selection = &explorer.selection;
+    let names = names_hash(selection);
+    let pick = &explorer.search_pick;
     PaneKey {
         location: location_of(pane),
         selected: selection.len(),
@@ -733,12 +758,20 @@ fn pane_key(pane: &PaneInput<'_>) -> PaneKey {
             .search_results
             .as_ref()
             .filter(|_| searching(explorer))
-            .map(|r| (Arc::as_ptr(&r.hits) as usize, explorer.search_cursor)),
+            .map(|r| {
+                (
+                    Arc::as_ptr(&r.hits) as usize,
+                    explorer.search_cursor,
+                    pick.picked,
+                    pick.selection.len(),
+                    names_hash(&pick.selection),
+                )
+            }),
     }
 }
 
-/// The selection as full paths: the items selected in list order, or in a search the result
-/// under the cursor (as the menus take it).
+/// The selection as full paths: the items selected in list order, or in a search the results
+/// selected (as the menus take them).
 fn selection_of(pane: &PaneInput<'_>) -> Vec<String> {
     if pane.page.is_some() {
         return Vec::new();
@@ -746,14 +779,9 @@ fn selection_of(pane: &PaneInput<'_>) -> Vec<String> {
     let explorer = pane.explorer;
     if searching(explorer) {
         return explorer
-            .search_results
-            .as_ref()
-            .zip(explorer.search_cursor)
-            .and_then(|(results, ix)| {
-                let hit = results.hits.get(ix)?;
-                Some(path_text(&results.root.join(&*hit.rel)))
-            })
-            .into_iter()
+            .selected_hits()
+            .iter()
+            .map(|(path, _)| path_text(path))
             .collect();
     }
     let selection = &explorer.selection;
@@ -988,11 +1016,22 @@ mod tests {
     fn requests_parse() {
         assert_eq!(
             parse(br#"{"v":1,"cmd":"state","extra":[1,2]}"#),
-            Ok(Request::State)
+            Ok(Request::State { selection: true })
+        );
+        assert_eq!(
+            parse(br#"{"v":1,"cmd":"state","selection":false}"#),
+            Ok(Request::State { selection: false })
+        );
+        assert_eq!(
+            parse(br#"{"v":1,"cmd":"state","selection":"no"}"#).map_err(|e| e.code),
+            Err(ErrorCode::BadRequest)
         );
         assert_eq!(parse(br#"{"cmd":"commands","v":1}"#), Ok(Request::Commands));
         // With the terminating NUL a `WM_COPYDATA` sender counted.
-        assert_eq!(parse(b"{\"v\":1,\"cmd\":\"state\"}\0"), Ok(Request::State));
+        assert_eq!(
+            parse(b"{\"v\":1,\"cmd\":\"state\"}\0"),
+            Ok(Request::State { selection: true })
+        );
         assert_eq!(
             parse(br#"{"v":1,"cmd":"open","path":"C:\\work"}"#),
             Ok(Request::Open {
@@ -1179,7 +1218,16 @@ mod tests {
                 ),
             ],
         };
-        let value = state_json(&snapshot);
+        let value = state_json(&snapshot, true);
+        assert_eq!(
+            value["windows"][0]["tabs"][0]["panes"][0]["selection"],
+            json!([])
+        );
+        // Asked without the selection: the field isn't there, the rest is the same.
+        let lean = state_json(&snapshot, false);
+        let pane = &lean["windows"][0]["tabs"][0]["panes"][0];
+        assert!(pane.get("selection").is_none(), "{pane}");
+        assert_eq!(pane["location"], json!({ "kind": "home" }));
         assert_eq!(value["windows"][0]["hwnd"], "0x1A2B3C");
         assert_eq!(value["windows"][0]["active"], true);
         assert_eq!(value["windows"][1]["active"], false);
@@ -1213,7 +1261,8 @@ mod tests {
     #[test]
     fn requests_encode_back_to_the_same_request() {
         for request in [
-            Request::State,
+            Request::State { selection: true },
+            Request::State { selection: false },
             Request::Commands,
             Request::Open {
                 path: PathBuf::from(r"C:\測試\a b"),

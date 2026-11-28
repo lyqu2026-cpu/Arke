@@ -21,6 +21,7 @@ use super::settings_panel::expander;
 use super::update_page::{button, open_url};
 use crate::assets::Icon;
 use crate::build_info;
+use crate::keynav::KeyStop as _;
 use crate::settings::{Settings, SettingsStore};
 use crate::theme;
 
@@ -204,17 +205,16 @@ fn compose(s: &Settings, with_log: bool, with_registry: bool) -> String {
     out
 }
 
+/// Everything but letters, digits and `-_.~` is escaped in a URL query value.
+const QUERY_VALUE: &percent_encoding::AsciiSet = &percent_encoding::NON_ALPHANUMERIC
+    .remove(b'-')
+    .remove(b'_')
+    .remove(b'.')
+    .remove(b'~');
+
 /// Percent-encodes a URL query value.
 fn encode(text: &str) -> String {
-    text.bytes().fold(String::new(), |mut out, b| {
-        if b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.' | b'~') {
-            out.push(char::from(b));
-        } else {
-            use std::fmt::Write as _;
-            let _ = write!(out, "%{b:02X}");
-        }
-        out
-    })
+    percent_encoding::utf8_percent_encode(text, QUERY_VALUE).to_string()
 }
 
 /// GitHub turns away longer new-issue URLs.
@@ -642,6 +642,7 @@ pub(super) fn check_row(
         .id(id)
         .debug_selector(move || id.to_owned())
         .a11y(gpui::Role::CheckBox, label.to_string())
+        .key_stop()
         .aria_toggled(crate::a11y::toggled(on))
         .flex()
         .items_center()

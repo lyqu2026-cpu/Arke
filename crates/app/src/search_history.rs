@@ -151,13 +151,12 @@ fn save(path: &Path, file: &StoredFile) -> Result<(), HistoryError> {
     }
     let json = serde_json::to_vec_pretty(file).map_err(HistoryError::Encode)?;
     let tmp = path.with_extension("json.tmp");
-    std::fs::write(&tmp, json).map_err(write_err)?;
-    std::fs::rename(&tmp, path).map_err(write_err)
+    arke_core::fs::replace_file(path, &tmp, json).map_err(write_err)
 }
 
 /// `<exe dir>\data\search_history.json`, next to the settings (string work only).
 pub(crate) fn default_path() -> Option<PathBuf> {
-    crate::settings::default_path().map(|p| p.with_file_name("search_history.json"))
+    crate::paths::roaming_file("search_history.json")
 }
 
 /// Whether `path` is worth remembering: a local or network path, not a server (SFTP, WebDAV) or

@@ -775,6 +775,23 @@ fn a_tile_back_over_the_empty_cell_is_a_tile_again(cx: &mut TestAppContext) {
     );
 }
 
+/// A press on the line above the tabs that doesn't move keeps the room shared by itself: only a
+/// drag sets the places' height.
+#[gpui::test]
+fn a_click_on_the_line_above_the_tabs_changes_nothing(cx: &mut TestAppContext) {
+    let (_ws, cx) = window(cx);
+    change(cx, |st| {
+        st.pinned = vec![p("a"), p("b"), p("c"), p("d")];
+    });
+    cx.simulate_resize(gpui::size(px(1200.), px(700.)));
+    refresh(cx);
+    let line = bounds(cx, "sidebar-split").center();
+    cx.simulate_mouse_down(line, MouseButton::Left, Modifiers::none());
+    cx.simulate_mouse_up(line, MouseButton::Left, Modifiers::none());
+    cx.run_until_parked();
+    assert_eq!(current(cx).sidebar_split, 0.);
+}
+
 /// The line between the places and the tabs: dragged down, the places take that much more room
 /// (saved, at 100% scale); double-clicked, the room is shared by itself again.
 #[gpui::test]
@@ -1065,4 +1082,45 @@ fn the_tab_menu_shows_its_keys_on_the_right(cx: &mut TestAppContext) {
     let other = ws.update(cx, |ws, cx| ws.tab_menu_drawn_for_test(0, cx));
     assert!(other.contains(&close), "{other:?}");
     assert!(!other.iter().any(|row| row.contains("(Ctrl")), "{other:?}");
+}
+
+/// The dragged height is an upper limit (#453): when the places get shorter than it (Favorites
+/// collapsed), the line moves up under them; expanded again, it goes back down to the dragged
+/// height. The saved height stays what the drag set.
+#[gpui::test]
+fn the_dragged_places_height_is_only_an_upper_limit(cx: &mut TestAppContext) {
+    let (_ws, cx) = window(cx);
+    change(cx, |st| {
+        st.favorites = Some(vec![p("a"), p("b"), p("c"), p("d")]);
+        st.pinned = vec![p("a"), p("b"), p("c"), p("d")];
+    });
+    cx.simulate_resize(gpui::size(px(1200.), px(900.)));
+    refresh(cx);
+    let full = bounds(cx, "sidebar-places-frame").size.height;
+    let line = bounds(cx, "sidebar-split");
+    cx.simulate_mouse_down(line.center(), MouseButton::Left, Modifiers::none());
+    let up = line.center() + point(px(0.), px(-30.));
+    cx.simulate_mouse_move(up, Some(MouseButton::Left), Modifiers::none());
+    cx.simulate_mouse_up(up, MouseButton::Left, Modifiers::none());
+    cx.run_until_parked();
+    refresh(cx);
+    let dragged = bounds(cx, "sidebar-places-frame").size.height;
+    assert!(near(dragged, full - px(30.)), "{full:?} -> {dragged:?}");
+    let saved = current(cx).sidebar_split;
+    assert!((saved - f32::from(dragged)).abs() < 1., "saved {saved}");
+
+    change(cx, |st| {
+        st.collapsed_sections
+            .push(crate::settings::SidebarSection::Favorites);
+    });
+    refresh(cx);
+    let short = bounds(cx, "sidebar-places-frame").size.height;
+    assert!(short < dragged - px(5.), "{dragged:?} -> {short:?}");
+    assert_eq!(current(cx).sidebar_split, saved, "the drag's height stays");
+
+    change(cx, |st| st.collapsed_sections.clear());
+    refresh(cx);
+    let back = bounds(cx, "sidebar-places-frame").size.height;
+    assert!(near(back, dragged), "{dragged:?} -> {back:?}");
+    assert_eq!(current(cx).sidebar_split, saved);
 }

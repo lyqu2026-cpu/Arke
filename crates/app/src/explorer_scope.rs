@@ -19,7 +19,6 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use arke_core::format::format_count;
-use arke_core::index::IndexHit;
 use arke_core::index_query as iq;
 use arke_core::index_query::Facet;
 use arke_core::{Entry, EntryKind, SearchHit, SearchResults};
@@ -30,10 +29,10 @@ use gpui::{
 };
 use rust_i18n::t;
 
-use super::Explorer;
+use super::{Explorer, ExplorerEvent};
 use crate::a11y::A11yExt as _;
 use crate::assets::Icon;
-use crate::global_search::GlobalSearch;
+use crate::global_search::{Found, GlobalSearch};
 use crate::theme::{self, UiFont as _};
 use crate::workspace::TooltipBelowExt as _;
 
@@ -41,7 +40,6 @@ actions!(
     explorer,
     [
         PanelEnter,
-        PanelEnterLast,
         PanelUp,
         PanelDown,
         PanelLeft,
@@ -63,9 +61,9 @@ pub(crate) fn bind_keys(cx: &mut App) {
     let filter = Some("FilterBar");
     let panel = Some(PANEL_CONTEXT);
     cx.bind_keys([
-        // Tab in the filter box moves into the search panel (Shift+Tab: its last row).
+        // Tab in the filter box moves into the search panel, and on past its last row to the
+        // window's next stop. Shift+Tab goes to the previous stop (`workspace.rs`).
         KeyBinding::new("tab", PanelEnter, filter),
-        KeyBinding::new("shift-tab", PanelEnterLast, filter),
         KeyBinding::new("up", PanelUp, panel),
         KeyBinding::new("down", PanelDown, panel),
         KeyBinding::new("left", PanelLeft, panel),
@@ -184,10 +182,13 @@ impl Scope {
 }
 
 /// Convert index hits to search results: empty root, full path in `rel` (`root.join(rel)` is the
-/// path).
-fn to_results(hits: Vec<IndexHit>, generation: arke_core::service::Gen) -> SearchResults {
-    let hits: Vec<Arc<SearchHit>> = hits
+/// path). Similar hits, when looked for, come after the exact ones (#396).
+fn to_results(found: Found, generation: arke_core::service::Gen) -> SearchResults {
+    let similar = found.similar.as_ref().map_or(0, Vec::len);
+    let hits: Vec<Arc<SearchHit>> = found
+        .exact
         .into_iter()
+        .chain(found.similar.into_iter().flatten())
         .map(|hit| {
             let name = hit.path.file_name().map_or_else(
                 || hit.path.display().to_string(),
@@ -216,6 +217,7 @@ fn to_results(hits: Vec<IndexHit>, generation: arke_core::service::Gen) -> Searc
         truncated: false,
         contents: false,
         read: 0,
+        similar,
     }
 }
 
@@ -242,12 +244,17 @@ impl Explorer {
             return;
         }
         let global = scope == Scope::Computer;
+        // Similar results open (or shown because nothing matched as typed) in one scope stay
+        // closed in another until asked for there.
+        self.similar_open = None;
+        self.similar_fallback = None;
         if self.search_mode && global != self.search_global {
             // Subfolders <-> this PC: old results can't stay.
             self.search.stop();
             self.search_root = None;
             self.search_results = None;
             self.search_cursor = None;
+            self.reset_search_pick();
             self.global_task = None;
         }
         self.search_global = global;
@@ -326,14 +333,6 @@ impl Explorer {
     pub(super) fn bind_scope_actions<E: InteractiveElement>(el: E, cx: &mut Context<Self>) -> E {
         el.on_action(cx.listener(|this, _: &PanelEnter, window, cx| {
             let at = PanelItem::Scope(this.scope());
-            this.focus_panel(at, window, cx);
-        }))
-        .on_action(cx.listener(|this, _: &PanelEnterLast, window, cx| {
-            let at = this
-                .panel_rows(cx)
-                .last()
-                .and_then(|row| row.first().copied())
-                .unwrap_or(PanelItem::Contents);
             this.focus_panel(at, window, cx);
         }))
     }
@@ -423,7 +422,12 @@ impl Explorer {
         let rows = self.panel_rows(cx);
         let at = self.panel_at(&rows);
         let Some(next) = step(&rows, at, mv) else {
-            self.panel_to_box(window, cx);
+            // Tab past the last row leaves the search for the next stop of the window.
+            if mv == Move::NextRow {
+                cx.emit(ExplorerEvent::StepStop(true));
+            } else {
+                self.panel_to_box(window, cx);
+            }
             return;
         };
         match (next, mv) {
@@ -569,31 +573,27 @@ impl Explorer {
             if query.is_empty() || !g.enabled() {
                 None
             } else {
-                g.search(query.clone(), MAX_COMPUTER_HITS, cx)
+                // Similar names (#396) only once asked for, or when none match as typed.
+                g.search(query.clone(), MAX_COMPUTER_HITS, self.similar_opened(), cx)
             }
         });
         let Some(search) = search else {
             self.global_task = None;
             self.search_results = None;
             self.search_cursor = None;
+            self.reset_search_pick();
             cx.notify();
             return;
         };
         self.global_task = Some(cx.spawn(async move |this, cx| {
-            let hits = search.await;
+            let found = search.await;
             let _ = this.update(cx, |this, cx| {
                 if this.global_serial != serial || this.scope() != Scope::Computer {
                     return;
                 }
-                let results = this.without_gone(to_results(hits, this.search.current_gen()));
+                let results = this.without_gone(to_results(found, this.search.current_gen()));
                 let results = this.arrange_results(results);
-                let len = results.hits.len();
-                this.search_cursor = match this.search_cursor {
-                    _ if len == 0 => None,
-                    Some(ix) => Some(ix.min(len - 1)),
-                    None => Some(0),
-                };
-                this.search_results = Some(results);
+                this.show_search_results(results);
                 cx.notify();
             });
         }));
@@ -628,17 +628,40 @@ impl Explorer {
     pub(super) fn computer_info(&self, cx: &App) -> Vec<String> {
         let mut parts = Vec::new();
         if let Some(r) = &self.search_results {
-            // The index returns only the top matches, so the total is unknown.
-            parts.push(if r.hits.len() >= MAX_COMPUTER_HITS {
-                t!("scope.top_hits", count = format_count(MAX_COMPUTER_HITS)).into_owned()
-            } else {
-                tn!("info.matched", r.hits.len()).into_owned()
-            });
+            // The index returns only the top matches, so the total is unknown. Exact and similar
+            // matches are capped apart.
+            let exact = r.hits.len() - r.similar;
+            parts.push(
+                if exact >= MAX_COMPUTER_HITS || r.similar >= MAX_COMPUTER_HITS {
+                    t!("scope.top_hits", count = format_count(MAX_COMPUTER_HITS)).into_owned()
+                } else {
+                    tn!("info.matched", r.hits.len()).into_owned()
+                },
+            );
         }
         if let Some(status) = index_status_text(cx) {
             parts.push(status);
         }
+        if self
+            .search_results
+            .as_ref()
+            .is_some_and(|r| !r.hits.is_empty())
+            && index_incomplete(cx)
+        {
+            parts.push(t!("scope.results_incomplete").into_owned());
+        }
         parts
+    }
+
+    /// Whether "this PC" shows the "still indexing" state instead of results: the index is
+    /// incomplete ([`index_incomplete`]) and nothing has been found yet (a search that finished
+    /// empty would otherwise read as "no matches").
+    pub(crate) fn shows_building_state(&self, cx: &App) -> bool {
+        index_incomplete(cx)
+            && self
+                .search_results
+                .as_ref()
+                .is_none_or(|r| r.hits.is_empty() && !r.searching)
     }
 
     /// Placeholder for "this PC" when there's nothing to list yet (off, no text, still indexing);
@@ -665,8 +688,7 @@ impl Explorer {
                 Some(t!("search.syntax").into_owned()),
             ));
         }
-        let building = GlobalSearch::global(cx).is_some_and(|g| g.read(cx).status.count.is_none());
-        if building && self.search_results.is_none() {
+        if self.shows_building_state(cx) {
             return Some(Self::empty_state(
                 svg()
                     .path(Icon::Drive.path())
@@ -820,6 +842,31 @@ impl Explorer {
                 |n| n.to_string_lossy().into_owned(),
             )
         })
+    }
+
+    /// The search box's placeholder for the scope in use, always starting with the same verb:
+    /// "Search <folder> (Ctrl+F)", "Search subfolders of <folder>", "Search this PC". `short`
+    /// drops the folder's name, for a box too narrow for it.
+    pub(crate) fn filter_placeholder(&self, locale: &str, short: bool) -> String {
+        let name = if short {
+            None
+        } else if self.scope() == Scope::Subfolders {
+            self.search_in_name().or_else(|| self.folder_label())
+        } else {
+            self.folder_label()
+        };
+        match (self.scope(), name) {
+            (Scope::Here, None) => t!("filter.placeholder", locale = locale),
+            (Scope::Here, Some(folder)) => {
+                t!("filter.placeholder_in", folder = folder, locale = locale)
+            }
+            (Scope::Subfolders, None) => t!("filter.search_placeholder", locale = locale),
+            (Scope::Subfolders, Some(name)) => {
+                t!("filter.search_in_placeholder", name = name, locale = locale)
+            }
+            (Scope::Computer, _) => t!("filter.computer_placeholder", locale = locale),
+        }
+        .into_owned()
     }
 
     pub(super) fn render_scope_chip(
@@ -1115,6 +1162,15 @@ impl Explorer {
     pub(crate) const fn panel_dismissed_for_test(&self) -> bool {
         self.panel_dismissed
     }
+}
+
+/// The whole-PC index is being built with no finished one to answer from (first run, or after
+/// an update changed its format): searches only see what the walk has found so far.
+fn index_incomplete(cx: &App) -> bool {
+    GlobalSearch::global(cx).is_some_and(|g| {
+        let g = g.read(cx);
+        g.enabled() && g.status.count.is_none()
+    })
 }
 
 /// Index status ("this PC N items · live updates…"); `None` when off.

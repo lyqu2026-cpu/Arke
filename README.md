@@ -79,6 +79,7 @@ Arke was featured in [Ruan Yifeng's tech weekly #420](https://www.ruanyifeng.com
 **Browse**
 - Details, icons (any size up to 256 px, Ctrl+mouse wheel) and columns views. In Details, folders
   can expand in place, and you can sort by several columns, reorder columns and show link targets.
+  Items can be grouped, and a click on a group's header collapses it.
 - Each folder remembers its view and sort.
 - Tabs you can pin or save as workspaces. Split a tab into two panes with one shared preview,
   synchronized browsing and folder compare. Middle-click or Ctrl+click a folder in the sidebar, on
@@ -99,8 +100,9 @@ Arke was featured in [Ruan Yifeng's tech weekly #420](https://www.ruanyifeng.com
 - Swipe with two fingers on a touchpad to go back and forward, like in a browser.
 - The sidebar can be made wider by dragging its edge and collapses to a column of icons (Ctrl+B),
   which can be set to open over the content when you rest the pointer on it (off by default).
-  Favorites, This PC and Network each collapse with a click on their heading, and the folder tree
-  follows the folder you're in. Columns in the columns view can be resized.
+  Favorites, This PC and Network each collapse with a click on their heading, Home, Favorites and
+  This PC can be hidden, and the folder tree follows the folder you're in. The › before the drive
+  in the path bar jumps to Home, Documents, any drive or a network share you opened. Columns in the columns view can be resized.
 - Interface scale from 80% to 150%, on top of Windows' own scale.
 - Command palette (Ctrl+Shift+P) for every command, and shortcuts you can change.
 
@@ -108,7 +110,7 @@ Arke was featured in [Ruan Yifeng's tech weekly #420](https://www.ruanyifeng.com
 - A resizable preview pane and Quick Look (Space) for images (SVG too), PDF, Word, Excel and
   PowerPoint, text and code with syntax highlighting, Markdown, archives, `.gz` files and folders.
 - Videos show a frame and PDFs their first page as their thumbnail. Quick Look zooms text, documents and PDF pages
-  (Ctrl+wheel), and with QuickLook installed, Space can open that instead.
+  (Ctrl+wheel), and Space can go to another preview program, such as QuickLook, instead.
 
 **Search**
 - As you type, in this folder, its subfolders or the whole computer, with fuzzy matching and
@@ -118,8 +120,9 @@ Arke was featured in [Ruan Yifeng's tech weekly #420](https://www.ruanyifeng.com
 
 **Files**
 - Copy and move through the Windows shell engine with progress, undo and redo. Jobs on the same
-  drive queue up and can be paused, with optional verify after copy or hand-off to TeraCopy
-  (experimental).
+  drive queue up and can be paused, with optional verify after copy or hand-off to another copy
+  program such as TeraCopy (experimental). Many small files between local SSDs are copied several at a time, much faster
+  than one by one.
 - Batch rename, "Move to new folder", and a move/copy/shortcut menu when you drag with the right
   mouse button or drop with Alt held.
 - A Properties window of its own (Alt+Enter): sizes, where a folder's space goes, attributes, the
@@ -133,6 +136,8 @@ Arke was featured in [Ruan Yifeng's tech weekly #420](https://www.ruanyifeng.com
   allow it for that location). Mapped drives and network places can get names of their own, kept
   in Arke only.
 - OneDrive and other cloud folders with sync status. Previews never download online-only files.
+- Phones and other devices connected by USB show under This PC: browse them, open files
+  and copy them to the PC (read-only for now, so nothing on the device changes).
 - Archives: preview and extract zip and 7z (password-protected ones too), tar (.gz, .xz, .bz2, .zst) and RAR, compress to zip.
   RAR and the xz / bzip2 / zstd tars use the libarchive built into Windows (best on Windows 11
   23H2 and later).
@@ -142,7 +147,8 @@ Arke was featured in [Ruan Yifeng's tech weekly #420](https://www.ruanyifeng.com
   second instead of 40 s, since Windows doesn't check every file first. Restore works as usual, and
   anything it can't vouch for (network drives, OneDrive, files in use, policies) is left to Windows.
   It can be turned off in settings. Loose files take a few milliseconds each, still two to six times
-  faster than Windows.
+  faster than Windows. When the Recycle Bin is full, the oldest items make room, as in File
+  Explorer, without slowing the delete down.
 - Updates download quietly in the background and install the next time Arke restarts, never while
   files are being copied and never over a metered connection.
 - Menus open in windows of their own, like Windows menus, so near the edge they reach past Arke's
@@ -161,8 +167,8 @@ Arke was featured in [Ruan Yifeng's tech weekly #420](https://www.ruanyifeng.com
   turn on "Win+E and the File Explorer icon open Arke too".
 - Screen reader support, x64 and ARM64 builds (both tested on real hardware),
   taskbar jump list, safe USB eject, system tray, settings backup. English, Simplified and
-  Traditional Chinese, Japanese, German, Spanish and Brazilian Portuguese (the last four are new
-  in 0.8; corrections to the wording are welcome in issues).
+  Traditional Chinese, Japanese, German, Spanish and Brazilian Portuguese (corrections to the
+  wording are welcome in issues).
 
 *Experimental* features are covered by automated tests and local test servers but not yet widely
 used; see the [changelog](CHANGELOG.md). Feedback in issues is welcome.
@@ -236,7 +242,8 @@ scoop install arke/arke
 
 Scoop then keeps it up to date (`scoop update arke`), and Arke leaves updating to it.
 
-Builds aren't code-signed yet, so SmartScreen may ask for confirmation the first time.
+Builds aren't code-signed yet, so SmartScreen may ask for confirmation the first time. Signing
+through SignPath Foundation is on the way, see [Code signing policy](#code-signing-policy).
 
 Arke checks GitHub for a new version at most once a day and only installs one when you say so
 (Settings › About). Updates are signed: Arke installs only files signed with its own key. Where
@@ -254,8 +261,11 @@ never reports names inside other users' profile folders. You can remove it from 
 ## Search syntax
 
 Type in the search box (Ctrl+F). The panel below it picks the scope (this folder, subfolders or
-the whole computer) and the filters; Tab moves into it. Words are matched fuzzily, so `rprt` finds
-`report`. Filters can also be typed and combined:
+the whole computer) and the filters; Tab moves into it. This folder is filtered fuzzily, so `rprt`
+finds `report`. Subfolders and the whole computer list the names that contain the words as typed;
+names that only have their letters in order wait under "Similar results" until it is opened, and
+show right away when nothing matches as typed. Start with `'` (`'report`) for exact matches only.
+Filters can also be typed and combined:
 
 | Filter | Example | Meaning |
 | --- | --- | --- |
@@ -280,12 +290,15 @@ ranks higher; turn it off or clear it in Settings › Search.
 | --- | --- |
 | Ctrl+T | Go to a folder (recent places, open tabs and paths) |
 | Ctrl+Shift+P | Command palette: search any command and run it; every shortcut can be changed in Settings › Keyboard shortcuts |
+| Ctrl+N | New window on the current folder |
 | Ctrl+W · Ctrl+Shift+T | Close tab (in split view, the active side) · reopen closed tab |
 | Ctrl+Tab · Ctrl+Shift+Tab · Ctrl+1…9 | Switch tabs |
 | Ctrl+Shift+S · Ctrl+Shift+D | Dual pane: synchronized browsing · compare folders |
-| Tab · Alt+C · Alt+M | Split view: switch panes · copy · move the selection to the other pane |
+| Alt+C · Alt+M | Split view: copy · move the selection to the other pane |
 | Ctrl+F · Ctrl+Shift+F · Ctrl+K | Search this folder · this folder and subfolders · the whole computer; Tab moves into the scope and filters |
 | Ctrl+L · Alt+D | Edit the path |
+| F6 · Shift+F6 | Next · previous area: file list, sidebar, path bar, toolbar, search box |
+| Tab · Shift+Tab | Next · previous stop: each file list (so also the other pane), sidebar, path bar, each toolbar button, search box |
 | Alt+← · Alt+→ · Alt+↑ | Back · forward · up |
 | F5 · Ctrl+R | Refresh |
 | Space | Quick look |
@@ -306,12 +319,12 @@ ranks higher; turn it off or clear it in Settings › Search.
 ## Accessibility
 
 Arke works with Windows screen readers through UI Automation, the interface Narrator and NVDA use;
-JAWS should work too. So far it has been checked with UI Automation tools, not yet by people who
-use a screen reader every day, so help with testing is welcome.
+JAWS should work too. It has been checked with NVDA and with UI Automation tools. Feedback from
+people who use a screen reader every day is very welcome, other screen readers included.
 
-What works: the file list, the sidebar, tabs, the path bar, search, Settings, menus and the
-Properties window. What is still incomplete: the toolbar buttons can't be reached with Tab yet
-(use F6 and the shortcuts instead), and some dialogs haven't been checked.
+What works, from the keyboard and with a screen reader: the file list, the sidebar, tabs, the path
+bar, the toolbar, search, Settings, menus and the Properties window. F6 and Shift+F6 move between
+the areas. Some dialogs haven't been checked yet.
 
 The [keyboard guide](docs/keyboard.md) lists every shortcut by area. If something can't be reached
 or isn't announced, please [open an issue](https://github.com/Koimsurai/Arke/issues) and mention
@@ -388,7 +401,7 @@ when Arke restarts after an update, Arke puts the version you had back and says 
 <summary><b>Will there be a Linux or macOS version?</b></summary>
 
 Not yet. `crates/core` is mostly platform-independent, but the parts that make Arke fast on
-Windows (the MFT index, shell integration) are Windows-specific. Tell us in an issue what you'd
+Windows (the MFT index, shell integration) are Windows-specific. Tell me in an issue what you'd
 need.
 
 </details>
@@ -433,7 +446,20 @@ framework of the Zed editor, and on the open-source crates listed in
 [Everything](https://www.voidtools.com/), the look owes a lot to the
 [Files](https://files.community/) app, and the tab sidebar is a nod to the Arc browser.
 
+Thanks to the [LINUX DO](https://linux.do) community.
+
 The name comes from Greek myth: Arke is the twin sister of Iris, both winged messengers.
+
+## Code signing policy
+
+Free code signing provided by [SignPath.io](https://about.signpath.io/), certificate by
+[SignPath Foundation](https://signpath.org/).
+
+- Committers and reviewers: [Koimsurai](https://github.com/Koimsurai)
+- Approvers: [Koimsurai](https://github.com/Koimsurai)
+
+Only exes built by this repository's release workflow on GitHub Actions from a tagged commit are
+signed, and each release is approved by hand before it is signed.
 
 ## Privacy
 

@@ -29,6 +29,7 @@ use crate::explorer::{Explorer, ExplorerEvent, PaneInfo, Services, StartClock, k
 use crate::net_dialog::{NetDialog, NetDialogEvent, NetDialogKind};
 use crate::palette::{Candidate, Command, LocationPalette, PaletteEvent, Source, Target};
 use crate::settings::{NewTabAction, SettingsStore, TabLayout};
+use crate::splitter::{DragEnd, Splitter};
 use crate::theme::{self, UiFont as _};
 
 #[path = "workspace_backup.rs"]
@@ -69,6 +70,8 @@ mod tabdrag;
 mod tabghost;
 #[path = "workspace_tabmove.rs"]
 mod tabmove;
+#[path = "workspace_tabstrip.rs"]
+mod tabstrip;
 #[path = "workspace_uninstall.rs"]
 mod uninstall_page;
 #[path = "workspace_update.rs"]
@@ -78,8 +81,10 @@ mod welcome;
 #[path = "workspace_whats_new.rs"]
 pub(crate) mod whats_new_page;
 use settings_panel::CloseSettings;
-pub(crate) use settings_panel::{OpenSettings, switch};
-pub(crate) use sidebar::{leave_drive_everywhere, reload_places_everywhere};
+pub(crate) use settings_panel::{OpenSettings, flyout_switch};
+pub(crate) use sidebar::{
+    leave_drive_everywhere, reload_places_everywhere, reload_remote_everywhere,
+};
 pub(crate) use tabmove::MovedTab;
 
 /// The Arke window used last, where folders from other programs open as tabs (#11). gpui has no
@@ -111,7 +116,9 @@ actions!(
         /// The saved workspaces panel.
         OpenWorkspaces,
         /// Collapses the sidebar to a column of icons, or expands it (Ctrl+B, #91).
-        ToggleSidebar
+        ToggleSidebar,
+        /// The setup guide (`workspace_welcome.rs`), again from its first step.
+        OpenSetupGuide
     ]
 );
 
@@ -139,6 +146,7 @@ pub(crate) fn bind_keys(cx: &mut App) {
     crate::net_dialog::bind_keys(cx);
     crate::archive_password::bind_keys(cx);
     crate::recycle_bin::bind_keys(cx);
+    crate::home::bind_keys(cx);
     let ctx = Some("Workspace");
     cx.bind_keys([
         KeyBinding::new("ctrl-t", OpenPalette, ctx),
@@ -180,6 +188,10 @@ struct Pane {
     /// Folder this pane last finished opening, to tell what kind of move the next one was
     /// (synchronized browsing repeats it in the other pane).
     last: Option<PathBuf>,
+    /// The folder "Open folders in Arke" opened here after ending File Explorer's launcher (#285),
+    /// and the mark's place in order ([`next_early_mark`]), until this side moves elsewhere or a
+    /// File Explorer window that came anyway used it ([`Workspace::merge_early`]).
+    early: Option<(PathBuf, u64)>,
     _subscriptions: [Subscription; 2],
 }
 
@@ -231,6 +243,15 @@ thread_local! {
     static PIN_FLASH_SERIAL: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
 }
 
+/// Orders the marks "Open folders in Arke" leaves on the tabs it opens early (#285), across windows:
+/// a late File Explorer window uses the newest. A count, not a clock.
+static EARLY_MARKS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// The next (newest) early-takeover mark.
+fn next_early_mark() -> u64 {
+    EARLY_MARKS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1
+}
+
 /// Flashes this sidebar list row, e.g. after pinning overflowed from the tiles into the list.
 pub(crate) fn flash_pin(path: PathBuf) {
     let serial = PIN_FLASH_SERIAL.with(|s| {
@@ -260,6 +281,48 @@ const fn index_after_move(ix: usize, from: usize, to: usize) -> usize {
         ix + 1
     } else {
         ix
+    }
+}
+
+#[cfg(test)]
+mod sign_in_reopen_tests {
+    use super::reopen_path_after_sign_in as reopen;
+    use std::path::PathBuf;
+
+    fn p(s: &str) -> PathBuf {
+        PathBuf::from(s)
+    }
+
+    #[test]
+    fn fills_in_the_user_that_signed_in() {
+        let done = p("http://arke@127.0.0.1:63110");
+        assert_eq!(
+            reopen(p("http://127.0.0.1:63110/docs/a"), &done),
+            p("http://arke@127.0.0.1:63110/docs/a")
+        );
+        assert_eq!(
+            reopen(p("http://127.0.0.1:63110"), &done),
+            p("http://arke@127.0.0.1:63110")
+        );
+        assert_eq!(
+            reopen(p("http://other@127.0.0.1:63110/docs"), &done),
+            p("http://arke@127.0.0.1:63110/docs")
+        );
+    }
+
+    #[test]
+    fn leaves_everything_else_alone() {
+        let done = p("http://arke@127.0.0.1:63110/x");
+        for same in [
+            "http://arke@127.0.0.1:63110/docs",
+            "http://127.0.0.1:63111/docs",
+            "https://127.0.0.1:63110/docs",
+            "http://example.com:63110/docs",
+            r"\\server\share\docs",
+            r"C:\docs",
+        ] {
+            assert_eq!(reopen(p(same), &done), p(same), "{same}");
+        }
     }
 }
 
@@ -363,6 +426,11 @@ pub(crate) struct Workspace {
     closed: Vec<ClosedTab>,
     /// Sidebar tree: expanded folders and listed children.
     expanded: HashSet<PathBuf>,
+    /// The folders opened under the favorites list (#424): the same folder under This PC opens on
+    /// its own, and following the current folder never touches these.
+    fav_expanded: HashSet<PathBuf>,
+    /// `tree_cue` is a row under the favorites list, not the same folder under This PC.
+    tree_cue_fav: bool,
     /// The tree node just expanded or collapsed: its chevron turns and its children fade in.
     tree_cue: (Option<PathBuf>, crate::motion::Cue),
     /// A tab was just split: the new right pane (its view) slides in from the right as it fades in.
@@ -388,6 +456,9 @@ pub(crate) struct Workspace {
     net_dialog: Option<NetDialogSlot>,
     /// An archive's password, asked when extracting it (#346).
     archive_password: Option<ArchivePasswordSlot>,
+    /// Further archives asking for their password while that dialog is open (several extracted
+    /// at once, #407): asked one after another.
+    archive_password_waiting: Vec<(Entity<Explorer>, crate::archive_password::PasswordAsk)>,
     /// Saved workspaces panel.
     workspaces: Option<(Entity<saved::WorkspacesPanel>, Subscription)>,
     /// The saved workspace this window was opened from or saved as last (#269).
@@ -397,7 +468,7 @@ pub(crate) struct Workspace {
     settings_panel: Option<settings_panel::SettingsPage>,
     /// Open Recycle Bin page.
     recycle_page: Option<recycle_page::RecyclePage>,
-    home_page: Option<home_page::HomeView>,
+    home_pages: Vec<home_page::HomeView>,
     whats_new: Option<whats_new_page::WhatsNewView>,
     /// The tab a page tab is being opened from, until the page takes it as its opener.
     page_opener: Option<gpui::EntityId>,
@@ -507,6 +578,10 @@ impl Workspace {
         cx: &mut Context<Self>,
     ) {
         let (view, ask) = (view.clone(), ask.clone());
+        if self.archive_password.is_some() {
+            self.archive_password_waiting.push((view, ask));
+            return;
+        }
         let name = ask.archive.file_name().map_or_else(
             || ask.archive.display().to_string(),
             |n| n.to_string_lossy().into_owned(),
@@ -541,6 +616,10 @@ impl Workspace {
             slot.view.update(cx, |v, cx| {
                 v.extract_archive(slot.archive, slot.here, Some(password), cx);
             });
+        }
+        if !self.archive_password_waiting.is_empty() {
+            let (view, ask) = self.archive_password_waiting.remove(0);
+            self.ask_password(&view, &ask, window, cx);
         }
         cx.notify();
     }
@@ -601,9 +680,10 @@ impl Workspace {
                 }
                 // Reopen where sign-in was asked for (that folder, not just the server), or open
                 // the new location in the active tab.
-                let (view, path) = slot
-                    .after
-                    .unwrap_or_else(|| (self.active_view().clone(), url));
+                let (view, path) = match slot.after {
+                    Some((view, path)) => (view, reopen_path_after_sign_in(path, &place.url)),
+                    None => (self.active_view().clone(), url),
+                };
                 view.update(cx, |v, cx| v.navigate(path, arke_core::NavKind::New, cx));
             }
         }
@@ -631,6 +711,31 @@ impl Workspace {
     pub(crate) fn net_dialog_for_test(&self) -> Option<Entity<NetDialog>> {
         self.net_dialog.as_ref().map(|slot| slot.dialog.clone())
     }
+}
+
+/// Where to reopen `asked` after signing in at `signed_in`: the same folder, but with the user
+/// that signed in when it is on the same server and typed without that user (an address like
+/// `http://host/` has no password saved under it, so asking again would never end).
+pub(crate) fn reopen_path_after_sign_in(asked: PathBuf, signed_in: &Path) -> PathBuf {
+    use arke_core::remote::RemoteUrl;
+    let (Some(url), Some(done)) = (
+        RemoteUrl::from_path(&asked),
+        RemoteUrl::from_path(signed_in),
+    ) else {
+        return asked;
+    };
+    if url.scheme != done.scheme
+        || url.host != done.host
+        || url.port != done.port
+        || url.user == done.user
+    {
+        return asked;
+    }
+    RemoteUrl {
+        user: done.user,
+        ..url
+    }
+    .to_path()
 }
 
 /// Actual accent color for the setting; `None` is the default Arke orange.
@@ -668,6 +773,7 @@ pub(crate) fn apply_theme(window: &mut Window, cx: &mut App) {
     theme::set_font(&look.font);
     theme::set_scale(look.ui_scale);
     theme::set_sidebar_base(look.sidebar_width);
+    theme::set_density(look.density);
     theme::set_backdrop(look.background_image.clone().map(|path| {
         (
             path,
@@ -772,8 +878,6 @@ impl Workspace {
             crate::quick_access::refresh(&this.services.shell, places, cx);
             // Another program may have added or deleted files.
             this.refresh_disk_space(cx);
-            // QuickLook may have been started or quit while Arke was in the background.
-            Self::recheck_quicklook(cx);
             // Shelf items may have been moved or deleted outside Arke.
             let fs = Arc::clone(&this.services.fs);
             crate::shelf::ShelfStore::global(cx).update(cx, |s, cx| s.recheck(fs, cx));
@@ -811,6 +915,8 @@ impl Workspace {
             tabs: Vec::new(),
             active: 0,
             expanded: HashSet::new(),
+            fav_expanded: HashSet::new(),
+            tree_cue_fav: false,
             tree_cue: (None, crate::motion::Cue::default()),
             split_cue: (None, crate::motion::Cue::default()),
             tree_children: HashMap::new(),
@@ -822,12 +928,13 @@ impl Workspace {
             closing_palette: None,
             net_dialog: None,
             archive_password: None,
+            archive_password_waiting: Vec::new(),
             workspaces: None,
             saved_shown: None,
             _saved_workspaces: saved_workspaces,
             settings_panel: None,
             recycle_page: None,
-            home_page: None,
+            home_pages: Vec::new(),
             whats_new: None,
             page_opener: None,
             startup: if start_default {
@@ -1027,7 +1134,7 @@ impl Workspace {
             if saved.home {
                 // Home over its folder, as it was left; back shows the folder.
                 self.active = tab_ix;
-                self.open_home_as(false, false, window, cx);
+                self.open_home_fresh(false, false, window, cx);
             }
         }
         ids
@@ -1035,7 +1142,6 @@ impl Workspace {
 
     /// Snapshot of this window's tabs for the last session. Panes without a path are skipped.
     pub(crate) fn session_snapshot(&self, cx: &App) -> crate::settings::Session {
-        let home_tab = self.home_page.as_ref().and_then(|p| self.tab_of(&p.owner));
         let shown = self.saved_shown.as_ref();
         let mut tabs: Vec<crate::settings::SessionTab> = Vec::with_capacity(self.tabs.len());
         let mut shown_tabs = Vec::new();
@@ -1056,7 +1162,7 @@ impl Workspace {
                 ratio: tab.ratio,
                 pinned: tab.pinned,
                 synced: tab.synced && panes.len() > 1,
-                home: home_tab == Some(ix),
+                home: self.tab_has_home(ix),
                 panes,
             });
         }
@@ -1296,6 +1402,7 @@ impl Workspace {
         Pane {
             view,
             last: None,
+            early: None,
             _subscriptions: [events, observe],
         }
     }
@@ -1346,6 +1453,88 @@ impl Workspace {
         let depth = usize::from(path.parent().is_some());
         let items = self.folder_menu(path, sidebar::MenuFor::Tree { depth }, cx);
         self.open_sidebar_menu(position, items, cx);
+    }
+
+    /// A pane arrived at a folder: the timeline, Recent, remembered places.
+    fn on_navigated(
+        &mut self,
+        source: &Entity<Explorer>,
+        (tab_ix, pane_ix): (usize, usize),
+        path: &Path,
+        (stepped, kind): (bool, NavKind),
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if stepped {
+            self.note_navigation(source.entity_id(), cx);
+        }
+        // A page that gave way to this folder had the keyboard focus: the list takes it back, or
+        // Alt+Left and Alt+Right would find nothing to act on. A step of the history lands here
+        // before the page is dropped by a frame, and its focus handle may live on, so drop what
+        // this arrival made stale first and move the focus whatever it is on now.
+        let stepped_by_history = matches!(
+            kind,
+            NavKind::Back | NavKind::Forward | NavKind::Jump { .. }
+        );
+        if stepped_by_history && self.active_view().entity_id() == source.entity_id() {
+            self.recycle_follow_navigation(cx);
+            self.home_follow_navigation(cx);
+            if !self.page_shown() {
+                self.focus_active(window, cx);
+            }
+        } else if kind != NavKind::Refresh
+            && window.focused(cx).is_none()
+            && self.active_view().entity_id() == source.entity_id()
+        {
+            self.focus_active(window, cx);
+        }
+        self.history_landed(source.entity_id(), kind, cx);
+        crate::search_history::SearchHistory::record(path, true, cx);
+        SettingsStore::global(cx).update(cx, |s, cx| {
+            s.update(
+                |st| {
+                    st.remember(path);
+                    st.remember_share(path);
+                },
+                cx,
+            );
+        });
+        self.pane_navigated(tab_ix, pane_ix, path, cx);
+    }
+
+    /// History stepped onto a page, or off one back to the folder under it.
+    fn on_history_page(
+        &mut self,
+        source: &Entity<Explorer>,
+        event: &ExplorerEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let kind = match event {
+            ExplorerEvent::PageShown { page, kind } => {
+                self.show_history_page(source, *page, window, cx);
+                *kind
+            }
+            ExplorerEvent::PageHidden { kind } => {
+                self.hide_pages_of(source, window, cx);
+                *kind
+            }
+            _ => return,
+        };
+        self.history_landed(source.entity_id(), kind, cx);
+    }
+
+    /// A remote folder changed (servers send no change notifications): every pane showing it
+    /// relists.
+    pub(crate) fn reload_remote(&self, path: &Path, cx: &mut Context<Self>) {
+        let views: Vec<_> = self
+            .tabs
+            .iter()
+            .flat_map(|t| t.panes.iter().map(|p| p.view.clone()))
+            .collect();
+        for view in views {
+            view.update(cx, |v, cx| v.reload_if_showing(path, cx));
+        }
     }
 
     fn on_explorer_event(
@@ -1404,29 +1593,22 @@ impl Workspace {
                 );
             }
             // Record once per real navigation. Doing this in observe would make two panes trigger each other via settings.
-            ExplorerEvent::BackToHome { start } => self.back_to_home(source, *start, window, cx),
+            ExplorerEvent::PageShown { .. } | ExplorerEvent::PageHidden { .. } => {
+                self.on_history_page(source, event, window, cx);
+            }
             ExplorerEvent::OpenHome => self.open_home(false, window, cx),
             ExplorerEvent::Navigated {
                 path,
                 stepped,
                 kind,
-            } => {
-                if *stepped {
-                    self.note_navigation(source.entity_id(), cx);
-                }
-                self.history_landed(source.entity_id(), *kind, cx);
-                crate::search_history::SearchHistory::record(path, true, cx);
-                SettingsStore::global(cx).update(cx, |s, cx| {
-                    s.update(
-                        |st| {
-                            st.remember(path);
-                            st.remember_share(path);
-                        },
-                        cx,
-                    );
-                });
-                self.pane_navigated(tab_ix, pane_ix, path, cx);
-            }
+            } => self.on_navigated(
+                source,
+                (tab_ix, pane_ix),
+                path,
+                (*stepped, *kind),
+                window,
+                cx,
+            ),
             ExplorerEvent::ToggleSync => self.toggle_sync(tab_ix, cx),
             ExplorerEvent::RenamePlace(path) => self.start_place_rename(path, window, cx),
             ExplorerEvent::FolderMenu { path, position } => {
@@ -1434,22 +1616,16 @@ impl Workspace {
             }
             ExplorerEvent::ToggleCompare => self.toggle_compare(tab_ix, cx),
             ExplorerEvent::SelectDifferences => self.select_differences(tab_ix, cx),
-            ExplorerEvent::RemoteChanged(path) => {
-                let views: Vec<_> = self
-                    .tabs
-                    .iter()
-                    .flat_map(|t| t.panes.iter().map(|p| p.view.clone()))
-                    .collect();
-                for view in views {
-                    view.update(cx, |v, cx| v.reload_if_showing(path, cx));
-                }
-            }
+            ExplorerEvent::RemoteChanged(path) => self.reload_remote(path, cx),
             ExplorerEvent::WindowMenu(position) => self.open_window_menu(*position, window, cx),
             ExplorerEvent::ImportSettings(path) => {
                 self.import_settings_from_menu(path.clone(), window, cx);
             }
             ExplorerEvent::FocusOtherPane => {
                 self.activate_pane(tab_ix, 1 - pane_ix.min(1), window, cx);
+            }
+            ExplorerEvent::StepStop(forward) => {
+                self.step_stop(*forward, window, cx);
             }
             ExplorerEvent::Arrived { dir, names } => {
                 self.select_arrived_beside(tab_ix, pane_ix, dir, names, cx);
@@ -1596,6 +1772,125 @@ impl Workspace {
         }
     }
 
+    /// "Open folders in Arke" just showed `target` here after ending File Explorer's launcher
+    /// (#285; [`Self::open_external`] or [`Self::show_taken_over`]): marks the side of the active
+    /// tab showing it, or the Recycle Bin page. The mark lives with that tab: it goes when the tab
+    /// closes or moves elsewhere, or the page closes, or a late window used it. Marked again, it
+    /// becomes the newest.
+    pub(crate) fn mark_early(&mut self, target: &arke_core::takeover::Target, cx: &App) {
+        use arke_core::takeover::Target;
+        let mark = next_early_mark();
+        match target {
+            Target::Folder(path) => {
+                let active = self.active;
+                let Some(tab) = self.tabs.get_mut(active) else {
+                    return;
+                };
+                let Some(pane) = tab.panes.get_mut(tab.active_pane) else {
+                    return;
+                };
+                if pane
+                    .view
+                    .read(cx)
+                    .display_path()
+                    .is_some_and(|p| crate::explorer::same_folder(p, path))
+                {
+                    pane.early = Some((path.clone(), mark));
+                }
+            }
+            Target::RecycleBin => {
+                if let Some(page) = &mut self.recycle_page {
+                    page.early = Some(mark);
+                }
+            }
+            Target::Home => {}
+        }
+    }
+
+    /// The newest mark here ([`Self::mark_early`]) a File Explorer window on `target` would use,
+    /// to compare windows: the newest of all of them wins (`main.rs` `merge_into_early_tab`).
+    pub(crate) fn early_mark(&self, target: &arke_core::takeover::Target, cx: &App) -> Option<u64> {
+        use arke_core::takeover::Target;
+        match target {
+            Target::Folder(path) => self.early_pane(path, cx).map(|(_, _, mark)| mark),
+            Target::RecycleBin => self
+                .recycle_page
+                .as_ref()
+                .filter(|page| self.tab_of(&page.owner).is_some())
+                .and_then(|page| page.early),
+            Target::Home => None,
+        }
+    }
+
+    /// A File Explorer window on `target` came although "Open folders in Arke" ended its launcher
+    /// (#285: the launcher had handed it over already), or some other program opened it then: if a
+    /// tab marked by [`Self::mark_early`] still shows it, the newest such tab comes forward with
+    /// `select` selected there, and nothing else opens. The mark is used up: one launch merges at
+    /// most once. False when no tab here holds such a mark.
+    pub(crate) fn merge_early(
+        &mut self,
+        target: &arke_core::takeover::Target,
+        select: Vec<Arc<str>>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        use arke_core::takeover::Target;
+        match target {
+            Target::Folder(path) => {
+                let Some((tab, pane, _)) = self.early_pane(path, cx) else {
+                    return false;
+                };
+                self.tabs[tab].panes[pane].early = None;
+                self.activate_pane(tab, pane, window, cx);
+                // No selection read from the window: what the tab has selected stays.
+                if !select.is_empty() {
+                    self.active_view()
+                        .update(cx, |e, cx| e.select_in_folder(path, select, cx));
+                }
+                true
+            }
+            Target::RecycleBin => {
+                if self.early_mark(target, cx).is_none() {
+                    return false;
+                }
+                let Some(page) = self.recycle_page.as_mut() else {
+                    return false;
+                };
+                page.early = None;
+                let owner = page.owner.clone();
+                self.go_to_page(Some(&owner), window, cx)
+            }
+            Target::Home => false,
+        }
+    }
+
+    /// The tab side with the newest [`Self::mark_early`] mark for `path` that still shows it with
+    /// no page over it, and that mark.
+    fn early_pane(&self, path: &Path, cx: &App) -> Option<(usize, usize, u64)> {
+        let mark = |pane: &Pane| {
+            let (early, mark) = pane.early.as_ref()?;
+            let shows = crate::explorer::same_folder(early, path)
+                && self.page_title(pane.view.entity_id()).is_none()
+                && pane
+                    .view
+                    .read(cx)
+                    .display_path()
+                    .is_some_and(|p| crate::explorer::same_folder(p, path));
+            shows.then_some(*mark)
+        };
+        let mut newest: Option<(usize, usize, u64)> = None;
+        for (t, tab) in self.tabs.iter().enumerate() {
+            for (p, pane) in tab.panes.iter().enumerate() {
+                if let Some(m) = mark(pane)
+                    && newest.is_none_or(|(_, _, n)| m > n)
+                {
+                    newest = Some((t, p, m));
+                }
+            }
+        }
+        newest
+    }
+
     /// [`Self::open_tab`], returning where the tab went: new tabs never go among the pinned ones.
     fn insert_tab(
         &mut self,
@@ -1673,8 +1968,7 @@ impl Workspace {
                 // Already on Home: there is nothing left to close.
                 if !self.home_open() {
                     self.remember_closed(ix, cx);
-                    self.home_page = None;
-                    self.open_home_as(false, true, window, cx);
+                    self.open_home_fresh(false, true, window, cx);
                 }
                 return;
             }
@@ -2343,18 +2637,27 @@ impl Workspace {
         self.shared_preview = shared;
     }
 
-    /// Saves the sidebar width the drag ended on.
+    /// Saves the sidebar width the drag ended on (if one was under way).
     pub(crate) fn finish_sidebar_drag(&mut self, cx: &mut Context<Self>) {
-        self.sidebar_resizing = false;
+        if !std::mem::take(&mut self.sidebar_resizing) {
+            log::debug!(target: "arke::splitter", "sidebar-edge: no drag under way");
+            return;
+        }
         let width = theme::sidebar_base();
+        log::debug!(target: "arke::splitter", "sidebar-edge: drag ended, width {width} saved");
         SettingsStore::global(cx).update(cx, |s, cx| s.update(|st| st.sidebar_width = width, cx));
         cx.notify();
     }
 
     /// Saves the places' height the drag of the line above the tabs ended on (at 100% scale), as
-    /// tall as they were drawn: a drag past what the tabs leave stops where they stopped.
+    /// tall as they were drawn: a drag past what the tabs leave stops where they stopped. A press
+    /// that didn't move saves nothing.
     pub(crate) fn finish_split_drag(&mut self, cx: &mut Context<Self>) {
-        if self.split_drag.take().is_none() {
+        let Some((_, from, to)) = self.split_drag.take() else {
+            return;
+        };
+        if from == to {
+            cx.notify();
             return;
         }
         let drawn = f32::from(self.sidebar_ui.places_scroll.bounds().size.height);
@@ -2376,81 +2679,44 @@ impl Workspace {
         if theme::sidebar_collapsed() {
             return None;
         }
-        let active = self.sidebar_resizing;
+        let hit = div()
+            .absolute()
+            .top_0()
+            .bottom_0()
+            .left(theme::sidebar_full_width() - px(4.))
+            .w(px(8.));
+        let line = div().h_full().w(px(2.)).mx_auto();
         Some(
-            div()
-                .id("sidebar-edge")
-                .debug_selector(|| "sidebar-edge".to_owned())
-                .absolute()
-                .top_0()
-                .bottom_0()
-                .left(theme::sidebar_full_width() - px(4.))
-                .w(px(8.))
-                .cursor_col_resize()
-                .on_mouse_down(
-                    MouseButton::Left,
-                    cx.listener(|this, event: &MouseDownEvent, _, cx| {
-                        if event.click_count >= 2 {
-                            Self::reset_sidebar_width(cx);
-                        } else {
-                            this.sidebar_resizing = true;
-                        }
-                        cx.stop_propagation();
-                    }),
-                )
-                .child(
-                    div()
-                        .h_full()
-                        .w(px(2.))
-                        .mx_auto()
-                        .when(active, |d| d.bg(theme::signal()))
-                        .hover(|s| s.bg(theme::signal_line())),
-                )
+            Splitter::new("sidebar-edge", gpui::CursorStyle::ResizeColumn)
+                .dragging(self.sidebar_resizing)
+                .on_start(cx.listener(|this, _: &MouseDownEvent, _, cx| {
+                    this.sidebar_resizing = true;
+                    log::debug!(target: "arke::splitter", "sidebar-edge: dragging");
+                    cx.notify();
+                }))
+                .on_double_click(cx.listener(|_, _: &MouseDownEvent, _, cx| {
+                    Self::reset_sidebar_width(cx);
+                }))
+                .on_drag(cx.listener(|_, e: &MouseMoveEvent, _, cx| {
+                    let base = f32::from(e.position.x) * 100. / theme::scale_pct() as f32;
+                    if theme::set_sidebar_base(base) {
+                        cx.notify();
+                    }
+                }))
+                .on_end(cx.listener(|this, _: &DragEnd, _, cx| this.finish_sidebar_drag(cx)))
+                .render(hit, line)
                 .into_any_element(),
         )
     }
 
-    fn on_mouse_move(
-        &mut self,
-        event: &MouseMoveEvent,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        if let Some((from_y, from_h, _)) = self.split_drag {
-            if event.pressed_button != Some(MouseButton::Left) {
-                self.finish_split_drag(cx);
-                return;
-            }
-            let height = (from_h + event.position.y - from_y).max(px(0.));
-            self.split_drag = Some((from_y, from_h, height));
-            cx.notify();
-            return;
-        }
-        if self.sidebar_resizing {
-            if event.pressed_button != Some(MouseButton::Left) {
-                self.finish_sidebar_drag(cx);
-                return;
-            }
-            let base = f32::from(event.position.x) * 100. / theme::scale_pct() as f32;
-            if theme::set_sidebar_base(base) {
-                cx.notify();
-            }
-            return;
-        }
-        if !self.resizing {
-            return;
-        }
-        if event.pressed_button != Some(MouseButton::Left) {
-            self.resizing = false;
-            return;
-        }
-        // The panes share what the tab's preview leaves.
+    /// The divider between the panes moved: they share what the tab's preview leaves at that
+    /// ratio, each keeping at least `pane_min()` so the top bar and columns don't get crushed.
+    fn drag_pane_gutter(&mut self, x: gpui::Pixels, window: &Window, cx: &mut Context<Self>) {
         let reserve = self
             .shared_preview
             .map_or(px(0.), crate::explorer::SharedPreview::reserve);
         let width = window.viewport_size().width - theme::sidebar_width() - reserve;
-        let ratio = (event.position.x - theme::sidebar_width()) / width;
-        // Keep at least pane_min() per side so the top bar and columns do not get crushed.
+        let ratio = (x - theme::sidebar_width()) / width;
         let min = (pane_min() / width).min(0.5);
         self.tabs[self.active].ratio = ratio.clamp(min, 1. - min);
         cx.notify();
@@ -2687,48 +2953,45 @@ impl Workspace {
                 .child(tab.panes[0].view.clone())
                 .into_any_element();
         }
-        // Zero-width divider; the hit area extends left into the gap between the two papers.
-        let resizing = self.resizing;
-        let gutter = div().relative().w(px(0.)).h_full().child(
-            div()
-                .id("pane-gutter")
-                .group("pane-gutter")
-                .absolute()
-                .top_0()
-                .bottom(theme::s_8())
-                .left(-theme::s_12() + px(2.))
-                .w(theme::s_12())
-                .flex()
-                .items_center()
-                .justify_center()
-                .cursor_col_resize()
-                .on_mouse_down(
-                    MouseButton::Left,
-                    cx.listener(|this, _: &MouseDownEvent, _, cx| {
-                        this.resizing = true;
-                        cx.stop_propagation();
-                    }),
-                )
-                .on_click(cx.listener(|this, event: &ClickEvent, _, cx| {
-                    // Double click resets to 50/50.
-                    if event.click_count() >= 2 {
-                        this.tabs[this.active].ratio = 0.5;
-                        cx.notify();
-                    }
-                }))
-                .child(
-                    div()
-                        .w(crate::theme::scaled_px(3.))
-                        .h(theme::s_32() + theme::s_8())
-                        .rounded(theme::R_FULL)
-                        .bg(if resizing {
-                            theme::signal()
-                        } else {
-                            theme::line_strong()
-                        })
-                        .group_hover("pane-gutter", |s| s.bg(theme::signal_line())),
-                ),
-        );
+        // Zero-width divider; the hit area extends left into the gap between the two papers,
+        // centered on it.
+        let gap = theme::paper_gap();
+        let hit = div()
+            .absolute()
+            .top_0()
+            .bottom(gap)
+            .left(-gap / 2. - theme::s_6())
+            .w(theme::s_12())
+            .flex()
+            .items_center()
+            .justify_center();
+        let pill = div()
+            .w(crate::theme::scaled_px(3.))
+            .h(theme::s_32() + theme::s_8())
+            .rounded(theme::R_FULL)
+            .bg(theme::line_strong());
+        let handle = Splitter::new("pane-gutter", gpui::CursorStyle::ResizeColumn)
+            .round(true)
+            .dragging(self.resizing)
+            .on_start(cx.listener(|this, _: &MouseDownEvent, _, cx| {
+                this.resizing = true;
+                cx.notify();
+            }))
+            // Double click resets to 50/50.
+            .on_double_click(cx.listener(|this, _: &MouseDownEvent, _, cx| {
+                this.tabs[this.active].ratio = 0.5;
+                cx.notify();
+            }))
+            .on_drag(cx.listener(|this, e: &MouseMoveEvent, window, cx| {
+                this.drag_pane_gutter(e.position.x, window, cx);
+            }))
+            .on_end(cx.listener(|this, _: &DragEnd, _, cx| {
+                if std::mem::take(&mut this.resizing) {
+                    cx.notify();
+                }
+            }))
+            .render(hit, pill);
+        let gutter = div().relative().w(px(0.)).h_full().child(handle);
         // The divider's ratio applies to what the shared preview leaves. The right pane's box runs
         // on under the preview, and the preview sits on top of it.
         let reserve = self
@@ -2741,8 +3004,8 @@ impl Workspace {
                 div()
                     .absolute()
                     .top_0()
-                    .bottom(theme::s_8())
-                    .right(theme::s_8())
+                    .bottom(gap)
+                    .right(gap)
                     .w(shared.width)
                     .child(preview),
             )
@@ -2805,13 +3068,13 @@ impl Workspace {
                 } else {
                     theme::h_bar()
                 })
-                .bottom(theme::s_8())
-                .right(theme::s_8())
-                .w((self.panes_width_hint() - theme::s_8()) / 2.)
+                .bottom(theme::paper_gap())
+                .right(theme::paper_gap())
+                .w((self.panes_width_hint() - theme::paper_gap()) / 2.)
                 .flex()
                 .items_center()
                 .justify_center()
-                .rounded(theme::r_12())
+                .rounded(theme::r_paper())
                 .border_2()
                 .border_color(theme::signal_line())
                 .bg(theme::signal_wash())
@@ -2921,7 +3184,10 @@ fn hand_drag_to_windows(
     // Enter the Windows drag loop only after this mouse event is handled, outside GPUI's event
     // dispatch.
     cx.spawn(async move |cx| {
-        let end = shell.drag_out(&pending.paths, pending.image.as_ref(), after_lost_press);
+        let end = match &pending.remote {
+            Some(items) => shell.drag_out_remote(items, pending.image.as_ref(), after_lost_press),
+            None => shell.drag_out(&pending.paths, pending.image.as_ref(), after_lost_press),
+        };
         if let Err(err) = &end {
             log::warn!("drag out to another program failed: {err}");
         }
@@ -3015,6 +3281,7 @@ impl Render for Workspace {
         self.settings_follow_navigation(cx);
         self.recycle_follow_navigation(cx);
         self.home_follow_navigation(cx);
+        self.sync_history_pages(cx);
         self.whats_new_follow_navigation(cx);
         Self::whats_new_on_startup(window, cx);
         self.save_session_if_changed(window, cx);
@@ -3093,6 +3360,8 @@ impl Render for Workspace {
             .on_action(cx.listener(Self::toggle_sidebar))
             .on_action(cx.listener(Self::focus_next_region))
             .on_action(cx.listener(Self::focus_prev_region))
+            .on_action(cx.listener(Self::focus_next_stop))
+            .on_action(cx.listener(Self::focus_prev_stop))
             .on_mouse_move(cx.listener(|this, e: &gpui::MouseMoveEvent, _, cx| {
                 this.peek_pointer_moved(e, cx);
             }))
@@ -3115,6 +3384,7 @@ impl Render for Workspace {
             .on_action(cx.listener(|this, _: &OpenWorkspaces, window, cx| {
                 this.open_workspaces(window, cx);
             }))
+            .on_action(|_: &OpenSetupGuide, window, cx| welcome::open_guide(window, cx))
             .on_key_down(cx.listener(Self::on_key_down))
             .on_action(cx.listener(|this, a: &crate::explorer::FocusComputerSearch, window, cx| {
                 this.page_key(window, cx, |e, window, cx| e.focus_computer_search(a, window, cx));
@@ -3131,8 +3401,8 @@ impl Render for Workspace {
             .on_action(cx.listener(|this, a: &crate::explorer::GoUp, window, cx| {
                 this.page_key(window, cx, |e, window, cx| e.go_up(a, window, cx));
             }))
-            // Back and forward on a page, as the mouse buttons there: the tab moves, and the page
-            // follows it away. Back on Home is handled first by the capture below.
+            // Back and forward on a page, as the mouse buttons there: the pane steps through its
+            // history, pages included.
             .on_action(cx.listener(|this, a: &crate::explorer::GoBack, window, cx| {
                 let view = this.active_view().clone();
                 view.update(cx, |e, cx| e.go_back(a, window, cx));
@@ -3142,9 +3412,7 @@ impl Render for Workspace {
                 view.update(cx, |e, cx| e.go_forward(a, window, cx));
             }))
             .capture_action(cx.listener(|this, _: &crate::explorer::GoBack, window, cx| {
-                if this.back_closes_home(window, cx) {
-                    cx.stop_propagation();
-                } else if Self::across_tabs(cx) {
+                if Self::across_tabs(cx) {
                     cx.stop_propagation();
                     this.step_timeline(true, window, cx);
                 }
@@ -3155,14 +3423,16 @@ impl Render for Workspace {
                     this.step_timeline(false, window, cx);
                 }
             }))
-            .capture_any_mouse_down(cx.listener(|this, event: &MouseDownEvent, window, cx| {
+            // Mouse back/forward act on release, like File Explorer and browsers (#497).
+            .capture_any_mouse_up(cx.listener(|this, event: &MouseUpEvent, window, cx| {
                 let MouseButton::Navigate(direction) = event.button else {
                     return;
                 };
+                if crate::press_guard::is_cancel(event) {
+                    return;
+                }
                 let back = direction == gpui::NavigationDirection::Back;
-                if back && this.back_closes_home(window, cx) {
-                    cx.stop_propagation();
-                } else if Self::across_tabs(cx) {
+                if Self::across_tabs(cx) {
                     cx.stop_propagation();
                     this.step_timeline(back, window, cx);
                 }
@@ -3171,16 +3441,16 @@ impl Render for Workspace {
             .on_scroll(cx.listener(Self::on_swipe))
             // Mouse back/forward anywhere in the window (the sidebar, the tab list, Home and the
             // other pages) move the active tab; over a list the pane itself handles them (#8).
-            .on_mouse_down(
+            .on_mouse_up(
                 MouseButton::Navigate(gpui::NavigationDirection::Back),
-                cx.listener(|this, _: &MouseDownEvent, window, cx| {
+                cx.listener(|this, _: &MouseUpEvent, window, cx| {
                     let view = this.active_view().clone();
                     view.update(cx, |e, cx| e.go_back(&crate::explorer::GoBack, window, cx));
                 }),
             )
-            .on_mouse_down(
+            .on_mouse_up(
                 MouseButton::Navigate(gpui::NavigationDirection::Forward),
-                cx.listener(|this, _: &MouseDownEvent, window, cx| {
+                cx.listener(|this, _: &MouseUpEvent, window, cx| {
                     let view = this.active_view().clone();
                     view.update(cx, |e, cx| {
                         e.go_forward(&crate::explorer::GoForward, window, cx);
@@ -3193,22 +3463,6 @@ impl Render for Workspace {
                     window.refresh();
                 }
             })
-            .on_mouse_move(cx.listener(Self::on_mouse_move))
-            .on_mouse_up(
-                MouseButton::Left,
-                cx.listener(|this, _: &MouseUpEvent, _, cx| {
-                    if this.resizing {
-                        this.resizing = false;
-                        cx.notify();
-                    }
-                    if this.sidebar_resizing {
-                        this.finish_sidebar_drag(cx);
-                    }
-                    if this.split_drag.is_some() {
-                        this.finish_split_drag(cx);
-                    }
-                }),
-            )
             .child(body)
             .children(self.render_split_drop_zone(cx))
             // Horizontal tabs: the pin zone floats under the start of the strip, where the pinned
@@ -3233,7 +3487,7 @@ impl Render for Workspace {
             .children(self.render_drag_out_watch(cx))
             .children(self.render_tab_drop_watch(cx))
             .children(sidebar_menu)
-            .children(welcome::welcome_card(cx))
+            .children(welcome::welcome_card(window, cx))
             .children(update_page::update_notice(cx))
             .children(self.net_dialog.as_ref().map(|slot| slot.dialog.clone()))
             .children(
@@ -3346,11 +3600,12 @@ impl Workspace {
             .pl(theme::s_12())
             .child(crate::brand::sidebar_mark())
             .child(if self.settings_open()
-                || self.recycle_open()
-                || self.home_open()
                 || self.whats_new_open()
+                || ((self.recycle_open() || self.home_open()) && !can_back)
             {
-                // With Settings or Recycle Bin open, back returns to the previous folder.
+                // With Settings open, or a page with nothing before it, back closes the page and
+                // shows the folder under it. Home and the Recycle Bin with a history before them
+                // step through it like any other location.
                 ghost_button(
                     "back",
                     Icon::ArrowLeft,
@@ -3376,7 +3631,7 @@ impl Workspace {
                             "back",
                             Icon::ArrowLeft,
                             can_back,
-                            t!("nav.back"),
+                            self.nav_tip(true, cx),
                             nav(|e, w, cx| e.go_back(&GoBack, w, cx)),
                         ),
                         cx,
@@ -3390,7 +3645,7 @@ impl Workspace {
                         "forward",
                         Icon::ArrowRight,
                         can_forward,
-                        t!("nav.forward"),
+                        self.nav_tip(false, cx),
                         nav(|e, w, cx| e.go_forward(&GoForward, w, cx)),
                     )),
             )
@@ -3422,9 +3677,11 @@ impl Workspace {
                 let pinned = self.tabs[ix].pinned;
                 div()
                     .when(pinned, |d| d.w(crate::theme::scaled_px(132.)).flex_none())
+                    // Down to a width that keeps the titles apart (#533); past that the strip
+                    // scrolls.
                     .when(!pinned, |d| {
                         d.w(crate::theme::scaled_px(200.))
-                            .min_w(crate::theme::scaled_px(96.))
+                            .min_w(crate::theme::scaled_px(tabstrip::TAB_MIN_W))
                             .flex_shrink(1.)
                     })
                     .child(self.render_tab(ix, cx))
@@ -3445,6 +3702,8 @@ impl Workspace {
                 cx.notify();
             }
         }
+        // Tabs cut off: scroll buttons at both ends of the tabs say so and step to them (#541).
+        let edges = tabstrip::StripEdges::of(scroll);
         div()
             .id("tab-strip")
             .debug_selector(|| "tab-strip".to_owned())
@@ -3460,6 +3719,9 @@ impl Workspace {
             .flex()
             .items_center()
             .gap(theme::s_4())
+            .when(edges.overflow, |d| {
+                d.child(Self::strip_scroll_button(false, edges.back, cx))
+            })
             // Too many tabs to fit: they scroll sideways (the wheel scrolls them too) instead of
             // the last ones being cut off.
             .child(
@@ -3474,6 +3736,9 @@ impl Workspace {
                     .track_scroll(scroll)
                     .children(tabs),
             )
+            .when(edges.overflow, |d| {
+                d.child(Self::strip_scroll_button(true, edges.forward, cx))
+            })
             .child(
                 div()
                     .id("strip-new-tab")
@@ -3510,6 +3775,8 @@ impl Workspace {
             )
             .child(Self::workspaces_button(cx))
             .child(sidebar::tab_layout_button(true, cx))
+            // After the tabs, so it reads their layout of this frame.
+            .child(self.strip_watch(edges))
     }
 }
 

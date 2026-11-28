@@ -94,6 +94,7 @@ impl Explorer {
             ascending: view.ascending,
             // Where folders go is one setting for every folder
             mixed: self.seen_defaults.0.mixed,
+            always_first: self.seen_defaults.0.always_first,
             then: view.then,
             sections: None,
         }
@@ -173,14 +174,19 @@ impl Explorer {
     fn unremembered_view(&self, path: &Path) -> (SortSpec, ViewMode) {
         let (sort, view) = self.seen_defaults;
         if self.is_downloads(path) {
-            return (SortSpec::by(SortColumn::Modified, false, sort.mixed), view);
+            return (
+                SortSpec::by(SortColumn::Modified, false, sort.mixed)
+                    .with_always_first(sort.always_first),
+                view,
+            );
         }
         (sort, view)
     }
 
-    /// Columns view moving the way the columns do (to the parent, a subfolder, or a folder next to
-    /// this one in the parent column). Switching views on every such step would throw the user out
-    /// of the columns, so these keep the tab's view and sort.
+    /// Columns view moving the way the columns do (to the parent, a subfolder, a folder next to
+    /// this one in the parent column, or another drive from a drive root). Switching views on
+    /// every such step would throw the user out of the columns, so these keep the tab's view and
+    /// sort.
     fn columns_move(&self, target: &Path) -> bool {
         if self.view_mode != ViewMode::Columns {
             return false;
@@ -194,6 +200,8 @@ impl Explorer {
         target_parent.as_ref() == Some(&here_key)
             || here_parent.as_ref() == Some(&target_key)
             || (target_parent.is_some() && target_parent == here_parent)
+            // From one drive to another in the parent column's drives (#523).
+            || (super::columns::is_drive_root(here) && super::columns::is_drive_root(target))
     }
 
     /// The navigation opened its folder.

@@ -232,6 +232,238 @@ fn with_single_window_off_each_folder_gets_a_window(cx: &mut TestAppContext) {
     assert_eq!(tabs_of(windows[1], cx), [Some(p(r"C:\b"))]);
 }
 
+/// What "Open folders in Arke" asks for: from the early path (File Explorer's launcher ended) or
+/// from the watcher (a File Explorer window).
+fn taken_over(path: &str, select: &[&str], early: bool) -> crate::win_takeover::OpenRequest {
+    let (reply, _) = flume::bounded(1);
+    crate::win_takeover::OpenRequest {
+        target: arke_core::takeover::Target::Folder(p(path)),
+        select: select.iter().map(|name| (*name).to_owned()).collect(),
+        explorer_thread: 0,
+        early,
+        unchecked: false,
+        reply,
+    }
+}
+
+fn until(cx: &mut TestAppContext, what: &str, mut done: impl FnMut(&mut TestAppContext) -> bool) {
+    let deadline = Instant::now() + Duration::from_secs(20);
+    loop {
+        cx.run_until_parked();
+        if done(cx) {
+            return;
+        }
+        assert!(Instant::now() < deadline, "timed out waiting for: {what}");
+        std::thread::sleep(Duration::from_millis(5));
+    }
+}
+
+/// The window `open` made, among those not in `before`.
+fn opened_window(
+    cx: &mut TestAppContext,
+    before: &[gpui::WindowId],
+    open: impl FnOnce(&mut TestAppContext) -> bool,
+) -> gpui::WindowHandle<Workspace> {
+    assert!(open(cx));
+    cx.run_until_parked();
+    workspaces(cx)
+        .into_iter()
+        .find(|w| !before.contains(&w.window_id()))
+        .expect("a window of its own")
+}
+
+fn window_ids(cx: &TestAppContext) -> Vec<gpui::WindowId> {
+    workspaces(cx).iter().map(|w| w.window_id()).collect()
+}
+
+/// The active list of `window`, once it shows `path`.
+fn loaded_view(
+    cx: &mut TestAppContext,
+    window: gpui::WindowHandle<Workspace>,
+    path: &str,
+) -> Entity<Explorer> {
+    let view = cx.update(|cx| window.read(cx).unwrap().active_view().clone());
+    let done = loaded(path);
+    until(cx, path, |cx| cx.update(|cx| done(view.read(cx))));
+    view
+}
+
+fn selection(cx: &mut TestAppContext, view: &Entity<Explorer>) -> Vec<String> {
+    cx.update(|cx| selected_names(view.read(cx)))
+}
+
+/// #285, single window mode off: the folder the early path opened gets a window. A File Explorer
+/// window on it that comes anyway (its launcher had handed it over already) shows in that tab with
+/// its selection instead of in a window of its own, once: the next one opens as any other. A tab
+/// that went elsewhere keeps no mark, even once it is back.
+#[gpui::test]
+fn a_late_explorer_window_uses_the_early_tab_once(cx: &mut TestAppContext) {
+    let fs = fake_fs();
+    let (ws, vcx) = setup_workspace(cx, Arc::clone(&fs), r"C:\a");
+    let first = ws.update(vcx, |ws, _| ws.active_view().clone());
+    wait_until(vcx, &first, "a", loaded(r"C:\a"));
+    let cx = &mut vcx.cx;
+    settings(cx, |s| s.single_window = false);
+    let services = services(&fs);
+    let open = |cx: &mut TestAppContext, request: crate::win_takeover::OpenRequest| {
+        cx.update(|cx| crate::open_taken_over(cx, &services, &request))
+    };
+
+    let before = window_ids(cx);
+    let early = opened_window(cx, &before, |cx| open(cx, taken_over(r"C:\b", &[], true)));
+    let view = loaded_view(cx, early, r"C:\b");
+
+    // The window comes anyway, with the item selected.
+    assert!(open(cx, taken_over(r"C:\b", &["file_000000.txt"], false)));
+    cx.run_until_parked();
+    assert_eq!(workspaces(cx).len(), 2, "no window of its own");
+    assert_eq!(tabs_of(early, cx), [Some(p(r"C:\b"))], "no second tab");
+    until(cx, "the window's selection", |cx| {
+        cx.update(|cx| selected_names(view.read(cx)) == ["file_000000.txt"])
+    });
+    // The mark is used up: the next window on it opens as usual.
+    assert!(open(cx, taken_over(r"C:\b", &[], false)));
+    cx.run_until_parked();
+    assert_eq!(workspaces(cx).len(), 3, "a window as usual");
+
+    // A tab that goes elsewhere loses its mark, even once it is back.
+    let before = window_ids(cx);
+    let early = opened_window(cx, &before, |cx| open(cx, taken_over(r"C:\c", &[], true)));
+    let view = loaded_view(cx, early, r"C:\c");
+    cx.update(|cx| {
+        view.update(cx, |v, cx| {
+            v.navigate(p(r"C:\d"), arke_core::NavKind::New, cx);
+        });
+    });
+    let _ = loaded_view(cx, early, r"C:\d");
+    cx.update(|cx| {
+        view.update(cx, |v, cx| {
+            v.navigate(p(r"C:\c"), arke_core::NavKind::New, cx);
+        });
+    });
+    let _ = loaded_view(cx, early, r"C:\c");
+    assert!(open(cx, taken_over(r"C:\c", &[], false)));
+    cx.run_until_parked();
+    assert_eq!(workspaces(cx).len(), 5, "not marked any more");
+}
+
+/// #285: two quick `explorer.exe C:\b`, both launchers ended, the second just too late, so its
+/// window comes anyway. Each launch has a window, and the late window goes to the second's (the
+/// newest mark), not the first's: no duplicate. Each mark is used once.
+#[gpui::test]
+fn two_quick_launches_each_get_their_own_merge(cx: &mut TestAppContext) {
+    let fs = fake_fs();
+    let (ws, vcx) = setup_workspace(cx, Arc::clone(&fs), r"C:\a");
+    let first = ws.update(vcx, |ws, _| ws.active_view().clone());
+    wait_until(vcx, &first, "a", loaded(r"C:\a"));
+    let cx = &mut vcx.cx;
+    settings(cx, |s| s.single_window = false);
+    let services = services(&fs);
+    let open = |cx: &mut TestAppContext, request: crate::win_takeover::OpenRequest| {
+        cx.update(|cx| crate::open_taken_over(cx, &services, &request))
+    };
+
+    let before = window_ids(cx);
+    let one = opened_window(cx, &before, |cx| open(cx, taken_over(r"C:\b", &[], true)));
+    let before = window_ids(cx);
+    let two = opened_window(cx, &before, |cx| open(cx, taken_over(r"C:\b", &[], true)));
+    let one_view = loaded_view(cx, one, r"C:\b");
+    let two_view = loaded_view(cx, two, r"C:\b");
+    assert_eq!(workspaces(cx).len(), 3);
+
+    // The second launch's window, with its item selected: the newest mark.
+    assert!(open(cx, taken_over(r"C:\b", &["file_000000.txt"], false)));
+    cx.run_until_parked();
+    assert_eq!(workspaces(cx).len(), 3, "no duplicate");
+    until(cx, "the second tab's selection", |cx| {
+        cx.update(|cx| selected_names(two_view.read(cx)) == ["file_000000.txt"])
+    });
+    assert!(
+        selection(cx, &one_view).is_empty(),
+        "the first tab untouched"
+    );
+
+    // One more on it goes to the first launch's tab, whose mark is left; then none are.
+    assert!(open(cx, taken_over(r"C:\b", &["file_000000.txt"], false)));
+    cx.run_until_parked();
+    assert_eq!(workspaces(cx).len(), 3);
+    until(cx, "the first tab's selection", |cx| {
+        cx.update(|cx| selected_names(one_view.read(cx)) == ["file_000000.txt"])
+    });
+    assert!(open(cx, taken_over(r"C:\b", &[], false)));
+    cx.run_until_parked();
+    assert_eq!(
+        workspaces(cx).len(),
+        4,
+        "every mark used: a window as usual"
+    );
+}
+
+/// A network folder the early path took without looking (#285), with the receiver of its answer.
+fn unchecked(path: &str) -> (crate::win_takeover::OpenRequest, flume::Receiver<bool>) {
+    let (reply, answer) = flume::bounded(1);
+    let request = crate::win_takeover::OpenRequest {
+        target: arke_core::takeover::Target::Folder(p(path)),
+        select: Vec::new(),
+        explorer_thread: 0,
+        early: true,
+        unchecked: true,
+        reply,
+    };
+    (request, answer)
+}
+
+/// Arke's answer to a request, once it comes.
+fn answer(cx: &mut TestAppContext, reply: &flume::Receiver<bool>) -> bool {
+    let mut got = None;
+    until(cx, "Arke's answer", |_| {
+        got = got.or_else(|| reply.try_recv().ok());
+        got.is_some()
+    });
+    got.unwrap_or_default()
+}
+
+/// #285: a network folder the early path took without looking is checked first. A folder opens
+/// as usual and is answered `true`; a missing folder or a file opens nothing and is answered
+/// `false` (File Explorer gets it back); one nobody waits for any more opens nothing.
+#[gpui::test]
+fn an_unchecked_folder_opens_only_once_it_is_found(cx: &mut TestAppContext) {
+    let fs = fake_fs();
+    let (ws, vcx) = setup_workspace(cx, Arc::clone(&fs), r"C:\a");
+    let first = ws.update(vcx, |ws, _| ws.active_view().clone());
+    wait_until(vcx, &first, "a", loaded(r"C:\a"));
+    let cx = &mut vcx.cx;
+    settings(cx, |s| s.single_window = false);
+    let services = services(&fs);
+
+    for missing in [r"C:\missing", r"C:\b\file_000000.txt"] {
+        let (request, reply) = unchecked(missing);
+        cx.update(|cx| crate::answer_taken_over(cx, &services, request));
+        assert!(!answer(cx, &reply), "{missing}: given back");
+        settle(cx);
+        assert_eq!(workspaces(cx).len(), 1, "{missing}: nothing opened");
+    }
+
+    // Nobody waits any more: File Explorer has it already.
+    let (request, reply) = unchecked(r"C:\c");
+    drop(reply);
+    cx.update(|cx| crate::answer_taken_over(cx, &services, request));
+    let deadline = Instant::now() + Duration::from_millis(500);
+    while Instant::now() < deadline {
+        cx.run_until_parked();
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    assert_eq!(workspaces(cx).len(), 1, "not opened behind File Explorer");
+
+    let before = window_ids(cx);
+    let (request, reply) = unchecked(r"C:\b");
+    cx.update(|cx| crate::answer_taken_over(cx, &services, request));
+    assert!(answer(cx, &reply), "found and opened");
+    let window = opened_window(cx, &before, |_| true);
+    let _ = loaded_view(cx, window, r"C:\b");
+    assert_eq!(workspaces(cx).len(), 2);
+}
+
 /// The forum report: with two windows open, the second one's tabs no longer replace the
 /// first's. Each window is saved; closing one of several drops it, closing the last keeps it.
 #[gpui::test]
@@ -546,13 +778,14 @@ fn restoring_answers_after_the_front_window_and_opens_at_most_twenty(cx: &mut Te
     assert_eq!(workspaces(cx).len(), crate::settings::RESTORED_WINDOWS_MAX);
 }
 
-fn settings_file(name: &str, json: &str) -> PathBuf {
-    let dir = std::env::temp_dir().join(format!("arke-{name}-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
-    let path = dir.join("settings.json");
+fn settings_file(name: &str, json: &str) -> (PathBuf, tempfile::TempDir) {
+    let guard = tempfile::Builder::new()
+        .prefix(&format!("arke-{name}-"))
+        .tempdir()
+        .unwrap();
+    let path = guard.path().join("settings.json");
     std::fs::write(&path, json).unwrap();
-    path
+    (path, guard)
 }
 
 /// The settings file read slowly (%APPDATA% on a network share): a folder visited and Arke
@@ -560,7 +793,7 @@ fn settings_file(name: &str, json: &str) -> PathBuf {
 #[gpui::test]
 fn nothing_is_written_before_the_settings_file_is_read(cx: &mut TestAppContext) {
     let saved = r#"{"show_hidden": true, "recent": ["C:\\old"]}"#;
-    let path = settings_file("unread", saved);
+    let (path, _guard) = settings_file("unread", saved);
     let store = cx.update(|cx| SettingsStore::reading_slowly(path.clone(), cx));
     store.update(cx, |s, cx| {
         s.update(|st| st.remember(Path::new(r"C:\new")), cx);
@@ -573,14 +806,13 @@ fn nothing_is_written_before_the_settings_file_is_read(cx: &mut TestAppContext) 
     cx.quit();
     std::thread::sleep(Duration::from_millis(200));
     assert_eq!(std::fs::read_to_string(&path).unwrap(), saved);
-    let _ = std::fs::remove_dir_all(path.parent().unwrap());
 }
 
 /// Folders visited before the file was read join it, and are written even when Arke quits right
 /// after (the write at quit is for a change newer than any written).
 #[gpui::test]
 fn folders_visited_before_the_file_is_read_are_written_with_it(cx: &mut TestAppContext) {
-    let path = settings_file("late", r#"{"show_hidden": true, "recent": ["C:\\old"]}"#);
+    let (path, _guard) = settings_file("late", r#"{"show_hidden": true, "recent": ["C:\\old"]}"#);
     let store = cx.update(|cx| SettingsStore::reading_slowly(path.clone(), cx));
     store.update(cx, |s, cx| {
         s.update(|st| st.remember(Path::new(r"C:\new")), cx);
@@ -606,7 +838,6 @@ fn folders_visited_before_the_file_is_read_are_written_with_it(cx: &mut TestAppC
         serde_json::json!([r"C:\new", r"C:\old"]),
         "{written}"
     );
-    let _ = std::fs::remove_dir_all(path.parent().unwrap());
 }
 
 /// A saved window whose tabs are the given folders, the ones in `pinned` pinned.

@@ -100,7 +100,7 @@ fn favorites_collapse_and_still_take_a_drop(cx: &mut TestAppContext) {
     assert!(!drawn(cx, "pin-row-0"), "the list is hidden");
     assert!(
         drawn(cx, "tile-slot-0"),
-        "the tiles belong to Home and stay"
+        "the tiles belong to Favorites, and stay while the list is collapsed"
     );
 
     // Drag the first tile onto the collapsed heading: it goes first in the list.
@@ -363,6 +363,21 @@ fn menu(ws: &Entity<Workspace>, cx: &mut VisualTestContext) -> Option<Vec<String
     ws.update(cx, |ws, cx| ws.open_menu_drawn_for_test(cx))
 }
 
+/// A section heading's menu: Hide, a line, then the sections list and the rest of the menu of the
+/// sidebar's empty space (#465).
+fn with_hide(hide: &str) -> Vec<String> {
+    vec![
+        hide.to_owned(),
+        "-".to_owned(),
+        t!("home.title").into_owned(),
+        t!("sidebar.favorites").into_owned(),
+        t!("sidebar.this_pc").into_owned(),
+        t!("sidebar.network").into_owned(),
+        "-".to_owned(),
+        t!("sidebar.follow_folder").into_owned(),
+    ]
+}
+
 fn checks(ws: &Entity<Workspace>, cx: &mut VisualTestContext) -> Option<Vec<bool>> {
     ws.update(cx, |ws, _| ws.open_menu_checks_for_test())
 }
@@ -387,10 +402,11 @@ fn sections_hide_from_their_heading_and_come_back(cx: &mut TestAppContext) {
     let hide = t!("sidebar.hide_section").into_owned();
     let this_pc = t!("sidebar.this_pc").into_owned();
     let favorites = t!("sidebar.favorites").into_owned();
+    let network = t!("sidebar.network").into_owned();
 
     let at = bounds(cx, "this-pc-header").center();
     right_click(cx, at);
-    assert_eq!(menu(&ws, cx), Some(vec![hide.clone()]));
+    assert_eq!(menu(&ws, cx), Some(with_hide(&hide)));
     pick(&ws, cx, &hide);
     assert_eq!(current(cx).hidden_sections, vec![SidebarSection::ThisPc]);
     assert!(
@@ -398,13 +414,16 @@ fn sections_hide_from_their_heading_and_come_back(cx: &mut TestAppContext) {
         "hidden, not collapsed"
     );
     assert!(!drawn(cx, "this-pc-header"), "gone, heading and all");
-    assert!(drawn(cx, "network-header"), "Network stays");
+    assert!(drawn(cx, "network-header"), "Network stays until hidden");
 
     let at = bounds(cx, "pin-list-label").center();
     right_click(cx, at);
     pick(&ws, cx, &hide);
     assert!(!drawn(cx, "pin-list-label") && !drawn(cx, "pin-row-0"));
-    assert!(drawn(cx, "tile-slot-0"), "the tiles are Home's");
+    assert!(
+        !drawn(cx, "tile-slot-0"),
+        "the tiles are Favorites', and go with it"
+    );
     assert_eq!(
         current(cx).hidden_sections,
         vec![SidebarSection::ThisPc, SidebarSection::Favorites]
@@ -417,29 +436,32 @@ fn sections_hide_from_their_heading_and_come_back(cx: &mut TestAppContext) {
         Some(vec![
             t!("home.title").into_owned(),
             favorites.clone(),
-            this_pc.clone()
+            this_pc.clone(),
+            network,
+            "-".to_owned(),
+            t!("sidebar.follow_folder").into_owned(),
         ])
     );
-    assert_eq!(checks(&ws, cx), Some(vec![true, false, false]));
+    assert_eq!(checks(&ws, cx), Some(vec![true, false, false, true, false]));
     pick(&ws, cx, &this_pc);
     assert_eq!(current(cx).hidden_sections, vec![SidebarSection::Favorites]);
     assert!(drawn(cx, "this-pc-header"), "back");
 
     let at = bounds(cx, "tab-list-end").center();
     right_click(cx, at);
-    assert_eq!(checks(&ws, cx), Some(vec![true, false, true]));
+    assert_eq!(checks(&ws, cx), Some(vec![true, false, true, true, false]));
     pick(&ws, cx, &favorites);
     assert!(current(cx).hidden_sections.is_empty());
     assert!(
-        drawn(cx, "pin-list-label") && drawn(cx, "pin-row-0"),
-        "listed again"
+        drawn(cx, "pin-list-label") && drawn(cx, "pin-row-0") && drawn(cx, "tile-slot-0"),
+        "listed again, the tiles with it"
     );
 }
 
-/// Home hides from its row's menu, its tiles with it; the list under Favorites stays. A right
-/// click on a heading that can't be hidden (Network) is the sidebar's: it brings Home back.
+/// Home hides from its row's menu, and only its row: the tiles and the list under Favorites stay
+/// (#463). The sidebar's empty space brings Home back.
 #[gpui::test]
-fn home_hides_with_its_tiles(cx: &mut TestAppContext) {
+fn home_hides_only_its_row(cx: &mut TestAppContext) {
     let (ws, cx) = window(cx);
     change(cx, |st| {
         st.favorites = Some(vec![p("a")]);
@@ -451,18 +473,59 @@ fn home_hides_with_its_tiles(cx: &mut TestAppContext) {
 
     let at = bounds(cx, "open-home").center();
     right_click(cx, at);
-    assert_eq!(menu(&ws, cx), Some(vec![hide.clone()]));
+    assert_eq!(menu(&ws, cx), Some(with_hide(&hide)));
     pick(&ws, cx, &hide);
     assert_eq!(current(cx).hidden_sections, vec![SidebarSection::Home]);
-    assert!(!drawn(cx, "open-home") && !drawn(cx, "tile-slot-0"));
+    assert!(!drawn(cx, "open-home"), "the Home row is gone");
+    assert!(drawn(cx, "tile-slot-0"), "the tiles stay");
     assert!(drawn(cx, "pin-row-0"), "the list stays");
 
-    let at = bounds(cx, "network-header").center();
+    let at = bounds(cx, "tab-list-end").center();
     right_click(cx, at);
-    assert_eq!(checks(&ws, cx), Some(vec![false, true, true]));
+    assert_eq!(checks(&ws, cx), Some(vec![false, true, true, true, false]));
     pick(&ws, cx, &home);
     assert!(current(cx).hidden_sections.is_empty());
     assert!(drawn(cx, "open-home") && drawn(cx, "tile-slot-0"));
+}
+
+/// Favorites hides the tiles and the list together, Home or not; showing it brings both back
+/// (#463).
+#[gpui::test]
+fn favorites_hides_the_tiles_and_the_list_together(cx: &mut TestAppContext) {
+    let (_ws, cx) = window(cx);
+    change(cx, |st| {
+        st.favorites = Some(vec![p("a")]);
+        st.pinned = vec![p("c")];
+    });
+    refresh(cx);
+    assert!(drawn(cx, "tile-slot-0") && drawn(cx, "pin-row-0"));
+
+    change(cx, |st| {
+        st.hidden_sections = vec![SidebarSection::Favorites];
+    });
+    refresh(cx);
+    assert!(drawn(cx, "open-home"), "the Home row stays");
+    assert!(!drawn(cx, "tile-slot-0"), "no tiles");
+    assert!(
+        !drawn(cx, "pin-list-label") && !drawn(cx, "pin-row-0"),
+        "no list"
+    );
+
+    change(cx, |st| {
+        st.hidden_sections = vec![SidebarSection::Home, SidebarSection::Favorites];
+    });
+    refresh(cx);
+    assert!(!drawn(cx, "open-home") && !drawn(cx, "tile-slot-0"));
+    assert!(!drawn(cx, "pin-list-label") && !drawn(cx, "pin-row-0"));
+    assert!(drawn(cx, "this-pc-header"), "the rest of the sidebar stays");
+
+    change(cx, |st| st.hidden_sections = vec![SidebarSection::Home]);
+    refresh(cx);
+    assert!(!drawn(cx, "open-home"));
+    assert!(
+        drawn(cx, "tile-slot-0") && drawn(cx, "pin-row-0"),
+        "both are back"
+    );
 }
 
 /// The Recycle Bin, once removed from the favorites, comes back from the menu of the sidebar's
@@ -494,4 +557,202 @@ fn the_recycle_bin_comes_back_from_the_sidebars_menu(cx: &mut TestAppContext) {
         !settings.is_hidden(SidebarSection::Favorites),
         "the favorites show, with it"
     );
+}
+
+/// Network hides from its heading's menu and comes back from the sidebar's empty space (#387).
+#[gpui::test]
+fn network_hides_and_comes_back(cx: &mut TestAppContext) {
+    let (ws, cx) = window(cx);
+    let hide = t!("sidebar.hide_section").into_owned();
+    let network = t!("sidebar.network").into_owned();
+
+    let at = bounds(cx, "network-header").center();
+    right_click(cx, at);
+    assert_eq!(menu(&ws, cx), Some(with_hide(&hide)));
+    pick(&ws, cx, &hide);
+    assert_eq!(current(cx).hidden_sections, vec![SidebarSection::Network]);
+    assert!(!drawn(cx, "network-header"), "gone, heading and all");
+    assert!(drawn(cx, "this-pc-header"), "This PC stays");
+
+    let at = bounds(cx, "tab-list-end").center();
+    right_click(cx, at);
+    assert_eq!(checks(&ws, cx), Some(vec![true, true, true, false, false]));
+    pick(&ws, cx, &network);
+    assert!(current(cx).hidden_sections.is_empty());
+    assert!(drawn(cx, "network-header"), "back");
+}
+
+/// A right click on a section's heading opens the sections menu, even with no empty space to
+/// click (#465).
+fn heading_opens_the_sections_menu(cx: &mut TestAppContext, heading: &str) {
+    let (ws, cx) = window(cx);
+    let this_pc = t!("sidebar.this_pc").into_owned();
+    let network = t!("sidebar.network").into_owned();
+    let at = bounds(cx, heading).center();
+    right_click(cx, at);
+    let rows = menu(&ws, cx).expect(heading);
+    assert!(
+        rows.contains(&this_pc) && rows.contains(&network),
+        "{rows:?}"
+    );
+    assert_eq!(
+        checks(&ws, cx),
+        Some(vec![false, true, true, true, true, false])
+    );
+    // Hidden from this heading's menu, shown again from another's.
+    pick(&ws, cx, &this_pc);
+    assert_eq!(current(cx).hidden_sections, vec![SidebarSection::ThisPc]);
+    let other = if heading == "network-header" {
+        "pin-list-label"
+    } else {
+        "network-header"
+    };
+    let at = bounds(cx, other).center();
+    right_click(cx, at);
+    pick(&ws, cx, &this_pc);
+    assert!(current(cx).hidden_sections.is_empty());
+    assert!(drawn(cx, "this-pc-header"), "back");
+}
+
+#[gpui::test]
+fn the_favorites_heading_opens_the_sections_menu(cx: &mut TestAppContext) {
+    heading_opens_the_sections_menu(cx, "pin-list-label");
+}
+
+#[gpui::test]
+fn the_network_heading_opens_the_sections_menu(cx: &mut TestAppContext) {
+    heading_opens_the_sections_menu(cx, "network-header");
+}
+
+#[gpui::test]
+fn the_home_row_opens_the_sections_menu(cx: &mut TestAppContext) {
+    heading_opens_the_sections_menu(cx, "open-home");
+}
+
+/// With the tabs on top the Tabs heading is gone, and the headings still open the menu (#465).
+#[gpui::test]
+fn the_headings_open_the_sections_menu_with_the_tabs_on_top(cx: &mut TestAppContext) {
+    let (ws, cx) = window(cx);
+    change(cx, |st| {
+        st.tab_layout = crate::settings::TabLayout::Horizontal;
+    });
+    refresh(cx);
+    assert!(!drawn(cx, "tabs-header"), "the tabs are on top");
+    let network = t!("sidebar.network").into_owned();
+    let at = bounds(cx, "this-pc-header").center();
+    right_click(cx, at);
+    let rows = menu(&ws, cx).expect("a menu");
+    assert!(rows.contains(&network), "{rows:?}");
+    pick(&ws, cx, &network);
+    assert_eq!(current(cx).hidden_sections, vec![SidebarSection::Network]);
+    assert!(!drawn(cx, "network-header"));
+}
+
+/// A spot on the places list's scrollbar `from_bottom` above its lower end: right of the rows,
+/// short of the sidebar's edge.
+fn places_track(cx: &mut VisualTestContext, from_bottom: Pixels) -> gpui::Point<Pixels> {
+    let frame = bounds(cx, "sidebar-places-frame");
+    point(frame.right() + px(2.), frame.bottom() - from_bottom)
+}
+
+/// The places list has the tab list's scrollbar (#427): nothing is there while the places fit, and
+/// once they don't a press below the thumb pages down and the thumb can be dragged.
+#[gpui::test]
+fn the_places_list_has_a_scrollbar_once_it_overflows(cx: &mut TestAppContext) {
+    let (ws, cx) = window(cx);
+    let overflow = |ws: &Entity<Workspace>, cx: &mut VisualTestContext| {
+        ws.update(cx, |ws, _| ws.places_overflow_for_test())
+    };
+    let offset = |ws: &Entity<Workspace>, cx: &mut VisualTestContext| {
+        ws.update(cx, |ws, _| ws.places_offset_for_test())
+    };
+    // Fits: no scrollbar to take the press.
+    assert!(overflow(&ws, cx) < px(1.), "the places fit");
+    let at = places_track(cx, px(8.));
+    click(cx, at);
+    assert_eq!(offset(&ws, cx), px(0.));
+
+    change(cx, |st| {
+        st.pinned = (0..30).map(|i| p(&format!("p{i:02}"))).collect();
+    });
+    refresh(cx);
+    let max = overflow(&ws, cx);
+    assert!(max > px(40.), "the places scroll");
+    // A press below the thumb pages down.
+    let at = places_track(cx, px(8.));
+    click(cx, at);
+    assert!(offset(&ws, cx) < px(-40.), "paged down");
+
+    // The thumb dragged: from the top of the list to its end.
+    ws.update(cx, |ws, cx| ws.scroll_places_for_test(px(0.), cx));
+    refresh(cx);
+    let frame = bounds(cx, "sidebar-places-frame");
+    let grab = point(frame.right() + px(2.), frame.top() + px(3.));
+    cx.simulate_mouse_down(grab, MouseButton::Left, Modifiers::none());
+    let to = point(grab.x, frame.bottom());
+    cx.simulate_mouse_move(to, Some(MouseButton::Left), Modifiers::none());
+    refresh(cx);
+    cx.simulate_mouse_up(to, MouseButton::Left, Modifiers::none());
+    cx.run_until_parked();
+    assert!(
+        (offset(&ws, cx) + max).abs() < px(1.),
+        "dragged to the end: {:?} of {max:?}",
+        offset(&ws, cx)
+    );
+}
+
+/// Every heading has its icon, centered on a row as tall as the sidebar's rows in each density,
+/// and a hairline sets each group of places apart from what is above it (the line between the
+/// places and the tabs does that for Tabs). With nothing above, no rule.
+#[gpui::test]
+fn section_headings_have_an_icon_and_follow_the_density(cx: &mut TestAppContext) {
+    use crate::settings::Density;
+    let (_ws, cx) = window(cx);
+    change(cx, |st| st.pinned = vec![p("c")]);
+    refresh(cx);
+    let headings = [
+        "pin-list-label",
+        "this-pc-header",
+        "network-header",
+        "tabs-header",
+    ];
+    for density in [Density::Compact, Density::Standard, Density::Comfortable] {
+        change(cx, move |st| st.density = density);
+        refresh(cx);
+        let row = crate::theme::h_row_side();
+        for id in headings {
+            let heading = bounds(cx, id);
+            assert_eq!(heading.size.height, row, "{density:?}: {id} is a row tall");
+            let icon = bounds(cx, &format!("{id}-icon"));
+            assert_eq!(icon.size.height, crate::theme::icon(), "{density:?}: {id}");
+            assert!(
+                (icon.center().y - heading.center().y).abs() < px(1.),
+                "{density:?}: {id}'s icon is centered: {icon:?} in {heading:?}"
+            );
+            assert!(
+                icon.left() >= heading.left() && icon.right() < heading.center().x,
+                "{density:?}: {id}'s icon comes first"
+            );
+        }
+        for id in &headings[..3] {
+            let rule = bounds(cx, &format!("{id}-rule"));
+            let heading = bounds(cx, id);
+            assert_eq!(rule.size.height, crate::theme::side_rule_h(), "{density:?}");
+            assert!(
+                rule.bottom() <= heading.top() && heading.top() - rule.bottom() < px(4.),
+                "{density:?}: the rule is right above {id}: {rule:?} / {heading:?}"
+            );
+        }
+        assert!(
+            !drawn(cx, "tabs-header-rule"),
+            "the split line sets the tabs apart"
+        );
+    }
+
+    // Home hidden: the tiles stay above Favorites, so its heading keeps its rule (#463).
+    change(cx, |st| st.hidden_sections = vec![SidebarSection::Home]);
+    refresh(cx);
+    assert!(drawn(cx, "pin-list-label"));
+    assert!(drawn(cx, "pin-list-label-rule"), "the tiles are above it");
+    assert!(drawn(cx, "this-pc-header-rule"));
 }

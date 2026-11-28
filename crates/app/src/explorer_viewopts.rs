@@ -4,7 +4,7 @@
 //!
 //! - the layout (Details, Icons, Columns);
 //! - Icons: the icon size slider, any size from small to 256 px (`explorer_icons.rs`);
-//!   Details: row density (not in split panes, which always use compact rows);
+//!   Details: row density (not in split panes, whose rows are tighter unless compact);
 //! - switches for grouping, the Details tree, hidden items and file name extensions. They are the
 //!   same settings as in Settings, so every tab follows.
 //!
@@ -19,6 +19,7 @@ use gpui::{
 };
 use rust_i18n::t;
 
+use super::toolbar::ToolbarStop as _;
 use super::{Explorer, IconSize, ViewColumns, ViewDetails, ViewMode};
 use crate::a11y::A11yExt as _;
 use crate::assets::Icon;
@@ -115,6 +116,12 @@ impl Explorer {
                     this.toggle_view_options(cx);
                 }),
             )
+            .toolbar_menu("view-options", {
+                let this = cx.entity().downgrade();
+                move |_, cx| {
+                    let _ = this.update(cx, Self::toggle_view_options);
+                }
+            })
             .when(!open, |d| d.tooltip_below(t!("view.options")));
         let mut root = div().relative().flex_none().child(button);
         if open {
@@ -208,7 +215,8 @@ impl Explorer {
             ));
         let size_block = match mode {
             ViewMode::Icons => Some(self.icon_size_block(cx)),
-            // Split panes always use compact rows.
+            // Split panes have tighter rows of their own (compact density, set in Settings, still
+            // applies).
             ViewMode::Details if !self.pane.split => Some(density_block(settings.density)),
             ViewMode::Details | ViewMode::Columns => None,
         };
@@ -497,7 +505,7 @@ fn toggle_row(
         .child(
             div()
                 .flex_none()
-                .child(crate::workspace::switch(id, on, toggle)),
+                .child(crate::workspace::flyout_switch(id, on, toggle)),
         )
         .when(a11y, |d| d.child(crate::a11y::end_label_scope()))
         .into_any_element()

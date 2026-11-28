@@ -20,6 +20,10 @@ pub(super) struct RecyclePage {
     view: Entity<RecycleBin>,
     /// Tab that owns the page.
     pub(super) owner: super::pages::Owner,
+    /// "Open folders in Arke" showed it after ending File Explorer's launcher (#285), with the
+    /// mark's place in order: a File Explorer window on the Recycle Bin that comes anyway shows
+    /// here once (`Workspace::merge_early`). Goes with the page.
+    pub(super) early: Option<u64>,
     _events: Subscription,
 }
 
@@ -47,12 +51,30 @@ impl Workspace {
         } else {
             self.clear_pages_here();
         }
+        self.show_recycle(new_tab, window, cx);
+        let view = self.active_view().clone();
+        if view.update(cx, |e, _| {
+            e.enter_page(arke_core::NavPage::RecycleBin, new_tab)
+        }) {
+            self.note_navigation(view.entity_id(), cx);
+        }
+    }
+
+    /// Shows the Recycle Bin page over the active tab (`new_tab`: the tab was opened for it).
+    /// The history is the caller's: this only draws the page.
+    pub(super) fn show_recycle(
+        &mut self,
+        new_tab: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let shell = Arc::clone(&self.services.shell);
         let view = cx.new(|cx| RecycleBin::new(shell, window, cx));
         let events = cx.subscribe_in(&view, window, Self::on_recycle_event);
         self.recycle_page = Some(RecyclePage {
             view,
             owner: self.owner_here(new_tab, cx),
+            early: None,
             _events: events,
         });
         cx.notify();
@@ -138,7 +160,7 @@ impl Workspace {
             .id("open-recycle")
             .a11y(gpui::Role::TreeItem, t!("recycle.title"))
             .aria_selected(open)
-            .h(theme::h_row())
+            .h(theme::h_row_side())
             .flex()
             .flex_none()
             .items_center()
@@ -270,9 +292,9 @@ impl Workspace {
                         .flex_col()
                         .flex_1()
                         .min_h_0()
-                        .mr(theme::s_8())
-                        .mb(theme::s_8())
-                        .rounded(theme::r_12())
+                        .mr(theme::paper_gap())
+                        .mb(theme::paper_gap())
+                        .rounded(theme::r_paper())
                         .bg(theme::paper())
                         .shadow(theme::elev_2())
                         .overflow_hidden()

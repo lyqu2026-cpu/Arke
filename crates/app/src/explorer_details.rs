@@ -16,6 +16,7 @@
 use rust_i18n::t;
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::rc::Rc;
 use std::sync::Arc;
 
 use arke_core::{Entry, Gen, SearchColumn};
@@ -29,6 +30,7 @@ use super::{AppEvent, Explorer, ViewMode, layout, spawn_thread};
 use crate::a11y::A11yExt as _;
 use crate::assets::Icon;
 use crate::prefs::Col;
+use crate::splitter::{DragEnd, Look, Splitter};
 use crate::theme::{self, UiFont as _};
 use crate::workspace::TooltipBelowExt as _;
 
@@ -71,20 +73,6 @@ impl Render for HeaderGhost {
             .text_size(theme::fs_12())
             .text_color(theme::text())
             .child(self.0.clone())
-    }
-}
-
-/// Column divider being dragged: which column, in which pane (in split view both panes' headers
-/// see the drag, and only the one it started in may size the column from its own edge).
-#[derive(Clone, Copy, Debug)]
-pub(crate) struct DraggedColumn(Col, gpui::EntityId);
-
-/// Nothing under the cursor while resizing (the column or the preview pane itself moves).
-pub(super) struct ColumnDragView;
-
-impl Render for ColumnDragView {
-    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
-        div()
     }
 }
 
@@ -153,37 +141,25 @@ impl Explorer {
         handle.0.borrow().base_handle.clone()
     }
 
-    /// The header's sideways scroll at this render and the list it follows, so painting can tell
-    /// when the list clamped its scroll (the pane grew, a column narrowed) and draw once more to
-    /// line the header up again. `None` while no header is drawn.
-    pub(super) fn header_follow(&self) -> Option<(Pixels, gpui::ScrollHandle)> {
-        self.header_x.get().map(|x| (x, self.header_list()))
-    }
-
     // ───────────────────────── Header ─────────────────────────
 
     pub(super) fn render_header(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        // Column resize released (anywhere): save to settings. Release triggers a redraw, which is
-        // where we notice.
-        if self.column_resized && !cx.has_active_drag() {
-            let this = cx.entity().downgrade();
-            cx.defer(move |cx| {
-                let _ = this.update(cx, Self::save_column_widths);
-            });
-        }
-        let scroll_x = self.header_list().offset().x.min(px(0.));
-        self.header_x.set(Some(scroll_x));
-        // The columns, laid out like the rows below (same padding and gaps) and moved with the
-        // list when it scrolls sideways. What's right of them is blank, like the list.
+        // The columns, laid out like the rows below (same padding and gaps). What's right of them
+        // is blank, like the list.
         let row = div()
             .flex()
             .flex_none()
             .h_full()
             .items_center()
-            .ml(scroll_x)
             .pl(layout::row_pad_l())
             .pr(layout::row_pad_r())
-            .gap(layout::col_gap());
+            .gap(layout::col_gap())
+            // Thin line between header and list to give the columns structure. It belongs to the
+            // row, so it scrolls with the columns like the rows' own washes do; the minimum width
+            // keeps it running to the pane's right edge while everything fits.
+            .border_b_1()
+            .border_color(theme::line())
+            .min_w(self.pane_width);
         let row = if self.search_mode {
             // Search results start in relevance order; a click on a header sorts them.
             row.child(
@@ -204,25 +180,29 @@ impl Explorer {
                 .w(theme::col_location())
                 .flex_none(),
             )
-            .child(resizable(
-                self.search_header_cell(
-                    SearchColumn::Modified,
-                    t!("col.modified").into_owned(),
+            .child(
+                self.resizable(
+                    self.search_header_cell(
+                        SearchColumn::Modified,
+                        t!("col.modified").into_owned(),
+                        cx,
+                    )
+                    .w(crate::prefs::modified_width())
+                    .flex_none(),
+                    Col::Modified,
                     cx,
-                )
-                .w(crate::prefs::modified_width())
-                .flex_none(),
-                Col::Modified,
-                cx,
-            ))
-            .child(resizable(
-                self.search_header_cell(SearchColumn::Size, t!("col.size").into_owned(), cx)
-                    .w(crate::prefs::size_width())
-                    .flex_none()
-                    .justify_end(),
-                Col::Size,
-                cx,
-            ))
+                ),
+            )
+            .child(
+                self.resizable(
+                    self.search_header_cell(SearchColumn::Size, t!("col.size").into_owned(), cx)
+                        .w(crate::prefs::size_width())
+                        .flex_none()
+                        .justify_end(),
+                    Col::Size,
+                    cx,
+                ),
+            )
         } else {
             let name = self.header_cell(Col::Name, cx);
             let cells: Vec<AnyElement> = self
@@ -231,19 +211,27 @@ impl Explorer {
                 .collect();
             row.child(self.name_header(name, cx)).children(cells)
         };
-        div()
+        let header = div()
             .id("details-header")
+            .debug_selector(|| "details-header-box".to_owned())
             .flex()
             .flex_none()
             .h(theme::h_header())
-            .mx(theme::s_8())
+            // Clipped where the rows are, at the list's left edge and 8 px short of its right one,
+            // so the columns slide into the inset together with the rows; they start at the
+            // inset when not scrolled.
+            .pl(theme::list_inset())
+            .mr(theme::s_8())
             .overflow_hidden()
-            // Thin line between header and list to give the columns structure.
-            .border_b_1()
-            .border_color(theme::line())
             .text_size(theme::fs_12())
             .text_color(theme::text_muted())
-            .child(row)
+            // Moved with the list when it scrolls sideways (see `SideScroll`).
+            .child(SideScroll {
+                child: row.into_any_element(),
+                handle: self.header_list(),
+                seen: Rc::clone(&self.header_x),
+                content: None,
+            })
             // Right-click anywhere on the header, the blank part too: which columns to show.
             .when(!self.search_mode, |d| {
                 d.on_mouse_down(
@@ -255,13 +243,23 @@ impl Explorer {
                     }),
                 )
             })
-            .into_any_element()
+            .into_any_element();
+        // The offset is clamped before anything reads it (see `SideScroll`).
+        SideScroll {
+            child: header,
+            handle: self.header_list(),
+            seen: Rc::default(),
+            content: self
+                .cols
+                .map(|c| c.row + theme::list_inset() + layout::list_gutter()),
+        }
+        .into_any_element()
     }
 
     /// The Name column's header: the select-all checkbox, room for the icon (and the tree's
     /// chevron), then `label`, with the column's divider on its right edge.
     fn name_header(&self, label: AnyElement, cx: &mut Context<Self>) -> AnyElement {
-        resizable(
+        self.resizable(
             div()
                 .w(self.column_width(Col::Name))
                 .flex_none()
@@ -406,7 +404,7 @@ impl Explorer {
         } else {
             cell
         };
-        resizable(cell, col, cx).into_any_element()
+        self.resizable(cell, col, cx).into_any_element()
     }
 
     /// A header was dropped on `target`: move `moved` there and save the order (app-wide).
@@ -564,7 +562,12 @@ impl Explorer {
     ) -> Option<Vec<Pixels>> {
         let results = self.search_results.as_ref()?;
         let mut widths = Vec::new();
-        for ix in self.rows_on_screen(&self.search_scroll) {
+        // "Similar results" is a row of its own (`explorer_similar.rs`), not a hit.
+        let similar = self.similar_row().map(|(at, _)| at);
+        for row in self.rows_on_screen(&self.search_scroll) {
+            let Some(ix) = super::similar::hit_at_row(row, similar) else {
+                continue;
+            };
             let Some(hit) = results.hits.get(ix) else {
                 break;
             };
@@ -724,7 +727,7 @@ impl Explorer {
     #[cfg(test)]
     pub(crate) fn header_columns_for_test(&self) -> Vec<(Col, Pixels, Pixels)> {
         let mut left = self.list_bounds.get().left()
-            + theme::s_8()
+            + theme::list_inset()
             + layout::row_pad_l()
             + self.header_x.get().unwrap_or_default();
         std::iter::once(Col::Name)
@@ -771,6 +774,7 @@ fn drop_side(moved: Col, target: Col) -> Option<bool> {
 /// Small muted text in a fixed-width column.
 fn text_cell(col: Col, text: impl Into<SharedString>) -> AnyElement {
     div()
+        .debug_selector(move || format!("cell-{}", col.key()))
         .w(crate::prefs::width(col))
         .flex_none()
         .truncate()
@@ -816,62 +820,62 @@ fn shown_extension(entry: &Entry) -> SharedString {
         .map_or_default(|dot| SharedString::from(entry.name[dot..].to_owned()))
 }
 
-/// `cell` with its column's divider on its right edge: dragging it sizes `col` (the columns to its
-/// right move along), double-clicking fits it to its content.
-fn resizable<E: ParentElement + InteractiveElement + Styled>(
-    cell: E,
-    col: Col,
-    cx: &mut Context<Explorer>,
-) -> E {
-    cell.relative()
-        .child(column_resize_handle(col, cx))
-        .on_drag_move(
-            cx.listener(move |this, e: &gpui::DragMoveEvent<DraggedColumn>, _, cx| {
-                let dragged = *e.drag(cx);
-                if dragged.0 == col && dragged.1 == cx.entity_id() {
-                    // The column's left edge stays put; the divider (half a gap past the right
-                    // edge) follows the cursor.
-                    let width = e.event.position.x - e.bounds.left() - layout::col_gap() / 2.;
-                    crate::prefs::set_width(col, Some(width));
+impl Explorer {
+    /// `cell` with its column's divider on its right edge: dragging it sizes `col` (the columns
+    /// to its right move along), double-clicking fits it to its content.
+    fn resizable<E: ParentElement + Styled>(&self, cell: E, col: Col, cx: &mut Context<Self>) -> E {
+        cell.relative().child(self.column_resize_handle(col, cx))
+    }
+
+    /// Divider on a column header's right edge, in the gap to the next column (or the row's
+    /// padding after the last one): drag to resize, double-click to fit the content.
+    fn column_resize_handle(&self, col: Col, cx: &mut Context<Self>) -> impl IntoElement {
+        // Columns are 12 px apart: the divider sits in the middle, 8 px wide for an easy grab.
+        let hit = div()
+            .absolute()
+            .top_0()
+            .bottom_0()
+            .right(px(-10.))
+            .w(crate::theme::scaled_px(8.))
+            .flex()
+            .justify_center();
+        let line = div()
+            .w(px(1.))
+            .h(crate::theme::scaled_px(14.))
+            .my_auto()
+            .bg(theme::line());
+        let dragging = self.column_drag.is_some_and(|d| d.0 == col);
+        Splitter::new(("col-resize", col as usize), gpui::CursorStyle::ResizeLeftRight)
+            .look(Look::Subtle)
+            .dragging(dragging)
+            .on_start(cx.listener(move |this, e: &MouseDownEvent, _, cx| {
+                log::info!("column resize start: {col:?}");
+                this.activate_on_press(cx);
+                this.column_drag = Some((col, e.position.x, this.column_width(col)));
+            }))
+            .on_double_click(cx.listener(move |this, _: &MouseDownEvent, window, cx| {
+                this.activate_on_press(cx);
+                this.autofit_column(col, window, cx);
+            }))
+            // The column's left edge stays put; its right edge moves as far as the cursor did since
+            // the press, so it neither jumps to the cursor nor lags behind it.
+            .on_drag(cx.listener(move |this, e: &gpui::MouseMoveEvent, _, cx| {
+                if let Some((c, from, start)) = this.column_drag
+                    && c == col
+                {
+                    crate::prefs::set_width(col, Some(start + e.position.x - from));
                     this.column_resized = true;
                     cx.notify();
                 }
-            }),
-        )
-}
-
-/// Divider on a column header's right edge, in the gap to the next column (or the row's padding
-/// after the last one): drag to resize, double-click to fit the content.
-fn column_resize_handle(col: Col, cx: &mut Context<Explorer>) -> impl IntoElement {
-    div()
-        .id(("col-resize", col as usize))
-        .absolute()
-        .top_0()
-        .bottom_0()
-        // Columns are 12 px apart: the divider sits in the middle, 8 px wide for an easy grab.
-        .right(px(-10.))
-        .w(crate::theme::scaled_px(8.))
-        .flex()
-        .justify_center()
-        .cursor(gpui::CursorStyle::ResizeLeftRight)
-        .group("col-resize")
-        .child(
-            div()
-                .w(px(1.))
-                .h(crate::theme::scaled_px(14.))
-                .my_auto()
-                .bg(theme::line())
-                .group_hover("col-resize", |s| s.bg(theme::text_subtle())),
-        )
-        .on_drag(DraggedColumn(col, cx.entity_id()), |d, _, _, cx| {
-            log::info!("column resize start: {:?}", d.0);
-            cx.new(|_| ColumnDragView)
-        })
-        .on_click(cx.listener(move |this, e: &ClickEvent, window, cx| {
-            if e.click_count() >= 2 {
-                this.autofit_column(col, window, cx);
-            }
-        }))
+            }))
+            .on_end(cx.listener(|this, _: &DragEnd, _, cx| {
+                if this.column_drag.take().is_some() {
+                    this.save_column_widths(cx);
+                    cx.notify();
+                }
+            }))
+            .render(hit, line)
+    }
 }
 
 /// Explorer's shortcut arrow for symlinks and junctions: a small framed arrow over the icon's
@@ -902,4 +906,92 @@ pub(crate) fn with_link_badge(visual: AnyElement, icon: Pixels) -> AnyElement {
                 .child(layer(Icon::LinkBadgeArrow, theme::signal())),
         )
         .into_any_element()
+}
+
+/// Sideways scrolling of the Details header, in two parts that share the list's `ScrollHandle`.
+///
+/// With `content` set it wraps the whole header and, before anything is laid out under it,
+/// clamps the handle's offset to the range the list will have this frame: `content` (the row plus
+/// the inset before it and the blank strip after it) less the header's own width, which is the
+/// list's width less its right padding. Without `content` it wraps the row and moves it by the handle's
+/// offset, which is therefore already the one the list will use: header and rows can never differ,
+/// whatever a wheel overshot or however the columns and the pane just changed, and the element
+/// tree keeps its order (the header stays before the rows for screen readers and focus).
+struct SideScroll {
+    child: AnyElement,
+    handle: gpui::ScrollHandle,
+    /// Receives the offset the row was drawn at (tests read it).
+    seen: Rc<std::cell::Cell<Option<Pixels>>>,
+    content: Option<Pixels>,
+}
+
+impl IntoElement for SideScroll {
+    type Element = Self;
+
+    fn into_element(self) -> Self::Element {
+        self
+    }
+}
+
+impl gpui::Element for SideScroll {
+    type RequestLayoutState = ();
+    type PrepaintState = ();
+
+    fn id(&self) -> Option<gpui::ElementId> {
+        None
+    }
+
+    fn source_location(&self) -> Option<&'static std::panic::Location<'static>> {
+        None
+    }
+
+    fn request_layout(
+        &mut self,
+        _: Option<&gpui::GlobalElementId>,
+        _: Option<&gpui::InspectorElementId>,
+        window: &mut Window,
+        cx: &mut gpui::App,
+    ) -> (gpui::LayoutId, ()) {
+        (self.child.request_layout(window, cx), ())
+    }
+
+    fn prepaint(
+        &mut self,
+        _: Option<&gpui::GlobalElementId>,
+        _: Option<&gpui::InspectorElementId>,
+        bounds: gpui::Bounds<Pixels>,
+        (): &mut (),
+        window: &mut Window,
+        cx: &mut gpui::App,
+    ) {
+        if let Some(content) = self.content {
+            // Rounded like GPUI rounds a scroll range, so both clamp to the same value.
+            let range = ((content - bounds.size.width).max(px(0.)) * 100.).round() / 100.;
+            let at = self.handle.offset();
+            if at.x < -range || at.x > px(0.) {
+                self.handle
+                    .set_offset(gpui::point(at.x.clamp(-range, px(0.)), at.y));
+            }
+            self.child.prepaint(window, cx);
+            return;
+        }
+        let x = self.handle.offset().x.min(px(0.));
+        self.seen.set(Some(x));
+        window.with_element_offset(gpui::point(x, px(0.)), |window| {
+            self.child.prepaint(window, cx);
+        });
+    }
+
+    fn paint(
+        &mut self,
+        _: Option<&gpui::GlobalElementId>,
+        _: Option<&gpui::InspectorElementId>,
+        _: gpui::Bounds<Pixels>,
+        (): &mut (),
+        (): &mut (),
+        window: &mut Window,
+        cx: &mut gpui::App,
+    ) {
+        self.child.paint(window, cx);
+    }
 }

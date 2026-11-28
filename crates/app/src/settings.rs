@@ -59,8 +59,9 @@ pub(crate) struct FavoriteGroup {
     pub(crate) collapsed: bool,
 }
 
-/// A sidebar section. Favorites, This PC and Network collapse to their heading; Home (its row and
-/// tiles) never collapses, nor do the tabs. Home, Favorites and This PC can be hidden (#323).
+/// A sidebar section. Favorites, This PC and Network collapse to their heading; Home (its row)
+/// never collapses, nor do the tabs. Home, Favorites and This PC can be hidden (#323); the tiles
+/// belong to Favorites.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum SidebarSection {
@@ -318,6 +319,9 @@ pub(crate) struct PropertiesPlace {
     pub(crate) width: f32,
     #[serde(default)]
     pub(crate) height: Option<f32>,
+    /// Scale of the monitor the size was saved on; absent in older files (then used as is).
+    #[serde(default)]
+    pub(crate) scale: Option<f32>,
 }
 
 /// Last window position and size in logical pixels. When maximized this is the restored size.
@@ -456,9 +460,11 @@ pub(crate) struct ColumnViewWidths {
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum FolderOrder {
-    /// Folders always first, as in Windows Explorer.
+    /// Before files, as in File Explorer: first when ascending, last when descending.
     #[default]
     First,
+    /// Always first: on top in both directions (#499).
+    AlwaysFirst,
     /// Mixed with files.
     Mixed,
 }
@@ -567,9 +573,10 @@ pub(crate) struct Settings {
     pub(crate) density: Density,
     /// Preview pane on the right.
     pub(crate) preview_pane: bool,
-    /// Space hands the item to QuickLook (QL-Win) instead of Arke's Quick Look (offered only
-    /// when it is installed).
-    pub(crate) space_quicklook: bool,
+    /// External preview program: Space hands the item to this command line instead of opening
+    /// Arke's Quick Look (`external.rs`). Empty: off. Before 0.10 `space_quicklook` (see
+    /// [`Settings::migrate_external_tools`]).
+    pub(crate) external_preview: String,
     /// Ctrl+T searches the whole PC. Needs an index, off by default.
     pub(crate) global_search: bool,
     /// Global search skips build and package cache folders (`node_modules`, Rust `target`, ...).
@@ -608,7 +615,8 @@ pub(crate) struct Settings {
     /// The collapsed sidebar opens over the content while the pointer rests on it (#122).
     pub(crate) sidebar_peek: bool,
     /// This PC's tree opens down to the current folder and scrolls to it (#241); off, the tree
-    /// only opens where the user opens it (#299).
+    /// only opens where the user opens it (#299). Off for new installs, as in File Explorer
+    /// (#416); a settings file that stores a value keeps it.
     pub(crate) sidebar_follow: bool,
     /// Sidebar sections collapsed to their heading. Before 0.8 only This PC could collapse
     /// (`this_pc_collapsed`, see [`Settings::migrate_this_pc_collapsed`]).
@@ -683,8 +691,10 @@ pub(crate) struct Settings {
     pub(crate) queue_same_drive: bool,
     /// Read copies back and compare them with their sources.
     pub(crate) verify_copies: bool,
-    /// Hand copies and moves to TeraCopy (offered only when it is installed).
-    pub(crate) use_teracopy: bool,
+    /// External copy program: copies and moves go to this command line instead of Arke's engine
+    /// (`external.rs`). Empty: off. Before 0.10 `use_teracopy` (see
+    /// [`Settings::migrate_external_tools`]).
+    pub(crate) external_copy: String,
     /// Double click on empty list space goes up one level.
     pub(crate) double_click_up: bool,
     /// Compute folder sizes in the background (local disks only).
@@ -777,13 +787,16 @@ pub(crate) struct Settings {
     /// Download route for updates (`update_route.rs`): empty for GitHub directly, an https prefix
     /// or an HTTP proxy `host:port`. Only update checks and downloads use it.
     pub(crate) update_route: String,
+    /// Windows' RedirectionGuard is on for every program on this PC (a policy): the copy Arke
+    /// started again through the desktop shell still had it, so later starts don't try that
+    /// (`redirection_guard.rs`). Cleared by a start without it. Per machine: not exported.
+    pub(crate) redirection_guard_by_policy: bool,
     /// What's new (`whats_new.rs`): open it after an update, and the version it last saw (`None`
     /// before Arke 0.4 recorded it).
     pub(crate) whats_new_auto: bool,
     pub(crate) whats_new_seen: Option<String>,
-    /// "Open with": custom apps (exe paths) and detected editors to hide.
+    /// "Open with": the apps (exe paths) the user added.
     pub(crate) open_with_extra: Vec<PathBuf>,
-    pub(crate) open_with_hidden: Vec<PathBuf>,
     /// Start in the background at Windows sign-in, via a shortcut in the Startup folder (no registry).
     pub(crate) autostart: bool,
     /// A shortcut in the Start menu (`%APPDATA%\Microsoft\Windows\Start Menu\Programs\Arke.lnk`),
@@ -791,6 +804,11 @@ pub(crate) struct Settings {
     pub(crate) start_menu: bool,
     /// The first-run card offering the Start menu shortcut was answered or dismissed.
     pub(crate) start_menu_offered: bool,
+    /// The setup guide (`workspace_welcome.rs`) was finished or skipped, so a first run doesn't
+    /// show it again; it still opens from Settings › About and the command palette.
+    pub(crate) onboarding_done: bool,
+    /// What's new has shown, once, the entry offering the setup guide to someone who updated.
+    pub(crate) onboarding_offered: bool,
     /// The tabs of the window used last (the first of `session_windows`), which versions before
     /// 0.7 read as the whole last session.
     pub(crate) session: Session,
@@ -823,7 +841,7 @@ impl Default for Settings {
             last_tab: LastTabAction::default(),
             density: Density::default(),
             preview_pane: false,
-            space_quicklook: false,
+            external_preview: String::new(),
             global_search: false,
             search_network: Vec::new(),
             search_network_auto: true,
@@ -844,7 +862,7 @@ impl Default for Settings {
             dark_shade: DarkShade::default(),
             sidebar_collapsed: false,
             sidebar_peek: false,
-            sidebar_follow: true,
+            sidebar_follow: false,
             collapsed_sections: Vec::new(),
             hidden_sections: Vec::new(),
             font: String::new(),
@@ -876,7 +894,7 @@ impl Default for Settings {
             warn_extension_change: true,
             queue_same_drive: true,
             verify_copies: false,
-            use_teracopy: false,
+            external_copy: String::new(),
             double_click_up: false,
             folder_sizes: true,
             hide_dotfiles: false,
@@ -913,16 +931,18 @@ impl Default for Settings {
             update_checked: None,
             update_dismissed: None,
             update_route: String::new(),
+            redirection_guard_by_policy: false,
             whats_new_auto: true,
             whats_new_seen: None,
             open_with_extra: Vec::new(),
-            open_with_hidden: Vec::new(),
             show_checkboxes: false,
             group_rows: false,
             details_tree: false,
             autostart: false,
             start_menu: false,
             start_menu_offered: false,
+            onboarding_done: false,
+            onboarding_offered: false,
             session: Session::default(),
             session_windows: Vec::new(),
             window: None,
@@ -942,6 +962,7 @@ impl Settings {
             !self.sort_descending,
             self.folders == FolderOrder::Mixed,
         )
+        .with_always_first(self.folders == FolderOrder::AlwaysFirst)
     }
 
     pub(crate) fn remember(&mut self, path: &Path) {
@@ -1440,6 +1461,9 @@ impl SettingsStore {
         self.loaded = true;
         self.last_session_folder = loaded.recent.first().cloned();
         let file = loaded.clone();
+        // What this start found out about RedirectionGuard, written like any change.
+        loaded.redirection_guard_by_policy =
+            crate::redirection_guard::remembered_policy(loaded.redirection_guard_by_policy);
         for path in self.settings.recent.iter().rev() {
             loaded.remember(path);
         }
@@ -1540,7 +1564,7 @@ pub(crate) fn data_dir() -> Option<PathBuf> {
 
 /// `<exe dir>\data\settings.json` (string handling only).
 pub(crate) fn default_path() -> Option<PathBuf> {
-    data_dir().map(|dir| dir.join("settings.json"))
+    crate::paths::settings_file()
 }
 
 /// Turns "Open folders in Arke" off in the settings file (for `--restore-explorer`, which runs
@@ -1563,19 +1587,28 @@ pub(crate) fn turn_off_takeover(path: &Path) -> bool {
 /// file before anything else starts (the folder handler deciding where Home goes). Off when the
 /// file is missing or unreadable; nothing is written.
 pub(crate) fn home_opens_arke() -> bool {
-    default_path()
-        .and_then(|path| std::fs::read(path).ok())
-        .is_some_and(|bytes| win_e_switch(&bytes))
+    file_switch("win_e_opens_arke")
 }
 
-fn win_e_switch(bytes: &[u8]) -> bool {
+/// `redirection_guard_by_policy`, read straight from the settings file like [`home_opens_arke`]:
+/// startup decides with it before the settings are loaded, and only when RedirectionGuard is on.
+pub(crate) fn redirection_guard_by_policy() -> bool {
+    file_switch("redirection_guard_by_policy")
+}
+
+/// One on/off setting from the settings file, without loading the rest. Off when the file is
+/// missing or unreadable.
+fn file_switch(key: &str) -> bool {
+    default_path()
+        .and_then(|path| std::fs::read(path).ok())
+        .is_some_and(|bytes| switch(&bytes, key))
+}
+
+fn switch(bytes: &[u8], key: &str) -> bool {
     let bytes = bytes.strip_prefix(&[0xEF, 0xBB, 0xBF]).unwrap_or(bytes);
     serde_json::from_slice::<serde_json::Value>(bytes)
         .ok()
-        .and_then(|v| {
-            v.get("win_e_opens_arke")
-                .and_then(serde_json::Value::as_bool)
-        })
+        .and_then(|v| v.get(key).and_then(serde_json::Value::as_bool))
         .unwrap_or(false)
 }
 
@@ -1587,6 +1620,22 @@ fn load(path: &Path) -> Option<Settings> {
 /// Parses the settings file. Strips a leading BOM first: Notepad and PowerShell add one for UTF-8 and
 /// serde_json rejects it, which would fall back to defaults and overwrite the user's settings on next save.
 fn parse_settings(bytes: &[u8], path: &Path) -> Option<Settings> {
+    // Tests never look for programs on this machine.
+    let find: fn(crate::legacy_tools::Tool) -> Option<PathBuf> = if cfg!(test) {
+        |_| None
+    } else {
+        crate::legacy_tools::find
+    };
+    parse_settings_with(bytes, path, find)
+}
+
+/// [`parse_settings`] with the search for the programs of the old TeraCopy and QuickLook switches
+/// given.
+fn parse_settings_with(
+    bytes: &[u8],
+    path: &Path,
+    find: impl Fn(crate::legacy_tools::Tool) -> Option<PathBuf>,
+) -> Option<Settings> {
     let bytes = bytes.strip_prefix(&[0xEF, 0xBB, 0xBF]).unwrap_or(bytes);
     match serde_json::from_slice::<Settings>(bytes) {
         Ok(mut settings) => {
@@ -1599,6 +1648,7 @@ fn parse_settings(bytes: &[u8], path: &Path) -> Option<Settings> {
             settings.migrate_bookmarks(path);
             settings.migrate_this_pc_collapsed(bytes);
             settings.migrate_pin_owners(bytes);
+            settings.migrate_external_tools(bytes, find);
             Some(settings)
         }
         Err(err) => {
@@ -1618,8 +1668,7 @@ fn save(path: &Path, settings: &Settings) -> std::io::Result<()> {
     }
     let json = serde_json::to_vec_pretty(settings).map_err(std::io::Error::other)?;
     let tmp = path.with_extension("json.tmp");
-    std::fs::write(&tmp, json)?;
-    std::fs::rename(&tmp, path)
+    arke_core::fs::replace_file(path, &tmp, json)
 }
 
 impl Settings {
@@ -1763,6 +1812,57 @@ impl Settings {
         for owner in self.menu_pin_owners.values_mut() {
             if owner == "-" {
                 owner.clear();
+            }
+        }
+    }
+
+    /// Before 0.10 two switches handed work to one program each: `use_teracopy` (copies and moves
+    /// to TeraCopy) and `space_quicklook` (Space to QuickLook). A file with a switch on and no
+    /// generic setting yet gets the generic one set to that program with the same arguments, so
+    /// it works as before; `find` looks for the program (`legacy_tools.rs`), and only runs then.
+    /// The old keys are dropped on the next save, so this happens once. TeraCopy not found stays
+    /// off: it wasn't used then either. QuickLook was reached over its pipe, wherever it ran
+    /// from, so its setting is the pipe form, with the exe as the fallback when it was found.
+    fn migrate_external_tools(
+        &mut self,
+        bytes: &[u8],
+        find: impl Fn(crate::legacy_tools::Tool) -> Option<PathBuf>,
+    ) {
+        use crate::legacy_tools::{TERACOPY_ARGS, Tool, quicklook_setting};
+        const OLD: [(&str, &str, Tool); 2] = [
+            ("use_teracopy", "external_copy", Tool::TeraCopy),
+            ("space_quicklook", "external_preview", Tool::QuickLook),
+        ];
+        let has = |key: &str| bytes.windows(key.len()).any(|w| w == key.as_bytes());
+        if !OLD.iter().any(|(old, ..)| has(old)) {
+            return;
+        }
+        let Ok(serde_json::Value::Object(map)) = serde_json::from_slice(bytes) else {
+            return;
+        };
+        for (old, new, tool) in OLD {
+            if map.get(old).and_then(serde_json::Value::as_bool) != Some(true)
+                || map.contains_key(new)
+            {
+                continue;
+            }
+            let exe = find(tool);
+            let line = match tool {
+                Tool::TeraCopy => {
+                    let Some(exe) = exe else {
+                        log::info!(
+                            "{old} was on, but {tool:?} isn't installed where it was looked for"
+                        );
+                        continue;
+                    };
+                    crate::external::command_line(&exe, TERACOPY_ARGS)
+                }
+                Tool::QuickLook => quicklook_setting(exe.as_deref()),
+            };
+            log::info!("{old} became {new}: {line}");
+            match tool {
+                Tool::TeraCopy => self.external_copy = line,
+                Tool::QuickLook => self.external_preview = line,
             }
         }
     }
@@ -1911,6 +2011,7 @@ impl Settings {
         out.session_windows.clear();
         out.window = None;
         out.recent.clear();
+        out.redirection_guard_by_policy = false;
         out
     }
 
@@ -1920,6 +2021,7 @@ impl Settings {
         from.session_windows.clone_from(&self.session_windows);
         from.window = self.window;
         from.recent.clone_from(&self.recent);
+        from.redirection_guard_by_policy = self.redirection_guard_by_policy;
         from
     }
 }
@@ -1976,6 +2078,125 @@ mod tests {
         bytes.extend_from_slice(br#"{"global_search": true, "show_hidden": true}"#);
         let s = parse_settings(&bytes, Path::new("settings.json")).unwrap();
         assert!(s.global_search && s.show_hidden);
+    }
+
+    /// #499: "first", as 0.10 saved it, now means "before files" (File Explorer); "always_first" is
+    /// the new choice, and each gives its own sort spec.
+    #[test]
+    fn folder_order_is_read_and_reaches_the_sort_spec() {
+        let path = Path::new("settings.json");
+        let load = |json: &[u8]| parse_settings(json, path).unwrap();
+        let before = load(br#"{"folders": "first"}"#);
+        assert_eq!(before.folders, FolderOrder::First);
+        let spec = before.default_sort();
+        assert!(!spec.mixed && !spec.always_first);
+        assert!(
+            !SortSpec {
+                ascending: false,
+                ..spec
+            }
+            .folders_lead()
+        );
+        let always = load(br#"{"folders": "always_first"}"#);
+        assert_eq!(always.folders, FolderOrder::AlwaysFirst);
+        let spec = always.default_sort();
+        assert!(!spec.mixed && spec.always_first);
+        assert!(
+            SortSpec {
+                ascending: false,
+                ..spec
+            }
+            .folders_lead()
+        );
+        let mixed = load(br#"{"folders": "mixed"}"#);
+        assert!(mixed.default_sort().mixed);
+        assert_eq!(
+            load(b"{}").folders,
+            FolderOrder::First,
+            "File Explorer's by default"
+        );
+    }
+
+    /// The TeraCopy and QuickLook switches of 0.9 become the generic programs with the same
+    /// arguments, once, and only when the program is found; a file that already has the generic
+    /// setting keeps it.
+    #[test]
+    fn old_teracopy_and_quicklook_switches_become_the_external_programs() {
+        use crate::external::{Command, Preview, Use};
+        use crate::legacy_tools::Tool;
+        let path = Path::new("settings.json");
+        let teracopy = PathBuf::from(r"C:\Program Files\TeraCopy\TeraCopy.exe");
+        let quicklook = PathBuf::from(r"C:\Users\u\AppData\Local\Programs\QuickLook\QuickLook.exe");
+        let looked = parking_lot::Mutex::new(Vec::new());
+        let found = |tool: Tool| {
+            looked.lock().push(tool);
+            Some(match tool {
+                Tool::TeraCopy => teracopy.clone(),
+                Tool::QuickLook => quicklook.clone(),
+            })
+        };
+        let old = br#"{"use_teracopy": true, "space_quicklook": true, "show_hidden": true}"#;
+        let s = parse_settings_with(old, path, found).unwrap();
+        assert_eq!(
+            s.external_copy,
+            r#""C:\Program Files\TeraCopy\TeraCopy.exe" {op} *{list} {dest}"#
+        );
+        assert_eq!(
+            s.external_preview,
+            concat!(
+                r"pipe:\\.\pipe\QuickLook.App.Pipe.{sid} QuickLook.App.PipeMessages.Toggle|{file}",
+                r#" || "C:\Users\u\AppData\Local\Programs\QuickLook\QuickLook.exe" {file}"#
+            )
+        );
+        assert!(s.show_hidden);
+        // What the old hand-offs did: TeraCopy got moves too; QuickLook the item over its pipe,
+        // and its exe when the pipe wasn't there.
+        let copy = Command::parse(&s.external_copy, Use::Copy)
+            .unwrap()
+            .unwrap();
+        assert_eq!(copy.program, teracopy);
+        let move_op = crate::shell::FileOp::Move {
+            sources: vec![PathBuf::from(r"C:\a")],
+            dest: PathBuf::from(r"D:\b"),
+        };
+        assert!(copy.takes(&move_op), "moves went to TeraCopy too");
+        assert!(
+            Preview::parse(&s.external_preview).is_some_and(|look| look.is_ok()),
+            "the converted setting reads back"
+        );
+
+        // Saved without the old keys: read again, nothing is looked for or changed.
+        looked.lock().clear();
+        let saved = serde_json::to_vec(&s).unwrap();
+        assert!(!saved.windows(12).any(|w| w == b"use_teracopy"));
+        let again = parse_settings_with(&saved, path, found).unwrap();
+        assert_eq!(again, s);
+        assert!(looked.lock().is_empty(), "converted once");
+
+        // Switches off, or the program not found: off.
+        let off = br#"{"use_teracopy": false, "space_quicklook": false}"#;
+        let s = parse_settings_with(off, path, found).unwrap();
+        assert!(s.external_copy.is_empty() && s.external_preview.is_empty());
+        assert!(looked.lock().is_empty(), "nothing to look for");
+        // Not found: TeraCopy stays off. QuickLook was reached over its pipe wherever it ran, so
+        // it keeps the pipe alone (Arke's Quick Look opens while it isn't running, as before).
+        let s = parse_settings_with(old, path, |_| None).unwrap();
+        assert!(s.external_copy.is_empty());
+        assert_eq!(
+            s.external_preview,
+            r"pipe:\\.\pipe\QuickLook.App.Pipe.{sid} QuickLook.App.PipeMessages.Toggle|{file}"
+        );
+        assert!(
+            Preview::parse(&s.external_preview).is_some_and(|look| look.is_ok()),
+            "the pipe alone reads back"
+        );
+
+        // A file that already has the generic setting (written by 0.10) keeps it.
+        let both = br#"{"use_teracopy": true, "external_copy": "", "space_quicklook": true,
+            "external_preview": "v.exe {file}"}"#;
+        let s = parse_settings_with(both, path, found).unwrap();
+        assert_eq!(s.external_copy, "");
+        assert_eq!(s.external_preview, "v.exe {file}");
     }
 
     /// Changed shortcuts are written to the file and read back; files from before have none.
@@ -2130,14 +2351,19 @@ mod tests {
     fn hidden_sections_are_kept() {
         let read = |json: &[u8]| parse_settings(json, Path::new("settings.json")).unwrap();
         assert!(Settings::default().hidden_sections.is_empty());
-        let later = read(br#"{"hidden_sections": ["home", "someday", "this_pc", "home"]}"#);
+        let later =
+            read(br#"{"hidden_sections": ["home", "someday", "this_pc", "home", "network"]}"#);
         assert_eq!(
             later.hidden_sections,
-            vec![SidebarSection::Home, SidebarSection::ThisPc]
+            vec![
+                SidebarSection::Home,
+                SidebarSection::ThisPc,
+                SidebarSection::Network
+            ]
         );
         let json = serde_json::to_string(&later).unwrap();
         assert!(
-            json.contains(r#""hidden_sections":["home","this_pc"]"#),
+            json.contains(r#""hidden_sections":["home","this_pc","network"]"#),
             "{json}"
         );
 
@@ -2175,7 +2401,8 @@ mod tests {
     /// leaves the newer one in the file.
     #[test]
     fn an_older_write_never_replaces_a_newer_one() {
-        let dir = std::env::temp_dir().join(format!("arke-save-order-{}", std::process::id()));
+        let tmp_dir = tempfile::tempdir().unwrap();
+        let dir = tmp_dir.path().to_path_buf();
         let path = dir.join("settings.json");
         let written = parking_lot::Mutex::new(0);
         let with_recent = |p: &str| Settings {
@@ -2191,7 +2418,6 @@ mod tests {
         save_change(&path, &with_recent(r"C:\newer"), 3, &written);
         assert_eq!(load(&path).unwrap().recent, [PathBuf::from(r"C:\newer")]);
         assert_eq!(*written.lock(), 3);
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// Settings saved before the Recycle Bin moved into the pinned list keep it pinned.
@@ -2202,6 +2428,26 @@ mod tests {
         let unpinned =
             parse_settings(br#"{"recycle_pinned": false}"#, Path::new("settings.json")).unwrap();
         assert!(!unpinned.recycle_pinned);
+    }
+
+    /// #416: the tree doesn't follow the folder on a new install, and a file that stores the
+    /// switch keeps it, either way.
+    #[test]
+    fn sidebar_follow_is_off_unless_the_file_says_otherwise() {
+        assert!(!Settings::default().sidebar_follow);
+        let read = |json: &[u8]| parse_settings(json, Path::new("settings.json")).unwrap();
+        assert!(!read(b"{}").sidebar_follow, "no value stored");
+        assert!(read(br#"{"sidebar_follow": true}"#).sidebar_follow);
+        assert!(!read(br#"{"sidebar_follow": false}"#).sidebar_follow);
+        let on = Settings {
+            sidebar_follow: true,
+            ..Settings::default()
+        };
+        let bytes = serde_json::to_vec(&on).unwrap();
+        assert!(
+            read(&bytes).sidebar_follow,
+            "written, so stored from then on"
+        );
     }
 
     #[test]
@@ -2516,7 +2762,8 @@ mod tests {
 
     #[test]
     fn round_trips_and_tolerates_missing_fields() {
-        let dir = std::env::temp_dir().join(format!("arke-settings-test-{}", std::process::id()));
+        let tmp_dir = tempfile::tempdir().unwrap();
+        let dir = tmp_dir.path().to_path_buf();
         let path = dir.join("settings.json");
         let mut s = Settings::default();
         s.toggle_pin(Path::new(r"C:\a"), &[]);
@@ -2594,7 +2841,6 @@ mod tests {
         // A corrupt file does not panic.
         std::fs::write(&path, b"{not json").unwrap();
         assert_eq!(load(&path), None);
-        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
@@ -2667,21 +2913,52 @@ mod tests {
 
     #[test]
     fn the_win_e_switch_is_read_without_loading_the_rest() {
-        assert!(win_e_switch(br#"{"win_e_opens_arke":true,"pinned":[]}"#));
-        assert!(win_e_switch(b"\xEF\xBB\xBF{\"win_e_opens_arke\":true}"));
-        assert!(!win_e_switch(br#"{"win_e_opens_arke":false}"#));
+        assert!(switch(
+            br#"{"win_e_opens_arke":true,"pinned":[]}"#,
+            "win_e_opens_arke"
+        ));
+        assert!(switch(
+            b"\xEF\xBB\xBF{\"win_e_opens_arke\":true}",
+            "win_e_opens_arke"
+        ));
+        assert!(!switch(
+            br#"{"win_e_opens_arke":false}"#,
+            "win_e_opens_arke"
+        ));
         assert!(
-            !win_e_switch(br#"{"open_folders_in_arke":true}"#),
+            !switch(br#"{"open_folders_in_arke":true}"#, "win_e_opens_arke"),
             "off unless set"
         );
-        assert!(!win_e_switch(b"{ broken"));
+        assert!(!switch(b"{ broken", "win_e_opens_arke"));
+    }
+
+    #[test]
+    fn the_redirection_guard_policy_is_off_by_default_and_per_machine() {
+        let key = "redirection_guard_by_policy";
+        assert!(!Settings::default().redirection_guard_by_policy);
+        let old = parse_settings(br#"{"pinned":[]}"#, Path::new("settings.json")).unwrap();
+        assert!(!old.redirection_guard_by_policy, "missing in older files");
+        let on = Settings {
+            redirection_guard_by_policy: true,
+            ..Settings::default()
+        };
+        let json = serde_json::to_vec(&on).unwrap();
+        assert!(switch(&json, key), "read early without loading the rest");
+        assert!(!switch(br#"{"pinned":[]}"#, key));
+        let back: Settings = serde_json::from_slice(&json).unwrap();
+        assert!(back.redirection_guard_by_policy);
+        // A policy of this PC: not exported, and an import keeps this PC's.
+        let exported = export_json(&on).unwrap();
+        assert!(!parse_export(&exported).unwrap().redirection_guard_by_policy);
+        assert!(on.imported(Settings::default()).redirection_guard_by_policy);
+        assert!(!Settings::default().imported(on).redirection_guard_by_policy);
     }
 
     #[test]
     fn uninstall_keeps_settings_but_turns_takeover_off() {
-        let dir = std::env::temp_dir().join(format!("arke-test-takeover-{}", std::process::id()));
+        let tmp_dir = tempfile::tempdir().unwrap();
+        let dir = tmp_dir.path().to_path_buf();
         let path = dir.join("settings.json");
-        let _ = std::fs::remove_dir_all(&dir);
         assert!(turn_off_takeover(&path), "no file, nothing to do");
         let settings = Settings {
             open_folders_in_arke: true,
@@ -2693,6 +2970,5 @@ mod tests {
         let kept = load(&path).unwrap();
         assert!(!kept.open_folders_in_arke);
         assert!(kept.show_hidden, "other settings stay");
-        std::fs::remove_dir_all(&dir).unwrap();
     }
 }

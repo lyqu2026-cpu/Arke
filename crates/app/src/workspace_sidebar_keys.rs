@@ -1,11 +1,12 @@
 //! The keyboard in the sidebar, and F6 between the parts of the window (#322).
 //!
 //! F6 (Shift+F6 back) moves the keyboard from the file list to the sidebar, the path bar, the
-//! search box and back to the list, as in File Explorer. In the sidebar the arrow keys move a
-//! cursor over its rows (favorites, the Recycle Bin, section headings, the folder tree): Right
-//! expands or steps into a folder, Left collapses it or goes up to its parent, Enter or Space opens
-//! it (the keyboard then goes to the list, as after a click) and Escape goes back to the list. The
-//! row under the cursor is reported to screen readers as the focused item.
+//! pane row's buttons (`explorer_toolbar.rs`), the search box and back to the list, as in File
+//! Explorer. In the sidebar the arrow keys move a cursor over its rows (favorites, the Recycle
+//! Bin, section headings, the folder tree): Right expands or steps into a folder, Left collapses
+//! it or goes up to its parent, Enter or Space opens it (the keyboard then goes to the list, as
+//! after a click) and Escape goes back to the list. The row under the cursor is reported to
+//! screen readers as the focused item.
 //!
 //! The sidebar takes the keyboard only through F6: it tracks its focus handle only while that
 //! handle is focused, so a click in the sidebar leaves the keyboard where it was (in the list), as
@@ -32,10 +33,15 @@ use crate::theme;
 actions!(
     sidebar_keys,
     [
-        /// F6: the keyboard goes to the next part of the window (list, sidebar, path bar, search).
+        /// F6: the keyboard goes to the next part of the window (list, sidebar, path bar, the pane
+        /// row's buttons, search).
         FocusNextRegion,
         /// Shift+F6: the previous part.
         FocusPrevRegion,
+        /// Tab: the keyboard goes to the next stop (see [`Stop`]).
+        FocusNextStop,
+        /// Shift+Tab: the previous stop.
+        FocusPrevStop,
         SidebarUp,
         SidebarDown,
         SidebarFirst,
@@ -64,6 +70,24 @@ pub(crate) fn bind_keys(cx: &mut gpui::App) {
         gpui::KeyBinding::new("space", SidebarOpen, sidebar),
         gpui::KeyBinding::new("escape", SidebarLeave, sidebar),
     ]);
+    // Tab walks the stops from the places that are one (the list, the tree, the Home page, the
+    // pane row). Anywhere else Tab keeps its own meaning: menus, dialogs, a rename box, the
+    // settings pages. The path bar and the search box use Tab themselves (completing a path,
+    // entering the search panel) and hand it on when they have nothing to do with it, so only
+    // Shift+Tab is bound there.
+    for context in ["FileList", "Sidebar", "HomePage", "RecycleBin", "Toolbar"] {
+        cx.bind_keys([
+            gpui::KeyBinding::new("tab", FocusNextStop, Some(context)),
+            gpui::KeyBinding::new("shift-tab", FocusPrevStop, Some(context)),
+        ]);
+    }
+    for context in ["PathBar", "FilterBar"] {
+        cx.bind_keys([gpui::KeyBinding::new(
+            "shift-tab",
+            FocusPrevStop,
+            Some(context),
+        )]);
+    }
 }
 
 /// Opens a row (a click on it).
@@ -97,6 +121,9 @@ pub(super) struct SidebarKeys {
     pub(super) cursor: RefCell<Option<SharedString>>,
     /// The current folder's row, where the cursor starts.
     here: RefCell<Option<SharedString>>,
+    /// When the current folder has no row (its parents are collapsed), the row of its nearest
+    /// drawn ancestor, with how deep that folder is: the deepest one wins.
+    nearest: RefCell<Option<(usize, SharedString)>>,
     /// Scroll the cursor's row into view once it has been drawn.
     reveal: Cell<bool>,
 }
@@ -115,6 +142,7 @@ impl SidebarKeys {
             .flatten();
         self.rows.borrow_mut().clear();
         self.here.borrow_mut().take();
+        self.nearest.borrow_mut().take();
         reveal
     }
 
@@ -137,6 +165,23 @@ impl SidebarKeys {
                 .unwrap_or(std::cmp::Ordering::Equal)
         });
         out.into_iter().map(|(k, r, _)| (k, r)).collect()
+    }
+
+    /// Notes that the row `key`, drawn this frame, is a folder above the current one, `depth`
+    /// components deep. The deepest such row is where F6 lands when the current folder has no row.
+    pub(super) fn note_ancestor(&self, depth: usize, key: &SharedString) {
+        let mut nearest = self.nearest.borrow_mut();
+        if nearest.as_ref().is_none_or(|(d, _)| depth > *d) {
+            *nearest = Some((depth, key.clone()));
+        }
+    }
+
+    /// Where the cursor starts: the current folder's row, else its nearest drawn ancestor's.
+    fn start_row(&self) -> Option<SharedString> {
+        self.here
+            .borrow()
+            .clone()
+            .or_else(|| self.nearest.borrow().as_ref().map(|(_, k)| k.clone()))
     }
 
     fn row(&self, key: &SharedString) -> Option<NavRow> {
@@ -233,7 +278,11 @@ impl Workspace {
         if self.sidebar_focus.is_focused(window) {
             return Region::Sidebar;
         }
-        match self.active_view().read(cx).typing_in(window, cx) {
+        let view = self.active_view().read(cx);
+        if view.toolbar_held(window) {
+            return Region::Toolbar;
+        }
+        match view.typing_in(window, cx) {
             Some(crate::explorer::TypingIn::PathBar) => Region::PathBar,
             Some(crate::explorer::TypingIn::Search) => Region::Search,
             None => Region::List,
@@ -256,6 +305,147 @@ impl Workspace {
         cx: &mut Context<Self>,
     ) {
         self.step_region(false, window, cx);
+    }
+
+    pub(super) fn focus_next_stop(
+        &mut self,
+        _: &FocusNextStop,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.step_stop(true, window, cx) {
+            cx.propagate();
+        }
+    }
+
+    pub(super) fn focus_prev_stop(
+        &mut self,
+        _: &FocusPrevStop,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.step_stop(false, window, cx) {
+            cx.propagate();
+        }
+    }
+
+    /// The stop the keyboard is on, or `None` when it is somewhere that keeps Tab: a menu, a
+    /// dialog, a rename box, a page, Quick Look.
+    fn stop(&self, window: &Window, cx: &gpui::App) -> Option<Stop> {
+        if self.sidebar_focus.is_focused(window) {
+            return Some(Stop::Sidebar);
+        }
+        let view = self.active_view().read(cx);
+        if view.toolbar_held(window) {
+            return Some(Stop::Toolbar);
+        }
+        match view.typing_in(window, cx) {
+            Some(crate::explorer::TypingIn::PathBar) => return Some(Stop::PathBar),
+            Some(crate::explorer::TypingIn::Search) => return Some(Stop::Search),
+            None if view.panel_held(window) => return Some(Stop::Search),
+            None => {}
+        }
+        if let Some(page) = self.page_focus(cx) {
+            return ((self.home_open() || self.recycle_open()) && page.is_focused(window))
+                .then_some(Stop::List(0));
+        }
+        self.tabs[self.active]
+            .panes
+            .iter()
+            .position(|pane| {
+                let view = pane.view.read(cx);
+                gpui::Focusable::focus_handle(view, cx).is_focused(window) && !view.list_keeps_tab()
+            })
+            .map(Stop::List)
+    }
+
+    /// Every stop, in the order Tab goes (see [`Stop`]).
+    fn stops(&self, cx: &mut gpui::App) -> Vec<Stop> {
+        let page = self.page_focus(cx).is_some();
+        let lists = if page {
+            1
+        } else {
+            self.tabs[self.active].panes.len()
+        };
+        let mut ring: Vec<Stop> = (0..lists).map(Stop::List).collect();
+        if Self::sidebar_takes_keys(cx) {
+            ring.push(Stop::Sidebar);
+        }
+        // A page replaces the panes, the path bar, the pane row and the search box with it: they
+        // aren't drawn, so the keyboard can't be left on them.
+        if !page {
+            ring.extend([Stop::PathBar, Stop::Toolbar, Stop::Search]);
+        }
+        ring
+    }
+
+    /// Tab (`forward`) or Shift+Tab: one stop on. `false` when the keyboard isn't on a stop, so
+    /// the key is left to whatever else wants it.
+    pub(super) fn step_stop(
+        &mut self,
+        forward: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let Some(now) = self.stop(window, cx) else {
+            return false;
+        };
+        // Each button of the pane row is a stop of its own.
+        if now == Stop::Toolbar
+            && self
+                .active_view()
+                .update(cx, |e, cx| e.toolbar_walk(forward, cx))
+        {
+            return true;
+        }
+        // The Home page's sections are stops of their own.
+        if now == Stop::List(0) && self.home_open() && self.home_tab_section(forward, cx) {
+            return true;
+        }
+        let ring = self.stops(cx);
+        let at = ring.iter().position(|s| *s == now).unwrap_or(0);
+        let next = if forward {
+            ring[(at + 1) % ring.len()]
+        } else {
+            ring[(at + ring.len() - 1) % ring.len()]
+        };
+        if now == Stop::PathBar {
+            self.active_view()
+                .update(cx, |e, cx| e.cancel_path_edit(window, cx));
+        }
+        self.focus_stop(next, forward, window, cx);
+        true
+    }
+
+    fn focus_stop(
+        &mut self,
+        stop: Stop,
+        forward: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        match stop {
+            Stop::List(pane) => {
+                if self.home_open() {
+                    self.home_enter(forward, cx);
+                }
+                let tab = self.active;
+                if pane == self.tabs[tab].active_pane {
+                    self.focus_active(window, cx);
+                } else {
+                    self.activate_pane(tab, pane, window, cx);
+                }
+            }
+            // Backwards into the pane row: its last button.
+            Stop::Toolbar if !forward => {
+                self.active_view()
+                    .update(cx, |e, cx| e.focus_toolbar_last(window, cx));
+            }
+            Stop::Toolbar => self.focus_region(Region::Toolbar, window, cx),
+            Stop::Sidebar => self.focus_region(Region::Sidebar, window, cx),
+            Stop::PathBar => self.focus_region(Region::PathBar, window, cx),
+            Stop::Search => self.focus_region(Region::Search, window, cx),
+        }
     }
 
     fn step_region(&mut self, forward: bool, window: &mut Window, cx: &mut Context<Self>) {
@@ -292,7 +482,7 @@ impl Workspace {
                     .as_ref()
                     .is_some_and(|c| keys.rows.borrow().contains_key(c));
                 if !known {
-                    let start = keys.here.borrow().clone();
+                    let start = keys.start_row();
                     *keys.cursor.borrow_mut() = start;
                 }
                 keys.reveal.set(true);
@@ -302,6 +492,7 @@ impl Workspace {
             Region::PathBar => view.update(cx, |e, cx| {
                 e.focus_path_bar(&crate::explorer::FocusPathBar, window, cx);
             }),
+            Region::Toolbar => view.update(cx, |e, cx| e.focus_toolbar(window, cx)),
             Region::Search => view.update(cx, |e, cx| {
                 e.focus_filter(&crate::explorer::FocusFilter, window, cx);
             }),
@@ -421,17 +612,53 @@ impl Workspace {
     }
 }
 
+/// Where Tab stops, in the order it goes (Shift+Tab goes the other way round).
+///
+/// The order is F6's, each part opened up into its controls:
+/// 1. the list of each pane, left to right (the other pane of a split view is the next stop
+///    after this one; on the Home page the page's content);
+/// 2. the sidebar tree, when it is shown (one stop; the arrows move inside it);
+/// 3. the path bar;
+/// 4. each button of the pane row, one by one;
+/// 5. the search box, then, with Tab, its panel (scope, filters, contents), whose last row hands
+///    Tab on to the first list.
+///
+/// On a page that replaces the panes (Home, the Recycle Bin), the stops are the page and the
+/// sidebar only; each section of the Home page (favorites, drives, ...) is a stop of its own.
+///
+/// File Explorer's own order jumps around the window; this one follows F6, so the two keys
+/// agree about where things are. The tab strip and the preview are not stops.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Stop {
+    /// The list of this pane (index in the tab).
+    List(usize),
+    Sidebar,
+    PathBar,
+    /// The pane row: the button the row is on is the stop.
+    Toolbar,
+    /// The search box, or its panel.
+    Search,
+}
+
 /// The parts of the window F6 goes through, in its order.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Region {
     List,
     Sidebar,
     PathBar,
+    /// The pane row's buttons, beside the path bar.
+    Toolbar,
     Search,
 }
 
 impl Region {
-    const ORDER: [Self; 4] = [Self::List, Self::Sidebar, Self::PathBar, Self::Search];
+    const ORDER: [Self; 5] = [
+        Self::List,
+        Self::Sidebar,
+        Self::PathBar,
+        Self::Toolbar,
+        Self::Search,
+    ];
 }
 
 #[cfg(test)]
@@ -446,12 +673,29 @@ impl Workspace {
             .map(ToString::to_string)
     }
 
+    /// Where the keyboard is, as Tab sees it ("none": on no stop, where Tab isn't ours), with the
+    /// pane row's button.
+    pub(crate) fn stop_for_test(&self, window: &Window, cx: &gpui::App) -> String {
+        match self.stop(window, cx) {
+            None => "none".to_owned(),
+            Some(Stop::List(pane)) => format!("list{pane}"),
+            Some(Stop::Sidebar) => "sidebar".to_owned(),
+            Some(Stop::PathBar) => "path".to_owned(),
+            Some(Stop::Toolbar) => {
+                let at = self.active_view().read(cx).toolbar_at_for_test();
+                format!("toolbar:{}", at.unwrap_or("?"))
+            }
+            Some(Stop::Search) => "search".to_owned(),
+        }
+    }
+
     /// Where the keyboard is, as F6 sees it.
     pub(crate) fn region_for_test(&self, window: &Window, cx: &gpui::App) -> &'static str {
         match self.region(window, cx) {
             Region::List => "list",
             Region::Sidebar => "sidebar",
             Region::PathBar => "path",
+            Region::Toolbar => "toolbar",
             Region::Search => "search",
         }
     }

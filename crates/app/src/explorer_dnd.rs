@@ -97,6 +97,8 @@ impl DraggedFiles {
 /// window.
 pub(crate) struct PendingDragOut {
     pub(crate) paths: Vec<PathBuf>,
+    /// Remote items, handed over as virtual files (#529), listed already.
+    pub(crate) remote: Option<Arc<crate::remote_shell::RemoteItems>>,
     /// Image that follows the cursor, once the background job finishes.
     pub(crate) image: Option<DragImage>,
     /// Drag generation; a finished image is only applied to the drag it was made for.
@@ -124,12 +126,6 @@ impl gpui::Global for RightDrag {}
 pub(crate) struct RightPress {
     pub(crate) at: Point<Pixels>,
 }
-
-/// How far the right button must move before the press becomes a drag (a little more than GPUI's
-/// own threshold, so a shaky right click still opens the menu).
-const RIGHT_DRAG_THRESHOLD: f64 = 4.;
-/// Most bytes downloaded so remote items can be dragged into other programs.
-const DRAG_STAGE_MAX: u64 = 64 * 1024 * 1024;
 
 /// Inputs for the drag image, gathered on the UI thread without touching disk.
 struct DragImageJob {
@@ -190,6 +186,7 @@ impl DragPreview {
         } else {
             cx.set_global(PendingDragOut {
                 paths,
+                remote: None,
                 image: None,
                 id,
             });
@@ -210,30 +207,38 @@ impl DragPreview {
         preview
     }
 
-    /// Other programs need files on disk: remote items are downloaded first (up to
-    /// [`DRAG_STAGE_MAX`]), and the drag can leave the window once their copies are ready.
-    /// Drops inside Arke don't wait for this; they transfer from the server directly.
+    /// Other programs get remote items as virtual files, read from the server as they take
+    /// them (#529). Their names and sizes are listed first, in the background, and the drag can
+    /// leave the window once they are (the drag's data object, on the UI thread, never waits on
+    /// the server). Nothing is downloaded. Drops inside Arke don't wait for this; they transfer
+    /// from the server directly.
     fn stage_remote(paths: Vec<PathBuf>, id: u64, services: &super::Services, cx: &mut App) {
+        if !paths.iter().all(|p| arke_core::remote::is_remote(p)) {
+            // Local and remote items in one drag: only Arke takes them.
+            return;
+        }
         let (tx, rx) = flume::bounded(1);
-        let remotes = Arc::clone(&services.remotes);
-        spawn_thread("drag-stage", move || {
-            let _ = tx.send(crate::remote_shell::stage_local_copies(
-                &remotes,
-                &paths,
-                DRAG_STAGE_MAX,
-            ));
+        let items = crate::remote_shell::RemoteItems::new(
+            Arc::clone(&services.remotes),
+            paths.clone(),
+            false,
+        );
+        let listed = Arc::clone(&items);
+        spawn_thread("drag-list", move || {
+            let _ = tx.send(listed.listing().map(|_| ()));
         });
         cx.spawn(async move |cx| {
-            let staged = rx.recv_async().await;
-            cx.update(|cx| match staged {
-                Ok(Ok(local)) if cx.has_active_drag() && DRAG_ID.load(Ordering::Relaxed) == id => {
+            let listed = rx.recv_async().await;
+            cx.update(|cx| match listed {
+                Ok(Ok(())) if cx.has_active_drag() && DRAG_ID.load(Ordering::Relaxed) == id => {
                     cx.set_global(PendingDragOut {
-                        paths: local,
+                        paths,
+                        remote: Some(items),
                         image: None,
                         id,
                     });
                 }
-                Ok(Err(err)) => log::info!("remote items not staged for drag out: {err}"),
+                Ok(Err(err)) => log::info!("remote items not listed for drag out: {err}"),
                 _ => {}
             });
         })
@@ -607,7 +612,10 @@ impl Explorer {
             cx.notify();
             return;
         }
-        if (event.position - press.at).magnitude() <= RIGHT_DRAG_THRESHOLD {
+        // The same distance as every other drag (the system's drag rectangle).
+        let moved = event.position - press.at;
+        let threshold = cx.drag_threshold();
+        if moved.x.abs() <= threshold.width && moved.y.abs() <= threshold.height {
             return;
         }
         self.right_press = None;
@@ -755,7 +763,11 @@ impl Explorer {
     /// that item.
     pub(crate) fn drag_paths(&self, ix: usize) -> Vec<PathBuf> {
         if self.search_mode {
-            return self.path_at(ix).map(|(p, _)| p).into_iter().collect();
+            return self
+                .search_drag_items(ix)
+                .into_iter()
+                .map(|(p, _)| p)
+                .collect();
         }
         let selected = self
             .view()
@@ -769,6 +781,28 @@ impl Explorer {
         } else {
             self.path_at(ix).map(|(p, _)| p).into_iter().collect()
         }
+    }
+
+    /// [`Self::drag_paths`] if every one is a folder.
+    pub(crate) fn drag_folders(&self, ix: usize) -> Option<Vec<PathBuf>> {
+        if self.search_mode {
+            let dragged = self.search_drag_items(ix);
+            return (!dragged.is_empty() && dragged.iter().all(|(_, is_dir)| *is_dir))
+                .then(|| dragged.into_iter().map(|(p, _)| p).collect());
+        }
+        let (model, view) = (self.model.as_ref()?, self.view()?);
+        let at = view.get(ix)?;
+        let dragged: Vec<&arke_core::Entry> = if self.selection.contains(&at.name) {
+            view.iter()
+                .filter(|e| self.selection.contains(&e.name))
+                .collect()
+        } else {
+            vec![at]
+        };
+        dragged
+            .iter()
+            .all(|e| e.is_dir_like())
+            .then(|| dragged.iter().map(|e| model.path.join(&*e.name)).collect())
     }
 
     /// What to build the drag image from for item `ix`, the one under the cursor.
@@ -812,6 +846,11 @@ impl Explorer {
     }
 
     fn drag_kind(&self, ix: usize) -> FileKind {
+        if self.search_mode {
+            return self.search_hit(Some(ix)).map_or(FileKind::Other, |hit| {
+                arke_core::filetype::file_kind(&hit.entry)
+            });
+        }
         self.view()
             .and_then(|v| v.get(ix).map(arke_core::filetype::file_kind))
             .unwrap_or(FileKind::Other)

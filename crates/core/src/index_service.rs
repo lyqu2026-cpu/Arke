@@ -35,9 +35,10 @@ use std::time::{Duration, Instant, SystemTime};
 use crate::frecency::FrecencySnapshot;
 use crate::fs::{Fs, WatchEvent};
 use crate::index::{
-    BuildProgress, BuildRules, Index, IndexHit, Overlay, Search, Seen, descends_into, is_indexable,
+    BuildProgress, BuildRules, Index, IndexHeader, IndexHit, Overlay, Search, Seen, descends_into,
+    is_indexable,
 };
-use crate::index_query::{Clock, Query};
+use crate::index_query::{Clock, NameMatch, Query};
 use crate::journal::{Change, Cursor, Journal, JournalEvent};
 use crate::rank::Stat;
 
@@ -326,7 +327,7 @@ struct Shared {
     /// Which roots are caught up with the journal (same order as `opts.roots`).
     caught_up: Mutex<Vec<bool>>,
     /// Matches of the previous query, used to narrow the next one.
-    narrow: Mutex<Option<Narrow>>,
+    narrow: Mutex<Narrows>,
     /// The folder watcher works: attached to every watched root, and no events lost since.
     watch_alive: AtomicBool,
     /// Bumped each time the watcher is attached to every watched root.
@@ -345,6 +346,32 @@ struct Narrow {
     input: String,
     show_hidden: bool,
     ids: Arc<Vec<u32>>,
+}
+
+impl Narrow {
+    /// The ids if `input` can be searched within them.
+    fn for_input(
+        &self,
+        index: &Arc<Index>,
+        show_hidden: bool,
+        input: &str,
+    ) -> Option<&Arc<Vec<u32>>> {
+        (Weak::ptr_eq(&self.index, &Arc::downgrade(index))
+            && self.show_hidden == show_hidden
+            && refines(&self.input, input))
+        .then_some(&self.ids)
+    }
+}
+
+/// Matches kept for narrowing, one set per kind of search (#396): the last exact search's, and
+/// the last fuzzy one's ([`NameMatch::Any`] or [`NameMatch::Similar`], exact names included).
+/// An exact search can search within either (an exact match is a fuzzy match too), a fuzzy one
+/// only within fuzzy matches. Kept apart, typing on narrows both kinds when nothing matches as
+/// typed and each keystroke runs both.
+#[derive(Default)]
+struct Narrows {
+    exact: Option<Narrow>,
+    fuzzy: Option<Narrow>,
 }
 
 /// Plain name query (no filters, folders, exclusions or other syntax): can search within the
@@ -416,7 +443,7 @@ impl IndexService {
             followers: Mutex::new(Vec::new()),
             live: std::sync::atomic::AtomicUsize::new(0),
             caught_up: Mutex::new(Vec::new()),
-            narrow: Mutex::new(None),
+            narrow: Mutex::new(Narrows::default()),
             watch_alive: AtomicBool::new(false),
             watch_epoch: std::sync::atomic::AtomicU64::new(0),
             fresh_epoch: std::sync::atomic::AtomicU64::new(0),
@@ -516,7 +543,8 @@ impl IndexService {
         }
     }
 
-    /// Runs a query (on a background thread). `clock` is for date filters like `dm:today`.
+    /// Runs a query (on a background thread), fuzzy with exact matches included
+    /// ([`NameMatch::Any`]). `clock` is for date filters like `dm:today`.
     pub fn search(
         &self,
         input: &str,
@@ -524,16 +552,25 @@ impl IndexService {
         limit: usize,
         show_hidden: bool,
     ) -> Vec<IndexHit> {
-        self.search_until(input, clock, limit, show_hidden, &AtomicBool::new(false))
-            .unwrap_or_default()
+        self.search_until(
+            input,
+            clock,
+            NameMatch::Any,
+            limit,
+            show_hidden,
+            &AtomicBool::new(false),
+        )
+        .unwrap_or_default()
     }
 
-    /// [`IndexService::search`] that gives up once `cancel` is set (the user typed on and a newer
-    /// query replaced this one): `None`, and the scan stops within one chunk.
+    /// [`IndexService::search`] with the name matching `names`, that gives up once `cancel` is set
+    /// (the user typed on and a newer query replaced this one): `None`, and the scan stops within
+    /// one chunk.
     pub fn search_until(
         &self,
         input: &str,
         clock: Clock,
+        names: NameMatch,
         limit: usize,
         show_hidden: bool,
         cancel: &AtomicBool,
@@ -543,15 +580,30 @@ impl IndexService {
         let Some(index) = index.or_else(|| self.shared.progress.partial.lock().clone()) else {
             return Some(Vec::new());
         };
-        let query = Query::parse(input, clock);
+        let query = Query {
+            names,
+            ..Query::parse(input, clock)
+        };
         let narrowable = can_narrow(input);
         let within = if narrowable {
-            self.shared.narrow.lock().as_ref().and_then(|n| {
-                (Weak::ptr_eq(&n.index, &Arc::downgrade(&index))
-                    && n.show_hidden == show_hidden
-                    && refines(&n.input, input))
-                .then(|| Arc::clone(&n.ids))
-            })
+            let narrows = self.shared.narrow.lock();
+            let fuzzy = narrows
+                .fuzzy
+                .as_ref()
+                .and_then(|n| n.for_input(&index, show_hidden, input));
+            let exact = narrows
+                .exact
+                .as_ref()
+                .filter(|_| names == NameMatch::Exact)
+                .and_then(|n| n.for_input(&index, show_hidden, input));
+            // The fewer to look through, the better.
+            let within = match (exact, fuzzy) {
+                (Some(e), Some(f)) if f.len() < e.len() => Some(Arc::clone(f)),
+                (Some(e), _) => Some(Arc::clone(e)),
+                (None, f) => f.map(Arc::clone),
+            };
+            drop(narrows);
+            within
         } else {
             None
         };
@@ -569,12 +621,18 @@ impl IndexService {
             return None;
         }
         if let Some(ids) = result.matched {
-            *self.shared.narrow.lock() = Some(Narrow {
+            let kept = Some(Narrow {
                 index: Arc::downgrade(&index),
                 input: input.trim().to_string(),
                 show_hidden,
                 ids: Arc::new(ids),
             });
+            let mut narrows = self.shared.narrow.lock();
+            if names == NameMatch::Exact {
+                narrows.exact = kept;
+            } else {
+                narrows.fuzzy = kept;
+            }
         }
         Some(
             self.shared
@@ -591,11 +649,15 @@ impl IndexService {
         &self,
         input: &str,
         clock: Clock,
+        names: NameMatch,
         show_hidden: bool,
         snapshot: &FrecencySnapshot,
         max: usize,
     ) -> Vec<IndexHit> {
-        let query = Query::parse(input, clock);
+        let query = Query {
+            names,
+            ..Query::parse(input, clock)
+        };
         let shared = &self.shared;
         crate::rank::frecent_hits(
             snapshot,
@@ -922,30 +984,33 @@ impl Shared {
     }
 
     /// Loads the saved index: picks the newer of `cache` and its alternate (see [`alt_path`]),
-    /// mapped directly rather than copied into memory. The other one is deleted.
+    /// mapped directly rather than copied into memory. The other one is deleted. Only the headers
+    /// are read to choose; only the file used is validated (the older one only if the newer turns
+    /// out damaged), and it is read ahead in the background ([`crate::index::Readahead::run`]).
     fn load_cache(&self) {
         let Some(path) = &self.opts.cache else {
             return;
         };
+        let fingerprint = self.rules.fingerprint();
+        // Roots or the skip-build-dirs setting changed: the old index is unusable.
+        let (candidates, mut missing) = usable_caches(path, |header| {
+            header.roots == self.opts.roots
+                && header.skipped_build_dirs == self.opts.skip_build_dirs
+                && header.excluded_hash == fingerprint
+        });
         let mut best: Option<(Index, PathBuf)> = None;
-        let mut missing = Rebuild::NoIndex;
-        for candidate in [path.clone(), alt_path(path)] {
-            match Index::open(&candidate) {
-                // Roots or the skip-build-dirs setting changed: the old index is unusable.
-                Ok(index)
-                    if index.roots() == self.opts.roots.as_slice()
-                        && index.skipped_build_dirs() == self.opts.skip_build_dirs
-                        && index.excluded_hash() == self.rules.fingerprint() =>
-                {
-                    if best
-                        .as_ref()
-                        .is_none_or(|(b, _)| index.built_at() > b.built_at())
-                    {
-                        best = Some((index, candidate));
-                    }
+        for candidate in candidates {
+            let init = &self.opts.thread_init;
+            let opened = Index::open_with(&candidate, |ahead| {
+                spawn("index-readahead", init, move || {
+                    ahead.run();
+                });
+            });
+            match opened {
+                Ok(index) => {
+                    best = Some((index, candidate));
+                    break;
                 }
-                Ok(_) => missing = Rebuild::SettingsChanged,
-                Err(err) if err.kind() == io::ErrorKind::NotFound => {}
                 Err(err) => {
                     if missing == Rebuild::NoIndex {
                         missing = Rebuild::Unreadable;
@@ -1250,6 +1315,8 @@ impl Shared {
             overlay.seq()
         };
         let path = checkpoint_path(cache);
+        // Not flushed to disk (`fs::replace_file`): checkpoints are frequent, and one cut short by a
+        // power loss fails its magic check on load and is rebuilt.
         let tmp = path.with_extension("checkpoint.tmp");
         let written = std::fs::write(&tmp, &bytes).and_then(|()| std::fs::rename(&tmp, &path));
         match written {
@@ -2088,6 +2155,35 @@ fn alt_path(path: &Path) -> PathBuf {
     path.with_file_name(name)
 }
 
+/// The saved files (`cache` and its alternate) whose header `fits` the current settings, newest
+/// first (on a tie `cache` first), and why there's no usable one if none fits. Reads only each
+/// file's header ([`Index::read_header`]), however big the files are.
+fn usable_caches(cache: &Path, fits: impl Fn(&IndexHeader) -> bool) -> (Vec<PathBuf>, Rebuild) {
+    let mut usable: Vec<(SystemTime, PathBuf)> = Vec::new();
+    let mut missing = Rebuild::NoIndex;
+    for candidate in [cache.to_path_buf(), alt_path(cache)] {
+        match Index::read_header(&candidate) {
+            Ok(header) if fits(&header) => usable.push((header.built_at, candidate)),
+            Ok(_) => missing = Rebuild::SettingsChanged,
+            Err(err) if err.kind() == io::ErrorKind::NotFound => {}
+            Err(err) => {
+                if missing == Rebuild::NoIndex {
+                    missing = Rebuild::Unreadable;
+                }
+                log::info!(
+                    "global search index unusable, rebuilding {}: {err}",
+                    candidate.display()
+                );
+            }
+        }
+    }
+    // Stable: equal times keep `cache` first.
+    usable.sort_by_key(|(built_at, _)| std::cmp::Reverse(*built_at));
+    (usable.into_iter().map(|(_, path)| path).collect(), missing)
+}
+
+/// Not flushed to disk like settings (`fs::replace_file`): the index is large and rebuilt when a
+/// power loss leaves it unreadable (its magic check fails on load).
 fn save(path: &Path, index: &Index) -> io::Result<()> {
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir)?;
@@ -2257,7 +2353,7 @@ mod tests {
     /// before the rewalk that catches up on changes made meanwhile.
     #[test]
     fn items_come_from_the_index_only_while_it_is_current() {
-        let (dir, cache) = temp_cache("current");
+        let (_, cache, _tmp) = temp_cache("current");
         let fs = share_fs();
         let svc = IndexService::start(
             Arc::clone(&fs) as Arc<dyn Fs>,
@@ -2287,7 +2383,6 @@ mod tests {
         assert_eq!(items(&svc), Some(2));
         assert_eq!(svc.last_rebuild(), Some(Rebuild::Resumed));
         drop(svc);
-        let _ = std::fs::remove_dir_all(dir);
     }
 
     /// An index cut off at the item limit never stands in for a walk: folders it didn't get to
@@ -2410,7 +2505,7 @@ mod tests {
     /// inside ignored. Changing the exclusions invalidates the saved index.
     #[test]
     fn excluded_folders_are_not_indexed_and_invalidate_the_cache() {
-        let (dir, cache) = temp_cache("excluded");
+        let (_, cache, _tmp) = temp_cache("excluded");
         let fs = FakeFs::new();
         fs.insert_dir(
             r"C:\",
@@ -2456,7 +2551,6 @@ mod tests {
         let svc = IndexService::start(fs, excluded(&[]), || {});
         wait("rebuild", || found(&svc, "level-report").len() == 1);
         drop(svc);
-        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]
@@ -2484,7 +2578,7 @@ mod tests {
     /// watches.
     #[test]
     fn passive_mode_only_reads_the_cache() {
-        let (dir, cache) = temp_cache("passive");
+        let (_, cache, _tmp) = temp_cache("passive");
         let fs = FakeFs::new();
         fs.insert_dir(
             r"C:\nas",
@@ -2509,7 +2603,6 @@ mod tests {
         assert_eq!(fs.read_dir_calls(), 0, "no walk");
         assert_eq!(fs.watcher_count(Path::new(r"C:\")), 0, "no watch");
         drop(svc);
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// Tight resources (`can_build` says no): no walk, status shows deferred; catches up once
@@ -2665,7 +2758,8 @@ mod tests {
 
     #[test]
     fn serves_the_cached_index_while_rebuilding() {
-        let dir = std::env::temp_dir().join(format!("arke-index-test-{}", std::process::id()));
+        let tmp_dir = tempfile::tempdir().unwrap();
+        let dir = tmp_dir.path().to_path_buf();
         let cache = dir.join("index.bin");
         let fs = FakeFs::new();
         fs.insert_dir(
@@ -2695,12 +2789,12 @@ mod tests {
         wait("rebuild done", || ready(&svc));
         assert_eq!(found(&svc, "report"), [r"C:\new\new-report.txt"]);
         drop(svc);
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn a_fresh_cache_is_used_without_rescanning() {
-        let dir = std::env::temp_dir().join(format!("arke-index-fresh-{}", std::process::id()));
+        let tmp_dir = tempfile::tempdir().unwrap();
+        let dir = tmp_dir.path().to_path_buf();
         let cache = dir.join("index.bin");
         let fs = FakeFs::new();
         fs.insert_dir(
@@ -2741,6 +2835,140 @@ mod tests {
         wait("new cache loaded", || ready(&svc));
         assert_eq!(found(&svc, "report"), [r"C:\new\new-report.txt"]);
         drop(svc);
+    }
+
+    /// An index of `C:\old\old-report.txt`, and a newer one that also has `new-report.txt`.
+    fn older_and_newer() -> (Index, Index) {
+        let fs = FakeFs::new();
+        fs.insert_dir(
+            r"C:\old",
+            vec![Entry::new("old-report.txt", EntryKind::File, 1, None, 0)],
+        );
+        let older = Index::build(
+            fs.as_ref(),
+            &[PathBuf::from(r"C:\")],
+            2,
+            &AtomicBool::new(false),
+            &BuildProgress::default(),
+            &|| {},
+            false,
+        );
+        let mut overlay = Overlay::default();
+        let seen = Seen {
+            is_dir: false,
+            hidden: false,
+            size: 1,
+            modified: 0,
+        };
+        overlay.record(PathBuf::from(r"C:\old\new-report.txt"), Some(seen));
+        let newer = older
+            .merged(&overlay, &BuildRules::default(), &AtomicBool::new(false))
+            .unwrap()
+            .index;
+        assert!(newer.built_at() > older.built_at());
+        (older, newer)
+    }
+
+    fn start_fresh(cache: &Path) -> IndexService {
+        let mut options = opts(Some(cache.to_path_buf()));
+        options.refresh_after = Duration::from_hours(24);
+        IndexService::start(FakeFs::new(), options, || {})
+    }
+
+    /// Black-tech #6: which saved file to load is decided from the headers alone, newest first
+    /// whatever its name; only that one is opened.
+    #[test]
+    fn loads_the_newer_saved_file_by_its_header() {
+        let dir = std::env::temp_dir().join(format!("arke-index-newer-{}", std::process::id()));
+        let cache = dir.join("index.bin");
+        let (older, newer) = older_and_newer();
+        // The newer one under the alternate name, so the order can't come from the names.
+        save(&cache, &older).unwrap();
+        save(&alt_path(&cache), &newer).unwrap();
+        let (picked, missing) = usable_caches(&cache, |_| true);
+        assert_eq!(picked, [alt_path(&cache), cache.clone()]);
+        assert_eq!(missing, Rebuild::NoIndex);
+        let (picked, missing) = usable_caches(&cache, |_| false);
+        assert!(picked.is_empty());
+        assert_eq!(missing, Rebuild::SettingsChanged);
+        let (picked, missing) = usable_caches(&dir.join("none.bin"), |_| true);
+        assert!(picked.is_empty());
+        assert_eq!(missing, Rebuild::NoIndex);
+
+        let svc = start_fresh(&cache);
+        wait("newer loaded", || ready(&svc));
+        let mut hits = found(&svc, "report");
+        hits.sort();
+        assert_eq!(hits, [r"C:\old\new-report.txt", r"C:\old\old-report.txt"]);
+        assert!(!cache.exists(), "the older one is deleted");
+        drop(svc);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A newer file that is damaged past its header: the older one is opened instead.
+    #[test]
+    fn falls_back_to_the_older_file_when_the_newer_is_damaged() {
+        let dir = std::env::temp_dir().join(format!("arke-index-damaged-{}", std::process::id()));
+        let cache = dir.join("index.bin");
+        let (older, newer) = older_and_newer();
+        save(&cache, &older).unwrap();
+        let alt = alt_path(&cache);
+        save(&alt, &newer).unwrap();
+        // Break a name in the pool: the header still reads, validation fails.
+        let mut bytes = std::fs::read(&alt).unwrap();
+        let needle = b"new-report.txt";
+        let at = bytes
+            .windows(needle.len())
+            .position(|w| w == needle)
+            .unwrap();
+        bytes[at] = 0xFF;
+        std::fs::write(&alt, &bytes).unwrap();
+        assert!(Index::read_header(&alt).is_ok());
+        assert_eq!(usable_caches(&cache, |_| true).0, [alt, cache.clone()]);
+
+        let svc = start_fresh(&cache);
+        wait("older loaded", || ready(&svc));
+        assert_eq!(found(&svc, "report"), [r"C:\old\old-report.txt"]);
+        drop(svc);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A file saved by a version with the previous format is rebuilt and replaced.
+    #[test]
+    fn an_index_saved_in_the_previous_format_is_rebuilt() {
+        let dir = std::env::temp_dir().join(format!("arke-index-oldformat-{}", std::process::id()));
+        let cache = dir.join("index.bin");
+        let fs = FakeFs::new();
+        fs.insert_dir(
+            r"C:\docs",
+            vec![Entry::new("report.txt", EntryKind::File, 1, None, 0)],
+        );
+        let index = Index::build(
+            fs.as_ref(),
+            &[PathBuf::from(r"C:\")],
+            2,
+            &AtomicBool::new(false),
+            &BuildProgress::default(),
+            &|| {},
+            false,
+        );
+        save(&cache, &index).unwrap();
+        let mut bytes = std::fs::read(&cache).unwrap();
+        bytes[..8].copy_from_slice(b"ARKEIDX6");
+        std::fs::write(&cache, &bytes).unwrap();
+        let walked = fs.read_dir_calls();
+
+        let mut options = opts(Some(cache.clone()));
+        options.refresh_after = Duration::from_hours(24);
+        let svc = IndexService::start(Arc::clone(&fs) as Arc<dyn Fs>, options, || {});
+        wait("rebuilt", || ready(&svc));
+        assert_eq!(svc.last_rebuild(), Some(Rebuild::Unreadable));
+        assert!(fs.read_dir_calls() > walked, "walked again");
+        assert_eq!(found(&svc, "report"), [r"C:\docs\report.txt"]);
+        wait("saved in the current format", || {
+            Index::read_header(&cache).is_ok()
+        });
+        drop(svc);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -2752,15 +2980,20 @@ mod tests {
         o
     }
 
-    fn temp_cache(tag: &str) -> (PathBuf, PathBuf) {
-        let dir = std::env::temp_dir().join(format!("arke-journal-{tag}-{}", std::process::id()));
+    /// A folder of its own and the index file in it; the folder goes when the last is dropped.
+    fn temp_cache(tag: &str) -> (PathBuf, PathBuf, tempfile::TempDir) {
+        let tmp = tempfile::Builder::new()
+            .prefix(&format!("arke-journal-{tag}-"))
+            .tempdir()
+            .unwrap();
+        let dir = tmp.path().to_path_buf();
         let cache = dir.join("index.bin");
-        (dir, cache)
+        (dir, cache, tmp)
     }
 
     #[test]
     fn journal_catches_up_on_changes_made_while_closed() {
-        let (dir, cache) = temp_cache("catchup");
+        let (_, cache, _tmp) = temp_cache("catchup");
         let me = Path::new(r"C:\Users\me");
         let fs = FakeFs::new();
         fs.insert_dir(
@@ -2813,7 +3046,6 @@ mod tests {
         journal.push(me.join("live-report.txt"), false);
         wait("live change", || found(&svc, "live-report").len() == 1);
         drop(svc);
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// A folder replaced by a new one at the same path (`rm -rf build && mkdir build`, or an
@@ -2822,7 +3054,7 @@ mod tests {
     /// old contents may come back, after catching up or live.
     #[test]
     fn a_folder_replaced_at_the_same_path_leaves_nothing_behind() {
-        let (dir, cache) = temp_cache("replaced");
+        let (_, cache, _tmp) = temp_cache("replaced");
         let me = Path::new(r"C:\Users\me");
         let build = me.join("build");
         let app = me.join("app");
@@ -2901,12 +3133,11 @@ mod tests {
             "the previous contents are gone live too"
         );
         drop(svc);
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn folder_sizes_come_from_the_index_only_when_journaled_and_live() {
-        let (dir, cache) = temp_cache("sizes");
+        let (_, cache, _tmp) = temp_cache("sizes");
         let me = Path::new(r"C:\Users\me");
         let fs = FakeFs::new();
         fs.insert_dir(
@@ -2941,7 +3172,6 @@ mod tests {
         });
         assert_eq!(fs.read_dir_calls(), calls, "answered from the index");
         drop(svc);
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// The service lists other people's profile folders without contents, so an index built from
@@ -2952,7 +3182,7 @@ mod tests {
     fn hidden_profiles_count_from_the_index() {
         use crate::dirsize::Profiles;
         use crate::journal::{LISTED_ROOT, Listed};
-        let (dir, cache) = temp_cache("profiles");
+        let (dir, cache, _tmp) = temp_cache("profiles");
         let fs = FakeFs::new();
         let file = |name: &str, size| Entry::new(name, EntryKind::File, size, None, 0);
         let folder = |name: &str| Entry::new(name, EntryKind::Dir, 0, None, 0x10);
@@ -3013,7 +3243,6 @@ mod tests {
             assert_eq!(inside, None, "walked instead");
             drop(svc);
         }
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// Checkpoints are saved periodically while running. If the journal overwrites the build-time
@@ -3021,7 +3250,7 @@ mod tests {
     /// and earlier recorded changes are kept.
     #[test]
     fn checkpoints_avoid_rebuilding_after_the_journal_wraps() {
-        let (dir, cache) = temp_cache("checkpoint");
+        let (dir, cache, _tmp) = temp_cache("checkpoint");
         let fs = FakeFs::new();
         let a = Path::new(r"C:\a");
         fs.insert_dir(
@@ -3066,12 +3295,11 @@ mod tests {
         journal.push(a.join("later-report.txt"), false);
         wait("later changes", || found(&svc, "later-report").len() == 1);
         drop(svc);
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn journal_gaps_trigger_a_rebuild() {
-        let (dir, cache) = temp_cache("gap");
+        let (_, cache, _tmp) = temp_cache("gap");
         let fs = FakeFs::new();
         fs.insert_dir(
             r"C:\a",
@@ -3104,7 +3332,6 @@ mod tests {
         wait("second rebuild", || found(&svc, "second-report").len() == 1);
         wait("journal refollowed", || journal.follow_calls() > calls);
         drop(svc);
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// #343: the index service going away (stopped, updated) isn't a journal gap. Following
@@ -3112,7 +3339,7 @@ mod tests {
     /// nothing is walked again.
     #[test]
     fn the_service_going_away_is_followed_again_not_rebuilt() {
-        let (dir, cache) = temp_cache("refollow");
+        let (_, cache, _tmp) = temp_cache("refollow");
         let fs = FakeFs::new();
         let a = Path::new(r"C:\a");
         fs.insert_dir(
@@ -3142,7 +3369,6 @@ mod tests {
         assert_eq!(fs.read_dir_calls(), walked, "nothing walked again");
         assert_eq!(svc.rebuilds(), rebuilds, "no rebuild");
         drop(svc);
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// A rebuild asked for while one runs isn't dropped: it follows the running one (a journal gap
@@ -3211,6 +3437,7 @@ mod tests {
             svc.search_until(
                 "report",
                 Clock::default(),
+                NameMatch::Any,
                 10,
                 false,
                 &AtomicBool::new(cancel),
@@ -3221,12 +3448,44 @@ mod tests {
         assert_eq!(run(true), None);
     }
 
+    /// Narrowing while typing (#396): a similar search never searches within an exact one's
+    /// matches (that would miss names with the letters spread out), while an exact search can
+    /// search within a similar one's (it keeps every fuzzy match, exact names included).
+    #[test]
+    fn similar_searches_dont_narrow_from_exact_ones() {
+        let fs = FakeFs::new();
+        fs.insert_dir(
+            r"C:\a",
+            vec![
+                Entry::new("report.txt", EntryKind::File, 1, None, 0),
+                Entry::new("r_e_p_o_r_t.txt", EntryKind::File, 1, None, 0),
+            ],
+        );
+        let svc = IndexService::start(fs, opts(None), || {});
+        wait("built", || ready(&svc));
+        let run = |input: &str, names: NameMatch| {
+            let cancel = AtomicBool::new(false);
+            let hits = svc.search_until(input, Clock::default(), names, 10, false, &cancel);
+            let mut found: Vec<String> = hits
+                .unwrap_or_default()
+                .iter()
+                .filter_map(|h| Some(h.path.file_name()?.to_string_lossy().into_owned()))
+                .collect();
+            found.sort();
+            found
+        };
+        assert_eq!(run("repo", NameMatch::Exact), ["report.txt"]);
+        assert_eq!(run("report", NameMatch::Similar), ["r_e_p_o_r_t.txt"]);
+        assert_eq!(run("report.", NameMatch::Exact), ["report.txt"]);
+        assert_eq!(run("report.t", NameMatch::Similar), ["r_e_p_o_r_t.txt"]);
+    }
+
     /// Every rebuild carries its reason (it goes into the log line): first build, too many
     /// changes at once, asked for, settings changed. Too many changes since the build no longer
     /// rebuild: they are folded into the index without walking.
     #[test]
     fn rebuilds_say_why() {
-        let (dir, cache) = temp_cache("reasons");
+        let (_, cache, _tmp) = temp_cache("reasons");
         let me = Path::new(r"C:\Users\me");
         let fs = FakeFs::new();
         fs.insert_dir(
@@ -3294,7 +3553,6 @@ mod tests {
         wait("settings rebuild", || ready(&svc));
         assert_eq!(svc.last_rebuild(), Some(Rebuild::SettingsChanged));
         drop(svc);
-        let _ = std::fs::remove_dir_all(&dir);
         assert_eq!(
             Rebuild::OverlayFull(100_001).to_string(),
             "100001 changes since the last build"
@@ -3306,7 +3564,7 @@ mod tests {
     /// it follows, and a restart after the journal wrapped picks both up without a rewalk.
     #[test]
     fn merged_changes_survive_a_restart() {
-        let (dir, cache) = temp_cache("merge");
+        let (_, cache, _tmp) = temp_cache("merge");
         let a = Path::new(r"C:\a");
         let fs = FakeFs::new();
         fs.insert_dir(
@@ -3352,7 +3610,6 @@ mod tests {
             OVERLAY_MAX + 1
         );
         drop(svc);
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// Steady churn (a change every few ms, like a build running) no longer rewrites the
@@ -3360,7 +3617,7 @@ mod tests {
     /// enough, and the final state still makes it to disk.
     #[test]
     fn checkpoints_are_spaced_out_under_steady_churn() {
-        let (dir, cache) = temp_cache("churn");
+        let (_, cache, _tmp) = temp_cache("churn");
         let a = Path::new(r"C:\a");
         let fs = FakeFs::new();
         fs.insert_dir(
@@ -3413,7 +3670,6 @@ mod tests {
         assert_eq!(found(&svc, "last-report"), [r"C:\a\last-report.txt"]);
         assert_eq!(svc.last_rebuild(), None);
         drop(svc);
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// Write volume of checkpoints over a day on a busy developer disk, old rule against new.

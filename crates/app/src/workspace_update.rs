@@ -14,6 +14,7 @@ use super::settings_panel::{Ui, choice_with, expander, set, switch};
 use crate::a11y::A11yExt as _;
 use crate::assets::Icon;
 use crate::build_info::{self, Channel};
+use crate::keynav::KeyStop as _;
 use crate::settings::Settings;
 use crate::theme;
 use crate::update::{self, UpdateState};
@@ -347,18 +348,38 @@ fn release_version(state: &UpdateState) -> String {
     }
 }
 
-/// Opens a URL in the default browser on a background thread.
+/// Opens a URL in the default browser on a background thread. Tests record it instead
+/// ([`opened_urls_for_test`]).
 pub(crate) fn open_url(url: &str, cx: &mut App) {
     if url.is_empty() {
         return;
     }
-    let _ = cx;
-    let url = url.to_string();
-    crate::explorer::spawn_thread("open-url", move || {
-        let _ = std::process::Command::new("rundll32.exe")
-            .args(["url.dll,FileProtocolHandler", &url])
-            .spawn();
-    });
+    #[cfg(test)]
+    cx.default_global::<OpenedUrls>().0.push(url.to_owned());
+    #[cfg(not(test))]
+    {
+        let _ = cx;
+        let url = url.to_string();
+        crate::explorer::spawn_thread("open-url", move || {
+            let _ = std::process::Command::new("rundll32.exe")
+                .args(["url.dll,FileProtocolHandler", &url])
+                .spawn();
+        });
+    }
+}
+
+/// The URLs [`open_url`] was asked to open, in order (tests open no browser).
+#[cfg(test)]
+#[derive(Default)]
+struct OpenedUrls(Vec<String>);
+
+#[cfg(test)]
+impl gpui::Global for OpenedUrls {}
+
+#[cfg(test)]
+pub(crate) fn opened_urls_for_test(cx: &App) -> Vec<String> {
+    cx.try_global::<OpenedUrls>()
+        .map_or_default(|o| o.0.clone())
 }
 
 fn row(
@@ -442,6 +463,7 @@ pub(super) fn button(
         .id(id)
         .debug_selector(move || id.to_owned())
         .a11y_lazy(gpui::Role::Button, || label.to_string())
+        .key_stop()
         .h(theme::h_ctl_sm())
         .px(theme::s_12())
         .flex()

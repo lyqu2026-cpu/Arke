@@ -29,6 +29,8 @@ pub(super) struct SidebarUi {
     /// sidebar and in the column of icons.
     pub(super) places_scroll: gpui::ScrollHandle,
     pub(super) tabs_scroll: gpui::ScrollHandle,
+    /// The places list's scrollbar (#427): the tab list's, on the list above it.
+    pub(super) places_bar: crate::scrollbar::ScrollbarDrag,
     /// The vertical tab list's scrollbar (#323), and the tab last scrolled into view there (the
     /// active one, once each time it changes or the list changes height).
     pub(super) tabs_bar: crate::scrollbar::ScrollbarDrag,
@@ -39,6 +41,9 @@ pub(super) struct SidebarUi {
     /// scrolled into view there (the active one, once each time it changes).
     pub(super) strip_scroll: gpui::ScrollHandle,
     pub(super) strip_revealed: std::cell::Cell<Option<(usize, gpui::Pixels)>>,
+    /// The tab on top the pointer rests on (its place), as the strip was last laid out: its
+    /// close button shows and takes its room from the title (`workspace_tabstrip.rs`).
+    pub(super) strip_hovered: std::rc::Rc<std::cell::Cell<Option<usize>>>,
     /// The open-over-the-content sidebar just closed and fades out (serial, for the animation id).
     peek_ghost: Option<u64>,
     peek_ghost_task: Option<gpui::Task<()>>,
@@ -59,9 +64,13 @@ pub(super) struct SidebarUi {
     pub(super) follow_cancel: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
     /// The current folder's row is to be scrolled into view the next time it is drawn.
     pub(super) reveal: std::cell::Cell<bool>,
-    /// The follow under way scrolls to the current folder's row once listed: not when that folder
-    /// is shown higher up already (a favorite or pinned folder).
-    pub(super) reveal_wanted: std::cell::Cell<bool>,
+    /// The current folder is a favorite shown in the sidebar (a tile or a row of the list), drawn
+    /// last frame: that favorite is the selected one, not the folder's row under This PC, and
+    /// following has nothing to open for it (#424).
+    pub(super) fav_here: std::cell::Cell<bool>,
+    /// Tests: how many follows were scheduled after a frame.
+    #[cfg(test)]
+    pub(super) follows_scheduled: std::cell::Cell<usize>,
     /// Index among the places of the current folder's row under This PC, while drawing it.
     pub(super) here_row: std::cell::Cell<Option<usize>>,
     /// The places were just scrolled to the current folder's row: next frame, a row of tiles cut
@@ -292,7 +301,8 @@ impl Workspace {
             .flex_col()
             .items_center()
             .gap(theme::s_2())
-            .pb(theme::s_8())
+            // The last button's bottom lines up with the paper's.
+            .pb(theme::paper_gap())
             .on_hover(cx.listener(|this, hovered: &bool, _, cx| this.rail_hovered(*hovered, cx)))
             // The rest starts over with every move; a press is a pick, not a rest.
             .on_mouse_move(cx.listener(|this, _: &gpui::MouseMoveEvent, _, cx| {
@@ -423,14 +433,11 @@ impl Workspace {
     }
 
     /// The quick access folders, the current one lit. Those the full sidebar draws as tiles go
-    /// with Home when it is hidden, the others with Favorites (#323).
+    /// with Favorites when it is hidden (#323, #463); hiding Home leaves them.
     fn rail_tiles(&self, cx: &mut Context<Self>) -> Vec<AnyElement> {
         let current = self.rail_here(cx);
-        let (home_hidden, list_hidden) = (
-            super::sidebar::section_hidden(SidebarSection::Home, cx),
-            super::sidebar::section_hidden(SidebarSection::Favorites, cx),
-        );
-        let favorites = if home_hidden && list_hidden {
+        let list_hidden = super::sidebar::section_hidden(SidebarSection::Favorites, cx);
+        let favorites = if list_hidden {
             Vec::new()
         } else {
             self.favorites(cx)
@@ -438,7 +445,6 @@ impl Workspace {
         favorites
             .into_iter()
             .enumerate()
-            .filter(|_| !home_hidden)
             .map(|(ix, (path, label, kf_icon))| {
                 let here = current.as_deref() == Some(path.as_path());
                 let tint = fav_icon_el(
@@ -695,7 +701,7 @@ impl Workspace {
                 button(
                     "rail-back",
                     Icon::ArrowLeft,
-                    t!("nav.back").into_owned(),
+                    self.nav_tip(true, cx),
                     can_back,
                 )
                 .on_click(move |_, window, cx| {
@@ -707,7 +713,7 @@ impl Workspace {
                 button(
                     "rail-forward",
                     Icon::ArrowRight,
-                    t!("nav.forward").into_owned(),
+                    self.nav_tip(false, cx),
                     can_forward,
                 )
                 .on_click(move |_, window, cx| {

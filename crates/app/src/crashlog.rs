@@ -119,9 +119,11 @@ pub(crate) fn init() {
     // Tests check the file path in a child process of their own.
     let release = !cfg!(debug_assertions) || (cfg!(test) && std::env::var_os(TEST_CHILD).is_some());
     let to_file = release && std::env::var_os("ARKE_LOG_STDERR").is_none();
-    let dir = crate::settings::data_dir();
-    if to_file && let Some(dir) = dir {
-        let path = dir.join("arke.log");
+    let path = crate::paths::log_file();
+    if to_file && let Some(path) = path {
+        let dir = path
+            .parent()
+            .map_or_else(PathBuf::new, std::path::Path::to_path_buf);
         let (tx, rx) = flume::unbounded::<Message>();
         let target = path.clone();
         let spawned = std::thread::Builder::new()

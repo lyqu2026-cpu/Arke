@@ -211,13 +211,12 @@ fn save(path: &Path, list: &[SavedWorkspace]) -> Result<(), WorkspacesError> {
     })
     .map_err(WorkspacesError::Encode)?;
     let tmp = path.with_extension("json.tmp");
-    std::fs::write(&tmp, json).map_err(write_err)?;
-    std::fs::rename(&tmp, path).map_err(write_err)
+    arke_core::fs::replace_file(path, &tmp, json).map_err(write_err)
 }
 
 /// `<exe dir>\data\workspaces.json`, next to the settings (string work only).
 pub(crate) fn default_path() -> Option<PathBuf> {
-    crate::settings::default_path().map(|p| p.with_file_name("workspaces.json"))
+    crate::paths::roaming_file("workspaces.json")
 }
 
 /// The app-wide list. Windows read it to draw the Workspaces panel; it saves itself.
@@ -411,7 +410,8 @@ mod tests {
 
     #[test]
     fn file_round_trip_and_odd_files() {
-        let dir = std::env::temp_dir().join(format!("arke-workspaces-{}", std::process::id()));
+        let tmp_dir = tempfile::tempdir().unwrap();
+        let dir = tmp_dir.path().to_path_buf();
         let path = dir.join("workspaces.json");
         assert!(load(&path).unwrap().list().is_empty(), "no file yet");
         let mut w = Workspaces::default();
@@ -422,7 +422,6 @@ mod tests {
         w.save("Both", vec![split, tab(&[r"C:\x"])], 1).unwrap();
         save(&path, w.list()).unwrap();
         assert_eq!(load(&path).unwrap(), w);
-        std::fs::remove_dir_all(&dir).unwrap();
 
         let mut bytes = vec![0xEF, 0xBB, 0xBF];
         bytes.extend_from_slice(

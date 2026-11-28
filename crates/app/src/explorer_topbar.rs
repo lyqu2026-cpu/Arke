@@ -25,6 +25,8 @@ use gpui::{
 use rust_i18n::t;
 
 use super::layout::{self, SearchBox};
+use super::scope::Scope;
+use super::toolbar::ToolbarStop as _;
 use super::{Explorer, ExplorerEvent, GoUp};
 use crate::a11y::A11yExt as _;
 use crate::assets::Icon;
@@ -41,8 +43,9 @@ fn search_rest_max() -> gpui::Pixels {
     crate::theme::scaled_px(600.)
 }
 /// A path bar narrower than this shows only "… › current folder" (no trailing ›, little blank
-/// end), so the current folder's name keeps some room.
-fn path_compact_below() -> gpui::Pixels {
+/// end), so the current folder's name keeps some room. The selection's buttons fold into "⋯"
+/// before they would push the path bar below it (#388).
+pub(super) fn path_compact_below() -> gpui::Pixels {
     crate::theme::scaled_px(200.)
 }
 /// The path bar keeps at least this much of the pane row; the item count and the selection's
@@ -79,8 +82,9 @@ pub(crate) struct TopRow {
     /// The search box was focused on this press already (its magnifier, or its query): the
     /// click that ends the press leaves its text alone.
     pub(super) search_focused_on_press: bool,
-    /// The folder the search box's placeholder names, and whether it is the short one.
-    placeholder_for: Option<(Option<String>, bool)>,
+    /// What the search box's placeholder was made for: the scope, the folder it names, and
+    /// whether it is the short one.
+    placeholder_for: Option<(Scope, Option<String>, bool)>,
 }
 
 /// Records `bounds` of the element it's drawn in; draws once more when they change (they don't
@@ -180,14 +184,16 @@ impl Explorer {
         width
     }
 
-    /// Names the folder in the search box's placeholder ("Search <folder> or this PC"); a box too
-    /// narrow for that shows the short one.
+    /// Makes the next frame fit the search box's placeholder to its width again.
+    pub(super) fn reset_placeholder_fit(&mut self) {
+        self.top_row.placeholder_for = None;
+    }
+
+    /// The search box's placeholder for the scope in use (see [`Self::filter_placeholder`]); a
+    /// box too narrow for the full one shows the short one.
     fn sync_search_placeholder(&mut self, width: Pixels, window: &Window, cx: &mut Context<Self>) {
-        let folder = self.folder_label();
-        let full = folder.as_ref().map_or_else(
-            || t!("filter.placeholder").into_owned(),
-            |name| t!("filter.placeholder_in", folder = name).into_owned(),
-        );
+        let locale = rust_i18n::locale();
+        let full = self.filter_placeholder(&locale, false);
         let normal = gpui::FontWeight::NORMAL;
         // Padding and border, the magnifier and the gaps around the text, and the scope chip.
         let chrome = theme::s_12()
@@ -202,12 +208,16 @@ impl Explorer {
             + theme::s_8();
         let short =
             width > px(0.) && chrome + text_width(&full, theme::fs_14(), normal, window) > width;
-        let key = (folder, short);
+        let key = (
+            self.scope(),
+            self.search_in_name().or_else(|| self.folder_label()),
+            short,
+        );
         if self.top_row.placeholder_for.as_ref() == Some(&key) {
             return;
         }
         let text = if short {
-            t!("filter.placeholder_short").into_owned()
+            self.filter_placeholder(&locale, true)
         } else {
             full
         };
@@ -371,17 +381,54 @@ impl Explorer {
             .display_path()
             .and_then(arke_core::path::parent)
             .is_some();
+        // How the row fits (#388, #474, #528), decided once: the path bar collapses levels only
+        // when the row says so.
+        let selecting = !self.search_mode && !self.selection.is_empty();
+        let fold = self.row_layout(selecting, window, cx);
+        self.row_fold.row = Some(fold);
         // A narrow path bar (as laid out on the last frame) keeps only the current folder.
         let slot = self.path_slot.get();
-        let compact = slot > px(0.) && slot < path_compact_below();
-        let info = if !self.search_mode && !self.selection.is_empty() {
-            self.render_selection_actions(self.compact_bar(), cx)
-        } else {
-            self.render_folder_actions(self.compact_bar(), cx)
+        let compact = fold.collapse && slot > px(0.) && slot < path_compact_below();
+        // The path bar is a stop of its own: built before the row's buttons are recorded.
+        let path = self.render_path_slot(compact, window, cx);
+        // The row's buttons are recorded as they are built (see `explorer_toolbar.rs`).
+        let held = self.toolbar.focus.is_focused(window);
+        self.toolbar
+            .begin(held, held && window.last_input_was_keyboard());
+        // Up, the filter chip, the folder's or the selection's actions, the view buttons.
+        let up = super::ghost_button(
+            "up",
+            Icon::ArrowUp,
+            can_up,
+            t!("nav.up"),
+            cx.listener(|this, _: &ClickEvent, w, cx| this.go_up(&GoUp, w, cx)),
+        )
+        .into_any_element();
+        let chip = self.render_filter_chip(cx);
+        let info = match fold.selection {
+            Some(layout) if selecting => self.render_selection_actions(layout, cx),
+            _ => self.render_folder_actions(self.compact_bar(), !fold.count_hidden(), cx),
         };
+        let view = self
+            .render_view_controls(&fold, window, cx)
+            .into_any_element();
+        if self.toolbar.end() {
+            window.request_animation_frame();
+        }
+        let this = cx.entity().downgrade();
         div()
             .id("pane-row")
             .debug_selector(|| "pane-row".to_owned())
+            .a11y(gpui::Role::Toolbar, t!("a11y.toolbar"))
+            // Only while F6 put the keyboard here, so a click leaves it where it was.
+            .when(held, |d| {
+                d.key_context("Toolbar")
+                    .track_focus(&self.toolbar.focus)
+                    .on_key_down(cx.listener(Self::toolbar_key))
+                    .on_click(move |event, window, cx| {
+                        Self::toolbar_press(&this, event, window, cx);
+                    })
+            })
             .flex()
             .flex_none()
             .items_center()
@@ -389,13 +436,7 @@ impl Explorer {
             .h(theme::h_ctx())
             .pl(theme::s_8())
             .pr(theme::s_12())
-            .child(super::ghost_button(
-                "up",
-                Icon::ArrowUp,
-                can_up,
-                t!("nav.up"),
-                cx.listener(|this, _: &ClickEvent, w, cx| this.go_up(&GoUp, w, cx)),
-            ))
+            .child(up)
             .child(
                 div()
                     .flex()
@@ -406,12 +447,12 @@ impl Explorer {
                         path_min()
                     })
                     .h_full()
-                    .child(self.render_path_slot(compact, window, cx)),
+                    .child(path),
             )
-            .children(self.render_filter_chip(cx))
+            .children(chip)
             .child(info)
             .child(super::view::vertical_divider())
-            .child(self.render_view_controls(window, cx))
+            .child(view)
             .into_any_element()
     }
 
@@ -426,6 +467,16 @@ impl Explorer {
             div()
                 .id("filter-chip")
                 .debug_selector(|| "filter-chip".to_owned())
+                // Before its × (the row's buttons go in the order they are built).
+                .toolbar_button(
+                    "filter-chip",
+                    cx.listener(|this, _: &ClickEvent, window, cx| {
+                        if this.pane.split && !this.pane.active {
+                            cx.emit(ExplorerEvent::Activated);
+                        }
+                        this.focus_filter_input(window, cx);
+                    }),
+                )
                 .a11y_button(t!("filter.chip_tip"))
                 .flex()
                 .flex_none()
@@ -470,18 +521,15 @@ impl Explorer {
                                 .size(theme::icon_sm())
                                 .text_color(theme::on_signal()),
                         )
-                        .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
-                            cx.stop_propagation();
-                            this.reset_filter(cx);
-                            cx.notify();
-                        })),
+                        .toolbar_button(
+                            "filter-chip-clear",
+                            cx.listener(|this, _: &ClickEvent, _, cx| {
+                                cx.stop_propagation();
+                                this.reset_filter(cx);
+                                cx.notify();
+                            }),
+                        ),
                 )
-                .on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
-                    if this.pane.split && !this.pane.active {
-                        cx.emit(ExplorerEvent::Activated);
-                    }
-                    this.focus_filter_input(window, cx);
-                }))
                 .into_any_element(),
         )
     }
@@ -501,7 +549,14 @@ impl Explorer {
         el.on_mouse_down(
             MouseButton::Left,
             cx.listener(move |this, e: &MouseDownEvent, window, cx| {
-                this.top_row.search_focused_on_press = collapsed || summary;
+                // A press in the box already being typed in only moves the caret; the click
+                // must not select everything over it.
+                let typing = this
+                    .filter_input
+                    .read(cx)
+                    .focus_handle(cx)
+                    .is_focused(window);
+                this.top_row.search_focused_on_press = collapsed || summary || typing;
                 if collapsed {
                     this.focus_filter_input(window, cx);
                 } else if summary {

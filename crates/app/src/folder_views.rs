@@ -370,13 +370,12 @@ fn save(path: &Path, file: &StoredFile) -> Result<(), FolderViewsError> {
     }
     let json = serde_json::to_vec_pretty(file).map_err(FolderViewsError::Encode)?;
     let tmp = path.with_extension("json.tmp");
-    std::fs::write(&tmp, json).map_err(write_err)?;
-    std::fs::rename(&tmp, path).map_err(write_err)
+    arke_core::fs::replace_file(path, &tmp, json).map_err(write_err)
 }
 
 /// `<exe dir>\data\folder_views.json`, next to the settings (string work only).
 pub(crate) fn default_path() -> Option<PathBuf> {
-    crate::settings::default_path().map(|p| p.with_file_name("folder_views.json"))
+    crate::paths::roaming_file("folder_views.json")
 }
 
 /// The app-wide memory. Tabs look up and record through it; it saves itself.
@@ -628,7 +627,8 @@ mod tests {
     /// the same order (so eviction after a restart still drops the right folder).
     #[test]
     fn file_round_trip_keeps_order_and_paths() {
-        let dir = std::env::temp_dir().join(format!("arke-folder-views-{}", std::process::id()));
+        let tmp_dir = tempfile::tempdir().unwrap();
+        let dir = tmp_dir.path().to_path_buf();
         let path = dir.join("folder_views.json");
         let mut views = FolderViews::default();
         views.insert(Path::new(r"C:\Old"), icons());
@@ -656,8 +656,8 @@ mod tests {
         assert!(tight.peek(Path::new(r"C:\Old")).is_none());
         assert!(tight.peek(Path::new(r"D:\Music")).is_some());
 
-        std::fs::remove_dir_all(&dir).unwrap();
         // No file yet: empty, not an error
+        std::fs::remove_file(&path).unwrap();
         assert!(load(&path).unwrap().is_empty());
     }
 

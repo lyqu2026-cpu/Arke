@@ -164,6 +164,164 @@ fn cloud_states_come_from_the_scan(cx: &mut TestAppContext) {
     assert_eq!(view.update(cx, |v, _| v.cloud.sync_of("x.txt")), None);
 }
 
+/// A folder inside a sync root is announced to the shell while the pane shows it (some sync
+/// clients only fill a folder when a shell window shows it, #319); one outside isn't. A hint that
+/// its items changed shows items added without a watcher event, without F5; a "Show in folder"
+/// caller that found the announcement selects in the pane.
+#[gpui::test]
+fn cloud_folders_are_announced_and_rechecked(cx: &mut TestAppContext) {
+    const ONLINE_ONLY: u32 = 0x400 | 0x40_0000;
+    let fs = FakeFs::new();
+    let cloud = Path::new(r"C:\wps");
+    fs.insert_dir(cloud, vec![file("local.txt", 2)]);
+    fs.insert_dir(r"C:\plain", vec![file("x.txt", 1)]);
+    let shell = Arc::new(FakeShell::default());
+    *shell.cloud.lock() = crate::shell::CloudScan {
+        sync_root: true,
+        ..Default::default()
+    };
+    let (view, cx) = setup(cx, Arc::clone(&fs), Arc::clone(&shell), r"C:\wps");
+    wait_until(cx, &view, "load", loaded(r"C:\wps"));
+    wait_shell_in(cx, "announced", || !shell.folder_visits.lock().is_empty());
+    let slot = view.entity_id().as_u64();
+    let announced = (slot, Some(PathBuf::from(r"C:\wps")));
+    assert_eq!(
+        *shell.folder_visits.lock(),
+        std::slice::from_ref(&announced)
+    );
+
+    // The sync client adds an online-only placeholder, and no watcher event comes.
+    fs.add_entry(
+        cloud,
+        Entry::new("remote.txt", EntryKind::File, 12, None, ONLINE_ONLY),
+    );
+    let changed = shell.visit_changed.lock().take().expect("the visit's hint");
+    changed();
+    wait_until(cx, &view, "the client's item", |v| {
+        names(v) == ["local.txt", "remote.txt"]
+    });
+    // The list changed, so the folder was scanned again, but it isn't announced twice.
+    cx.run_until_parked();
+    assert_eq!(
+        *shell.folder_visits.lock(),
+        std::slice::from_ref(&announced)
+    );
+
+    // "Show in folder" through the announcement selects in the pane, item by item.
+    let select = shell
+        .visit_select
+        .lock()
+        .take()
+        .expect("the visit's selection");
+    select(vec![Arc::from("remote.txt")]);
+    wait_until(cx, &view, "one selected", |v| {
+        selected_names(v) == ["remote.txt"]
+    });
+    select(vec![Arc::from("remote.txt"), Arc::from("local.txt")]);
+    wait_until(cx, &view, "both selected", |v| {
+        let mut names = selected_names(v);
+        names.sort();
+        names == ["local.txt", "remote.txt"]
+    });
+
+    // Leaving ends the visit; a folder outside a sync root isn't announced.
+    *shell.cloud.lock() = crate::shell::CloudScan::default();
+    view.update(cx, |v, cx| {
+        v.navigate(PathBuf::from(r"C:\plain"), NavKind::New, cx);
+    });
+    wait_until(cx, &view, "plain", loaded(r"C:\plain"));
+    wait_shell_in(cx, "plain scanned", || {
+        shell
+            .cloud_scans
+            .lock()
+            .iter()
+            .any(|(dir, _)| dir == Path::new(r"C:\plain"))
+    });
+    cx.run_until_parked();
+    assert_eq!(*shell.folder_visits.lock(), [announced, (slot, None)]);
+}
+
+/// A recheck that finds the sync client's items while the list changes under it (a watcher
+/// delta for another item) doesn't drop them: it runs once more against the new list and
+/// reloads, so they show without F5 (#319).
+#[gpui::test]
+fn a_recheck_racing_a_watcher_delta_still_shows_the_items(cx: &mut TestAppContext) {
+    const ONLINE_ONLY: u32 = 0x400 | 0x40_0000;
+    let fs = FakeFs::new();
+    let cloud = Path::new(r"C:\wps");
+    fs.insert_dir(cloud, vec![file("local.txt", 2)]);
+    let shell = Arc::new(FakeShell::default());
+    *shell.cloud.lock() = crate::shell::CloudScan {
+        sync_root: true,
+        ..Default::default()
+    };
+    let (view, cx) = setup(cx, Arc::clone(&fs), Arc::clone(&shell), r"C:\wps");
+    wait_until(cx, &view, "load", loaded(r"C:\wps"));
+    wait_shell_in(cx, "announced", || !shell.folder_visits.lock().is_empty());
+
+    // The recheck's listing waits while the client fills the folder without a watcher event.
+    fs.hang(cloud);
+    let before = fs.read_dir_calls();
+    let changed = shell.visit_changed.lock().take().expect("the visit's hint");
+    changed();
+    wait_shell_in(cx, "the recheck listing", || fs.read_dir_calls() > before);
+    fs.add_entry(
+        cloud,
+        Entry::new("remote.txt", EntryKind::File, 12, None, ONLINE_ONLY),
+    );
+    // Meanwhile the watcher reports another item, so the list moves on.
+    fs.add_entry(cloud, file("other.txt", 1));
+    fs.emit_changed(cloud, &["other.txt"]);
+    wait_until(cx, &view, "the watched item", |v| {
+        names(v) == ["local.txt", "other.txt"]
+    });
+    fs.release(cloud);
+    wait_until(cx, &view, "the client's item", |v| {
+        names(v) == ["local.txt", "other.txt", "remote.txt"]
+    });
+}
+
+/// Items that list as plain ones next to placeholders are not synced only if the items themselves
+/// say they aren't placeholders: WPS Cloud's in-sync folders and files listed without their
+/// reparse point attribute and showed a red mark, File Explorer a green check (#319).
+#[gpui::test]
+fn placeholders_listed_as_plain_items_are_not_marked_not_synced(cx: &mut TestAppContext) {
+    const REPARSE: u32 = 0x400;
+    const RECALL_ON_DATA_ACCESS: u32 = 0x40_0000;
+    let fs = FakeFs::new();
+    fs.insert_dir(
+        r"C:\wps",
+        vec![
+            Entry::new(
+                "online.docx",
+                EntryKind::File,
+                1,
+                None,
+                REPARSE | RECALL_ON_DATA_ACCESS,
+            ),
+            Entry::new("sub1", EntryKind::Dir, 0, None, 0x10),
+            Entry::new("top.txt", EntryKind::File, 1, None, 0x20),
+            Entry::new("fresh.txt", EntryKind::File, 1, None, 0x20),
+        ],
+    );
+    let shell = Arc::new(FakeShell::default());
+    *shell.cloud.lock() = crate::shell::CloudScan {
+        sync_root: true,
+        ..Default::default()
+    };
+    *shell.cloud_placeholders.lock() = vec![Arc::from("sub1"), Arc::from("top.txt")];
+    let (view, cx) = setup(cx, fs, Arc::clone(&shell), r"C:\wps");
+    wait_until(cx, &view, "load", loaded(r"C:\wps"));
+    wait_until(cx, &view, "states", |v| {
+        v.cloud.sync_of("fresh.txt") == Some(CloudSync::NotSynced)
+    });
+    view.update(cx, |v, _| {
+        assert_eq!(v.cloud.sync_of("sub1"), None);
+        assert_eq!(v.cloud.sync_of("top.txt"), None);
+        assert_eq!(v.cloud.sync_of("online.docx"), None);
+    });
+}
+
 fn shelf_paths(cx: &mut VisualTestContext) -> Vec<(PathBuf, bool, bool)> {
     cx.update(|_, cx| {
         ShelfStore::global(cx)

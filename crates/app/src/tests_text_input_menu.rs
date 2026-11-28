@@ -575,6 +575,14 @@ fn the_search_box_holding_a_query_takes_clicks_like_a_text_box(cx: &mut TestAppC
     let at = input.read_with(cx, |i, _| i.selection());
     assert!(at.is_empty() && at.start > 0 && at.start < 16, "{at:?}");
 
+    // Clicking again in the box now being typed in keeps the caret there (#390).
+    let again = gpui::point(summary.left() + gpui::px(60.), summary.center().y);
+    cx.simulate_click(again, Modifiers::none());
+    cx.run_until_parked();
+    assert!(focused(cx));
+    let at = input.read_with(cx, |i, _| i.selection());
+    assert!(at.is_empty(), "the click doesn't select everything: {at:?}");
+
     // Right-click on it, once it shows its query again.
     cx.simulate_keystrokes("down");
     cx.run_until_parked();
@@ -722,4 +730,41 @@ fn word_boundaries() {
     let cjk = "\u{8CC7}\u{6599}\u{593E} a";
     assert_eq!(previous_word(cjk, 9), 0);
     assert_eq!(next_word(cjk, 0), 10);
+}
+
+/// Ctrl+Shift+V pastes in the rename box, the address bar and the search box like Ctrl+V (#428).
+#[gpui::test]
+fn ctrl_shift_v_pastes_in_text_boxes(cx: &mut TestAppContext) {
+    let (view, cx) = rename_setup(cx);
+    cx.write_to_clipboard(gpui::ClipboardItem::new_string("XY".into()));
+
+    cx.simulate_keystrokes("ctrl-l");
+    let path = path_input(&view, cx);
+    cx.simulate_keystrokes("ctrl-a ctrl-shift-v");
+    assert_eq!(text(&path, cx), "XY");
+    cx.simulate_keystrokes("escape");
+
+    let filter = view.update(cx, |v, _| v.filter_input_for_test());
+    cx.dispatch_action(FocusFilter);
+    cx.run_until_parked();
+    cx.simulate_keystrokes("ctrl-shift-v");
+    assert_eq!(text(&filter, cx), "XY");
+    cx.simulate_keystrokes("escape escape");
+
+    cx.simulate_keystrokes("end f2");
+    let rename = rename_input(&view, cx);
+    cx.run_until_parked();
+    cx.simulate_keystrokes("ctrl-shift-v");
+    assert_eq!(text(&rename, cx), "XY.docx");
+}
+
+/// In the file list Ctrl+Shift+V is still unbound: it does not paste files.
+#[gpui::test]
+fn ctrl_shift_v_in_the_file_list_does_not_paste_files(cx: &mut TestAppContext) {
+    let (view, cx) = rename_setup(cx);
+    cx.write_to_clipboard(gpui::ClipboardItem::new_string("XY".into()));
+    cx.simulate_keystrokes("ctrl-shift-v");
+    cx.run_until_parked();
+    assert!(view.update(cx, |v, _| !v.editing_path && v.renaming.is_none()));
+    assert_eq!(view.update(cx, |v, _| v.ops_running), 0);
 }

@@ -16,7 +16,9 @@ use std::rc::Rc;
 use std::sync::Arc;
 use std::time::Duration;
 
-use windows::Win32::Foundation::{ERROR_CANCELLED, GlobalFree, HANDLE, HGLOBAL, HWND, POINT};
+use windows::Win32::Foundation::{
+    ERROR_CANCELLED, GlobalFree, HANDLE, HGLOBAL, HWND, POINT, RPC_E_CHANGED_MODE,
+};
 use windows::Win32::Storage::FileSystem::{FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_NORMAL};
 use windows::Win32::System::Com::{
     CLSCTX_ALL, COINIT_APARTMENTTHREADED, COINIT_DISABLE_OLE1DDE, CoCreateInstance, CoInitializeEx,
@@ -41,6 +43,14 @@ use windows::core::{HRESULT, PCWSTR, w};
 
 use crate::shell::{ClipboardFiles, FileOp, ItemFailure, OpOutcome, PutBack, ShellError, Undo};
 
+mod lazy_clipboard;
+mod remote_clip;
+
+pub(crate) use remote_clip::{
+    clipboard_is as clipboard_is_remote, drag_out as drag_out_remote,
+    set_clipboard as set_clipboard_remote,
+};
+
 /// Cancel pressed in a copy engine dialog.
 const COPYENGINE_E_USER_CANCELLED: HRESULT = HRESULT(0x8027_0000_u32.cast_signed());
 const DROPEFFECT_COPY: u32 = 1;
@@ -62,22 +72,50 @@ pub(crate) fn message(err: &windows::core::Error) -> String {
 }
 
 /// COM (STA) on the current thread, uninitialized on drop.
-pub(crate) struct Com;
+pub(crate) struct Com {
+    /// Whether this guard owns an initialization: false when the thread already had COM in
+    /// another mode (`RPC_E_CHANGED_MODE`), which stays as it is.
+    owned: bool,
+}
 
 impl Com {
     pub(crate) fn init() -> Result<Self, ShellError> {
         // SAFETY: initializes an STA on the caller's thread; on success (including S_FALSE)
         // Drop pairs it with CoUninitialize.
-        unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE) }.ok()?;
-        Ok(Self)
+        let hr = unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE) };
+        if hr == RPC_E_CHANGED_MODE {
+            // A thread that is already multithreaded (#461): COM is usable, so go on, and
+            // leave it initialized.
+            return Ok(Self { owned: false });
+        }
+        hr.ok()?;
+        Ok(Self { owned: true })
     }
 }
 
 impl Drop for Com {
     fn drop(&mut self) {
-        // SAFETY: pairs with the successful CoInitializeEx in init.
-        unsafe { CoUninitialize() };
+        if self.owned {
+            // SAFETY: pairs with the successful CoInitializeEx in init.
+            unsafe { CoUninitialize() };
+        }
     }
+}
+
+/// Runs `f` on a thread of its own, which COM sets up as a single-threaded apartment on first
+/// use ([`Com::init`]), and waits for it. For work that needs an STA (the copy engine) called
+/// from a worker that is multithreaded for other reasons, which can't change its mode (#461).
+/// Fails only when the thread can't be started.
+pub(crate) fn run_on_sta<T: Send>(f: impl FnOnce() -> T + Send) -> std::io::Result<T> {
+    std::thread::scope(|scope| {
+        let handle = std::thread::Builder::new()
+            .name("file op".into())
+            .spawn_scoped(scope, f)?;
+        match handle.join() {
+            Ok(value) => Ok(value),
+            Err(panic) => std::panic::resume_unwind(panic),
+        }
+    })
 }
 
 fn shell_item(path: &Path) -> Result<IShellItem, ShellError> {
@@ -175,6 +213,14 @@ mod recorder {
             }
         }
 
+        /// Counts the item as done only when the engine finished it. A conflict the engine has
+        /// deferred to its dialog (pending), or one the user skipped, is not done.
+        pub(super) fn tick_for(&self, hr: HRESULT) {
+            if super::finished(hr) {
+                self.tick();
+            }
+        }
+
         fn relocated(&self, hr: HRESULT, item: Option<&IShellItem>, now: Option<&IShellItem>) {
             let (Some(item), Some(now)) = (item, now) else {
                 return;
@@ -263,7 +309,7 @@ mod recorder {
             hr: HRESULT,
             now: windows::core::Ref<IShellItem>,
         ) -> windows::core::Result<()> {
-            self.tick();
+            self.tick_for(hr);
             self.check(hr, item.as_ref());
             self.relocated(hr, item.as_ref(), now.as_ref());
             Ok(())
@@ -286,7 +332,7 @@ mod recorder {
             hr: HRESULT,
             now: windows::core::Ref<IShellItem>,
         ) -> windows::core::Result<()> {
-            self.tick();
+            self.tick_for(hr);
             self.check(hr, item.as_ref());
             self.add_bytes(hr, item.as_ref(), now.as_ref(), true);
             self.relocated(hr, item.as_ref(), now.as_ref());
@@ -310,7 +356,7 @@ mod recorder {
             hr: HRESULT,
             now: windows::core::Ref<IShellItem>,
         ) -> windows::core::Result<()> {
-            self.tick();
+            self.tick_for(hr);
             self.check(hr, item.as_ref());
             self.add_bytes(hr, item.as_ref(), now.as_ref(), false);
             self.created(hr, now.as_ref());
@@ -367,13 +413,15 @@ mod recorder {
             hr: HRESULT,
             now: windows::core::Ref<IShellItem>,
         ) -> windows::core::Result<()> {
-            self.tick();
+            self.tick_for(hr);
             self.created(hr, now.as_ref());
             Ok(())
         }
         fn UpdateProgress(&self, total: u32, so_far: u32) -> windows::core::Result<()> {
             if let Some(p) = &self.progress {
                 use std::sync::atomic::Ordering;
+                // Windows' own units, shown as a count while nothing is done.
+                p.work_in_bytes.store(false, Ordering::Relaxed);
                 p.work_total.store(u64::from(total), Ordering::Relaxed);
                 p.work_done.store(u64::from(so_far), Ordering::Relaxed);
             }
@@ -648,6 +696,24 @@ pub(crate) fn perform_tracked(
             };
             &rest
         }
+        // Same-volume move: what is only a rename is renamed here (win_fast_move.rs), the rest
+        // goes through the engine below, which asks about conflicts as it always did.
+        FileOp::Move { sources, dest } => {
+            let renamed = crate::win_fast_move::rename(sources, dest, progress);
+            fast = renamed.put_back;
+            let undo = || (!fast.is_empty()).then(|| Undo::PutBack(fast.clone()));
+            if renamed.cancelled {
+                return (Ok(OpOutcome::Cancelled), undo());
+            }
+            if renamed.rest.is_empty() {
+                return (Ok(OpOutcome::Done), undo());
+            }
+            rest = FileOp::Move {
+                sources: renamed.rest,
+                dest: dest.clone(),
+            };
+            &rest
+        }
         other => other,
     };
     HIDE_PROGRESS.set(true);
@@ -685,6 +751,7 @@ fn copy_tracked(
         // The engine reports its own work, starting from nothing.
         progress.work_done.store(0, Ordering::Relaxed);
         progress.work_total.store(0, Ordering::Relaxed);
+        progress.work_in_bytes.store(false, Ordering::Relaxed);
         let rest = FileOp::Copy {
             sources: fast.rest.iter().map(|(_, path)| path.clone()).collect(),
             dest: dest.to_path_buf(),
@@ -1287,42 +1354,53 @@ pub(crate) fn drag_out(
     after_lost_press: bool,
 ) -> Result<Option<DragOutcome>, ShellError> {
     use windows::Win32::System::Ole::{DROPEFFECT_COPY, DROPEFFECT_LINK, DROPEFFECT_MOVE};
-    use windows::Win32::UI::Shell::SHDoDragDrop;
 
     if paths.is_empty() {
         return Ok(None);
     }
-    // SAFETY: SHDoDragDrop runs on the UI thread, which is OLE-initialized.
-    unsafe {
-        let data = drag_data_object(paths)?;
-        add_hdrop(&data, paths)?;
-        if let Some(image) = image {
-            crate::win_dragimage::attach(&data, image);
-        }
-        // Custom drop source: cancel when the cursor returns to the Arke window so Arke's
-        // internal drag can take over.
-        let home = drag_home();
-        let source = drag_source::ReturnAware::new(home, after_lost_press);
-        let returned = Rc::clone(&source.returned);
-        let source: windows::Win32::System::Ole::IDropSource = source.into();
-        let _modal = gpui_windows::begin_modal_drag();
-        let effect = SHDoDragDrop(
-            None,
-            &data,
-            &source,
-            DROPEFFECT_COPY | DROPEFFECT_MOVE | DROPEFFECT_LINK,
-        )?;
-        if returned.get() {
-            return Ok(Some(DragOutcome::Returned));
-        }
-        Ok(if effect.0 & DROPEFFECT_MOVE.0 != 0 {
-            Some(DragOutcome::Moved)
-        } else if effect.0 & (DROPEFFECT_COPY.0 | DROPEFFECT_LINK.0) != 0 {
-            Some(DragOutcome::Copied)
-        } else {
-            None
-        })
+    let data = drag_data_object(paths)?;
+    add_hdrop(&data, paths)?;
+    drag_object_out(
+        &data,
+        image,
+        after_lost_press,
+        DROPEFFECT_COPY | DROPEFFECT_MOVE | DROPEFFECT_LINK,
+    )
+}
+
+/// Runs Windows' drag loop for `data`, offering `effects` to the drop target (see
+/// [`drag_out`]). UI thread.
+fn drag_object_out(
+    data: &windows::Win32::System::Com::IDataObject,
+    image: Option<&crate::shell::DragImage>,
+    after_lost_press: bool,
+    effects: windows::Win32::System::Ole::DROPEFFECT,
+) -> Result<Option<DragOutcome>, ShellError> {
+    use windows::Win32::System::Ole::{DROPEFFECT_COPY, DROPEFFECT_LINK, DROPEFFECT_MOVE};
+    use windows::Win32::UI::Shell::SHDoDragDrop;
+
+    if let Some(image) = image {
+        crate::win_dragimage::attach(data, image);
     }
+    // Custom drop source: cancel when the cursor returns to the Arke window so Arke's
+    // internal drag can take over.
+    let home = drag_home();
+    let source = drag_source::ReturnAware::new(home, after_lost_press);
+    let returned = Rc::clone(&source.returned);
+    let source: windows::Win32::System::Ole::IDropSource = source.into();
+    let _modal = gpui_windows::begin_modal_drag();
+    // SAFETY: SHDoDragDrop runs on the UI thread, which is OLE-initialized.
+    let effect = unsafe { SHDoDragDrop(None, data, &source, effects) }?;
+    if returned.get() {
+        return Ok(Some(DragOutcome::Returned));
+    }
+    Ok(if effect.0 & DROPEFFECT_MOVE.0 != 0 {
+        Some(DragOutcome::Moved)
+    } else if effect.0 & (DROPEFFECT_COPY.0 | DROPEFFECT_LINK.0) != 0 {
+        Some(DragOutcome::Copied)
+    } else {
+        None
+    })
 }
 
 /// The Arke window the drag started in: the one holding the mouse since the press. A press on a
@@ -1887,7 +1965,13 @@ fn set_clipboard_shell(files: &ClipboardFiles) -> Result<(), ShellError> {
 }
 
 pub(crate) fn set_clipboard_files(files: &ClipboardFiles) -> Result<u32, ShellError> {
-    // Prefer the shell data object (most formats); if e.g. a path can't be parsed, fall back
+    // Paths and drop effect at once, shell IDs only when a program asks for them: nothing is
+    // parsed here, so thousands of files cost no more than a few.
+    match lazy_clipboard::set(files) {
+        Ok(seq) => return Ok(seq),
+        Err(err) => log::info!("clipboard without delayed rendering: {err}"),
+    }
+    // Otherwise the shell data object (most formats); if e.g. a path can't be parsed, fall back
     // to a hand-built CF_HDROP.
     match set_clipboard_shell(files) {
         // SAFETY: only reads the sequence number.
@@ -1918,6 +2002,14 @@ pub(crate) fn set_clipboard_files(files: &ClipboardFiles) -> Result<u32, ShellEr
     }
     // SAFETY: only reads the sequence number.
     Ok(unsafe { GetClipboardSequenceNumber() })
+}
+
+/// Before Arke exits: renders the clipboard formats no program has asked for yet, so the files
+/// stay pasteable in full after Arke is gone. Does nothing if Arke put no files on the clipboard.
+/// Remote items (virtual files) can't be read without Arke, so they are taken off instead.
+pub(crate) fn render_clipboard_on_quit() {
+    lazy_clipboard::render_all_now();
+    remote_clip::clear_on_quit();
 }
 
 pub(crate) fn set_clipboard_text(text: &str) -> Result<(), ShellError> {
@@ -2001,18 +2093,18 @@ mod tests {
     use std::fs;
     use std::sync::atomic::Ordering;
 
-    /// Temp folder under %TEMP% named with the PID, deleted afterwards. Real file
-    /// operations in tests happen only here, never on user files.
-    struct Sandbox(PathBuf);
+    /// Temp folder under %TEMP%, deleted afterwards. Real file operations in tests happen only
+    /// here, never on user files.
+    struct Sandbox(
+        PathBuf,
+        #[allow(dead_code, reason = "held for its Drop, which deletes the folder")]
+        tempfile::TempDir,
+    );
 
     impl Sandbox {
         fn new(tag: &str) -> Self {
-            let dir = crate::win::long_temp_dir()
-                .join(format!("arke-fileop-test-{tag}-{}", std::process::id()));
-            assert!(dir.starts_with(crate::win::long_temp_dir()));
-            let _ = fs::remove_dir_all(&dir);
-            fs::create_dir_all(&dir).unwrap();
-            Self(dir)
+            let guard = crate::win::long_tempdir(&format!("arke-fileop-test-{tag}-"));
+            Self(guard.path().to_path_buf(), guard)
         }
 
         fn file(&self, rel: &str, body: &str) -> PathBuf {
@@ -2486,6 +2578,72 @@ mod tests {
             .expect("the operation did not finish: Windows may be showing a dialog")
     }
 
+    /// A same-volume move done by `perform_tracked` renames directly and records the same undo the
+    /// engine does: put back, in the order of the sources, and the undo restores everything.
+    #[test]
+    fn tracked_move_renames_and_undoes() {
+        use std::sync::atomic::Ordering;
+        let sb = Sandbox::new("fast-move");
+        let a = sb.file(r"src\a.txt", "aaa");
+        let b = sb.file(r"src\folder\b.txt", "bbb");
+        fs::create_dir_all(sb.0.join("dst")).unwrap();
+        let progress = Arc::new(crate::shell::OpProgress::default());
+        let (result, undo_step) = tracked_with(
+            FileOp::Move {
+                sources: vec![a, b.parent().unwrap().to_path_buf()],
+                dest: sb.0.join("dst"),
+            },
+            &progress,
+        );
+        assert_eq!(result.map_err(|e| e.to_string()), Ok(OpOutcome::Done));
+        assert_eq!(sb.names("src"), Vec::<String>::new());
+        assert_eq!(sb.names("dst"), ["a.txt", "folder"]);
+        assert_eq!(progress.done.load(Ordering::Relaxed), 2);
+        assert_eq!(progress.bytes.load(Ordering::Relaxed), 0);
+        let step = undo_step.expect("a move has an undo step");
+        assert_eq!(step.len(), 2);
+        assert_eq!(
+            undo(&step, None, true).map_err(|e| e.to_string()),
+            Ok(OpOutcome::Done)
+        );
+        assert_eq!(sb.names("src"), ["a.txt", "folder"]);
+        assert_eq!(sb.names("dst"), Vec::<String>::new());
+    }
+
+    /// Items the fast path leaves alone (a junction) still go through the engine, and the undo of
+    /// both kinds is one list.
+    #[test]
+    fn tracked_move_sends_what_it_cannot_rename_to_the_engine() {
+        let sb = Sandbox::new("fast-move-mixed");
+        let a = sb.file(r"src\a.txt", "aaa");
+        let target = sb.file(r"target\t.txt", "t");
+        let link = sb.0.join(r"src\link");
+        let made = std::process::Command::new("cmd")
+            .args(["/C", "mklink", "/J"])
+            .arg(&link)
+            .arg(target.parent().unwrap())
+            .output();
+        if !made.is_ok_and(|o| o.status.success()) {
+            return;
+        }
+        fs::create_dir_all(sb.0.join("dst")).unwrap();
+        let (result, undo_step) = tracked(FileOp::Move {
+            sources: vec![link.clone(), a],
+            dest: sb.0.join("dst"),
+        });
+        assert_eq!(result.map_err(|e| e.to_string()), Ok(OpOutcome::Done));
+        assert_eq!(sb.names("dst"), ["a.txt", "link"]);
+        assert!(target.exists(), "the junction moved, not what it points to");
+        let step = undo_step.expect("a move has an undo step");
+        assert_eq!(step.len(), 2);
+        assert_eq!(
+            undo(&step, None, true).map_err(|e| e.to_string()),
+            Ok(OpOutcome::Done)
+        );
+        assert_eq!(sb.names("src"), ["a.txt", "link"]);
+        let _ = fs::remove_dir(&link);
+    }
+
     /// Recycling two folders where one holds a file in use: the engine reports both, the failed one
     /// too, but only the folder that went to the bin counts as done.
     #[test]
@@ -2543,6 +2701,43 @@ mod tests {
         assert!(!finished(
             windows::Win32::Foundation::ERROR_ACCESS_DENIED.to_hresult()
         ));
+    }
+
+    /// While the engine's conflict dialog is open its items are pending, and a skipped one is
+    /// ignored: neither is "done" in the toast or the operation center.
+    #[test]
+    fn conflicting_items_count_only_once_settled() {
+        use windows::Win32::Foundation::{ERROR_ACCESS_DENIED, S_OK};
+        use windows::Win32::UI::Shell::{COPYENGINE_S_PENDING, COPYENGINE_S_USER_IGNORED};
+        let progress = Arc::new(crate::shell::OpProgress::default());
+        let recorder = Recorder {
+            done: std::cell::RefCell::new(Vec::new()),
+            progress: Some(Arc::clone(&progress)),
+            failed: std::cell::RefCell::new(Vec::new()),
+            top: None,
+        };
+        let done = || progress.done.load(Ordering::Relaxed);
+        // Three items wait for the user's choice: nothing is done yet.
+        for _ in 0..3 {
+            recorder.tick_for(COPYENGINE_S_PENDING);
+        }
+        assert_eq!(done(), 0);
+        // Replace one, skip one, the last one is cancelled or fails.
+        recorder.tick_for(S_OK);
+        recorder.tick_for(COPYENGINE_S_USER_IGNORED);
+        recorder.tick_for(ERROR_ACCESS_DENIED.to_hresult());
+        assert_eq!(done(), 1);
+        // "Replace all": the three settle as done.
+        let all = Recorder {
+            done: std::cell::RefCell::new(Vec::new()),
+            progress: Some(Arc::clone(&progress)),
+            failed: std::cell::RefCell::new(Vec::new()),
+            top: None,
+        };
+        for _ in 0..3 {
+            all.tick_for(S_OK);
+        }
+        assert_eq!(done(), 4);
     }
 
     fn failures_of(result: &Result<OpOutcome, ShellError>) -> Vec<(String, FailReason)> {
@@ -2802,8 +2997,8 @@ mod shell_clipboard_tests {
     /// Shell IDList Array, and the cut marker.
     #[test]
     fn shell_data_object_has_files_ids_and_the_cut_flag() {
-        let dir = crate::win::long_temp_dir().join(format!("arke-clip-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
+        let tmp_dir = crate::win::long_tempdir("arke-clip-");
+        let dir = tmp_dir.path().to_path_buf();
         let a = dir.join("a.txt");
         // Non-ASCII on purpose: paths must survive the data object intact.
         let b = dir.join("b 報告.txt");
@@ -2841,7 +3036,6 @@ mod shell_clipboard_tests {
             );
             let _ = GlobalUnlock(effect.u.hGlobal);
         }
-        let _ = std::fs::remove_dir_all(&dir);
     }
 }
 
@@ -2894,9 +3088,8 @@ mod drag_tests {
     #[test]
     #[ignore = "starts cmd.exe through the shell; run by hand"]
     fn files_dropped_on_a_shortcut_reach_its_program() {
-        let dir = crate::win::long_temp_dir().join(format!("arke-drop-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
+        let tmp_dir = crate::win::long_tempdir("arke-drop-");
+        let dir = tmp_dir.path().to_path_buf();
         let file = dir.join("dropped.txt");
         std::fs::write(&file, "x").unwrap();
         let script = dir.join("args.cmd");
@@ -2935,8 +3128,6 @@ mod drag_tests {
         drop_on(&shortcut, &data);
         let got = wait("Arke's drag");
         assert!(got.contains("dropped.txt"), "{got:?}");
-
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// Items in the object's Shell IDList Array (a CIDA: item count, then offsets); `None` when
@@ -2958,8 +3149,8 @@ mod drag_tests {
     /// could wait on the network) and keep the plain object.
     #[test]
     fn drags_of_local_files_carry_shell_ids() {
-        let dir = crate::win::long_temp_dir().join(format!("arke-drag-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
+        let tmp_dir = crate::win::long_tempdir("arke-drag-");
+        let dir = tmp_dir.path().to_path_buf();
         let a = dir.join("a.txt");
         let b = dir.join("b 報告.txt");
         std::fs::write(&a, "a").unwrap();
@@ -2978,7 +3169,6 @@ mod drag_tests {
             0,
             "network paths stay plain"
         );
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// The formats an object offers, in its own order, as (format, storage media).
@@ -3089,8 +3279,8 @@ mod drag_tests {
     /// its length.
     #[test]
     fn drags_from_one_folder_match_explorers() {
-        let dir = crate::win::long_temp_dir().join(format!("arke-drag-ex-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
+        let tmp_dir = crate::win::long_tempdir("arke-drag-ex-");
+        let dir = tmp_dir.path().to_path_buf();
         let a = dir.join("a.txt");
         let b = dir.join("b 報告.txt");
         std::fs::write(&a, "a").unwrap();
@@ -3119,13 +3309,13 @@ mod drag_tests {
         assert_eq!(path_of(&our_folder), dir.to_string_lossy());
         assert_eq!(path_of(&our_folder), path_of(&their_folder));
         assert_eq!(our_folder.len(), their_folder.len(), "folder ID length");
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// Items from different folders (search results) still go in one object, all of them.
     #[test]
     fn drags_from_several_folders_carry_every_id() {
-        let dir = crate::win::long_temp_dir().join(format!("arke-drag-mix-{}", std::process::id()));
+        let tmp_dir = crate::win::long_tempdir("arke-drag-mix-");
+        let dir = tmp_dir.path().to_path_buf();
         let sub = dir.join("sub");
         std::fs::create_dir_all(&sub).unwrap();
         let a = dir.join("a.txt");
@@ -3145,7 +3335,6 @@ mod drag_tests {
             assert_eq!(parse_hdrop(HDROP(medium.u.hGlobal.0)), paths);
             windows::Win32::System::Ole::ReleaseStgMedium(&raw mut medium);
         }
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -3159,5 +3348,60 @@ mod drag_tests {
         assert_eq!(common_parent(&[p(r"C:\a\x.txt"), p(r"C:\a\sub\y")]), None);
         assert_eq!(common_parent(&[p(r"C:\")]), None, "a drive has no folder");
         assert_eq!(common_parent(&[]), None);
+    }
+}
+
+#[cfg(test)]
+mod mta_worker_tests {
+    use super::*;
+    use windows::Win32::System::Com::{COINIT_MULTITHREADED, CoInitializeEx, CoUninitialize};
+
+    /// A worker that is multithreaded for another reason (a virtual drop reading the other
+    /// program's data) can't set up an STA itself (#461).
+    #[test]
+    fn com_on_a_multithreaded_thread_goes_on_without_owning_it() {
+        std::thread::spawn(|| {
+            // SAFETY: initializes COM on this test thread, paired below.
+            unsafe { CoInitializeEx(None, COINIT_MULTITHREADED) }.unwrap();
+            let com = Com::init().expect("RPC_E_CHANGED_MODE is not a failure");
+            assert!(!com.owned);
+            drop(com);
+            // The thread's own COM is still up: a second guard is still refused the STA mode.
+            assert!(!Com::init().unwrap().owned);
+            // SAFETY: pairs with the CoInitializeEx above.
+            unsafe { CoUninitialize() };
+        })
+        .join()
+        .unwrap();
+    }
+
+    /// The copy engine runs on its own STA thread when the caller is multithreaded, and the
+    /// moved file arrives.
+    #[test]
+    fn a_move_from_a_multithreaded_thread_runs_on_its_own_sta_thread() {
+        let tmp = crate::win::long_tempdir("arke-mta-");
+        let from = tmp.path().join("from");
+        let to = tmp.path().join("to");
+        std::fs::create_dir_all(&from).unwrap();
+        std::fs::create_dir_all(&to).unwrap();
+        let file = from.join("link.url");
+        std::fs::write(&file, "[InternetShortcut]\r\nURL=https://example.com/\r\n").unwrap();
+        let dest = to.clone();
+        std::thread::spawn(move || {
+            // SAFETY: initializes COM on this test thread, paired below.
+            unsafe { CoInitializeEx(None, COINIT_MULTITHREADED) }.unwrap();
+            let op = FileOp::Move {
+                sources: vec![file],
+                dest,
+            };
+            let result = run_on_sta(|| perform(&op, None, true)).unwrap();
+            assert!(matches!(result, Ok(OpOutcome::Done)), "{result:?}");
+            // SAFETY: pairs with the CoInitializeEx above.
+            unsafe { CoUninitialize() };
+        })
+        .join()
+        .unwrap();
+        assert!(to.join("link.url").is_file());
+        assert!(!from.join("link.url").exists());
     }
 }

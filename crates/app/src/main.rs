@@ -6,6 +6,8 @@
 //!   arke <path> --bench startup|scroll|scroll-grid [--bench-out file]
 //!   arke --bench index [--bench-out file]   build the search index headless, report time and
 //!                                           memory (see `bench_index.rs`)
+//!   arke [folder] --bench list [--bench-out file]   list and sort 100,000 items headless
+//!                                           (see `bench_list.rs`)
 //!   arke --no-resident [path]   don't use or become the resident process
 //!   arke --quit                 quit the resident process
 //!   arke --api <json>           an integration API request; prints the JSON reply (see `api.rs`
@@ -19,6 +21,9 @@
 //!   arke --shell-host           (internal) hidden context menu process, see `shell_host.rs`
 //!   arke --thumb-host           (internal) hidden video thumbnail process, see `thumb_host.rs`
 //!   arke --pick-file            (internal) one file dialog for Settings, see `win_picker.rs`
+//!   arke -Embedding             (internal) COM starts Arke for the folder verbs, see
+//!                               `win_folder_com.rs`
+//!   arke --com-check            (internal) whether COM reaches that class
 //!
 //! By default the first Arke stays in the background after its last window closes, so later
 //! launches only open a window without reinitializing the GPU. See `instance.rs`.
@@ -46,36 +51,45 @@ mod archive_password;
 mod assets;
 mod bench;
 mod bench_index;
+mod bench_list;
 mod brand;
 mod build_info;
 mod caption;
 mod cloud_places;
 mod commands;
 mod crashlog;
+mod elevation;
 mod explorer;
+mod external;
+mod external_pipe;
 mod folder_handler;
 mod folder_views;
 mod frame_probe;
 mod global_search;
 mod home;
 mod instance;
+mod keynav;
+mod legacy_tools;
 mod localized;
 mod media;
+mod media_budget;
 mod menu_order;
 mod menu_pin_looks;
 mod motion;
 mod net_dialog;
+mod onboarding;
 mod op_center;
 mod op_queue;
 mod palette;
+mod paths;
 mod place_names;
 mod popup;
 mod prefs;
 mod press_guard;
 mod properties;
 mod quick_access;
-mod quicklook;
 mod recycle_bin;
+mod redirection_guard;
 mod remote_shell;
 mod resident;
 mod saved_workspaces;
@@ -87,8 +101,8 @@ mod shelf;
 mod shell;
 mod shell_host;
 mod slider;
+mod splitter;
 mod spring;
-mod teracopy;
 mod text_input;
 mod theme;
 mod thumb_host;
@@ -100,14 +114,20 @@ mod update_route;
 mod update_sig;
 mod whats_new;
 mod win;
+mod win_bin_evict;
+mod win_bin_usage;
 mod win_cloud;
 mod win_devnotify;
+mod win_dll;
 mod win_dragimage;
 mod win_e_hook;
 mod win_eject;
 mod win_fast_copy;
+mod win_fast_move;
 mod win_fast_recycle;
 mod win_fileops;
+mod win_folder_com;
+mod win_folder_visit;
 mod win_http;
 mod win_icons;
 mod win_inuse;
@@ -160,6 +180,8 @@ enum BenchArg {
     Window(BenchMode),
     /// `--bench index`: headless index benchmark, no window (`bench_index.rs`)
     Index,
+    /// `--bench list`: headless list-and-sort of 100,000 items (`bench_list.rs`)
+    List,
 }
 
 #[allow(
@@ -182,10 +204,25 @@ struct Args {
     new_window: bool,
     /// Search the whole computer for this text in the window that opens (`--search <text>`)
     search: Option<String>,
+    /// Started by COM for the folder verbs (`-Embedding`, `win_folder_com.rs`): like
+    /// `--background`, and when another Arke is resident, pass the calls on to it
+    embedding: bool,
 }
 
 fn parse_args() -> Args {
     parse_args_from(std::env::args_os().skip(1))
+}
+
+/// The command line as text, for reading flags (`--indexd`, `--uninstall`, `--api`, the update
+/// hand-off). `std::env::args` panics on an argument that isn't valid Unicode, such as a folder
+/// whose name has a lone surrogate; here such an argument keeps U+FFFD in its place. The folder
+/// argument itself is read as an `OsString` ([`parse_args`]).
+fn text_args() -> Vec<String> {
+    text_args_from(std::env::args_os())
+}
+
+fn text_args_from(it: impl Iterator<Item = std::ffi::OsString>) -> Vec<String> {
+    it.map(|arg| arg.to_string_lossy().into_owned()).collect()
 }
 
 fn parse_args_from(mut it: impl Iterator<Item = std::ffi::OsString>) -> Args {
@@ -200,12 +237,14 @@ fn parse_args_from(mut it: impl Iterator<Item = std::ffi::OsString>) -> Args {
         restore_explorer: false,
         new_window: false,
         search: None,
+        embedding: false,
     };
     while let Some(arg) = it.next() {
         match arg.to_str() {
             Some("--bench") => {
                 args.bench = Some(match it.next().as_ref().and_then(|s| s.to_str()) {
                     Some("index") => BenchArg::Index,
+                    Some("list") => BenchArg::List,
                     Some("scroll") => BenchArg::Window(BenchMode::Scroll),
                     Some("scroll-grid") => BenchArg::Window(BenchMode::ScrollGrid),
                     _ => BenchArg::Window(BenchMode::Startup),
@@ -228,12 +267,15 @@ fn parse_args_from(mut it: impl Iterator<Item = std::ffi::OsString>) -> Args {
                     .map(|text| text.trim().to_owned())
                     .filter(|text| !text.is_empty());
             }
+            // Started again without RedirectionGuard (`redirection_guard.rs`): nothing to do.
+            Some(redirection_guard::RELAUNCHED_ARG) => {}
             // Just updated: the old process's pid follows (already waited for at the start of
             // app_main).
             Some(update::AFTER_UPDATE_ARG) => {
                 let _ = it.next();
                 update::mark_just_updated();
             }
+            Some(flag) if win_folder_com::is_embedding_arg(flag) => args.embedding = true,
             // An empty argument (`arke.exe ""`, a shortcut with an empty %1) names no folder.
             _ if arg.is_empty() => {}
             _ => args.path = Some(path_arg(&arg)),
@@ -291,7 +333,7 @@ fn instant_from_unix_ms(launched_unix_ms: u64) -> Instant {
 const INDEXD_ARG: &str = "--indexd";
 
 fn main() -> std::process::ExitCode {
-    let args: Vec<String> = std::env::args().collect();
+    let args = text_args();
     if args.get(1).map(String::as_str) == Some(INDEXD_ARG) {
         return arke_indexd::cli::run(args[2..].to_vec(), Some(INDEXD_ARG));
     }
@@ -326,6 +368,10 @@ fn main() -> std::process::ExitCode {
     if args.get(1).map(String::as_str) == Some(win_picker::PICK_ARG) {
         win_picker::run();
         return std::process::ExitCode::SUCCESS;
+    }
+    // Whether the shell would reach Arke's folder-open COM class (`win_folder_com.rs`).
+    if args.get(1).map(String::as_str) == Some(win_folder_com::CHECK_ARG) {
+        return win_folder_com::check_cli();
     }
     let mut args = parse_args();
     // As the folder handler the shell hands over every folder, virtual ones included: what Arke
@@ -367,6 +413,9 @@ fn main() -> std::process::ExitCode {
     if args.bench == Some(BenchArg::Index) {
         return bench_index::run(args.bench_out.as_deref());
     }
+    if args.bench == Some(BenchArg::List) {
+        return bench_list::run(args.path.as_deref(), args.bench_out.as_deref());
+    }
     app_main(args);
     std::process::ExitCode::SUCCESS
 }
@@ -380,7 +429,7 @@ fn app_main(mut args: Args) {
         return;
     }
     // Launched by the old version (auto-update): wait for it to exit before taking over residency.
-    update::wait_for_previous(&std::env::args().collect::<Vec<_>>());
+    update::wait_for_previous(&text_args());
     let started_at = Instant::now();
     // A launch in the background opens no window; any it opens later is no cold start.
     if !args.background {
@@ -389,6 +438,7 @@ fn app_main(mut args: Args) {
     let launched_unix_ms = unix_ms_now();
     crashlog::init();
     motion::refresh_system_setting();
+    scrollbar::refresh_system_setting();
     rust_i18n::set_locale(&win::ui_locale());
     theme::set_mica_available(use_mica());
     // From here any filesystem call on this thread trips a debug assertion.
@@ -420,12 +470,44 @@ fn app_main(mut args: Args) {
         }
         return;
     }
+    // Started by Inno Setup with Windows' RedirectionGuard on (#406): start again through the
+    // desktop shell without it, and exit. Here, after the one-shot commands the installer waits for
+    // (`--quit` above, `--uninstall` in main), with the log open for why, and before this copy
+    // opens a window or takes over residency, which the new copy does instead. Not when COM started
+    // this copy (`-Embedding`): COM waits for this process to register its class, so a copy
+    // started elsewhere would leave the caller waiting.
+    if !args.embedding && redirection_guard::restart_unguarded() {
+        crashlog::flush(Duration::from_millis(200));
+        return;
+    }
+    // Started as administrator while the shell isn't (a program running elevated opened a folder,
+    // #451): hand over to the resident Arke as usual, but never become it. With none running, start
+    // again as the user through the desktop shell before anything else (`elevation.rs`). Not when
+    // COM started this copy, for the same reason as above (and COM doesn't start it elevated: its
+    // class is per user).
+    let admin = if args.embedding {
+        elevation::Plan::Normal
+    } else {
+        elevation::plan()
+    };
+    let elevated = admin != elevation::Plan::Normal;
+    let relaunch_tried = elevated && !instance::resident_exists();
+    if relaunch_tried && elevation::start_unelevated(admin) {
+        crashlog::flush(Duration::from_millis(200));
+        return;
+    }
     let linger = shell_window(&args);
-    let listener = if args.background {
+    let listener = if args.background || args.embedding {
         // Background launch: if a resident process exists we're not needed; otherwise become
-        // resident without a window.
+        // resident without a window. Started by COM, the folders come through the class.
+        // Elevated, there is nothing to do (see above).
         match instance::listen() {
+            Some(_) if elevated => return,
             Some(listener) => Some(listener),
+            None if args.embedding => {
+                win_folder_com::forward_until_idle();
+                return;
+            }
             None => return,
         }
     } else if args.resident || args.quit {
@@ -452,6 +534,17 @@ fn app_main(mut args: Args) {
                 }
                 return;
             }
+            // The resident Arke went away or doesn't answer: the copy started as the user deals
+            // with it; failing that, a window here without residency.
+            outcome if elevated => {
+                // Closes the pipe first, so the new copy can become the resident Arke.
+                drop(outcome);
+                if !relaunch_tried && elevation::start_unelevated(admin) {
+                    crashlog::flush(Duration::from_millis(200));
+                    return;
+                }
+                None
+            }
             HandOff::BecomeResident(listener) => Some(listener),
             HandOff::Standalone => None,
         }
@@ -463,7 +556,7 @@ fn app_main(mut args: Args) {
         return;
     }
 
-    let background = args.background;
+    let background = args.background || args.embedding;
     let bench = args
         .window_bench()
         .map(|mode| Bench::new(mode, args.bench_out));
@@ -471,6 +564,10 @@ fn app_main(mut args: Args) {
     let start_page = args.page;
     let start_search = args.search;
     let resident = listener.is_some();
+    // The folder verbs may call the resident Arke over COM (#340).
+    if resident && bench.is_none() && folder_handler::shell_allowed() {
+        let _ = win_folder_com::serve();
+    }
     log::info!(
         "{}",
         if resident {
@@ -553,25 +650,10 @@ fn app_main(mut args: Args) {
             )),
             remotes,
         };
-        // "Open in VS Code/Zed": check in the background whether they're installed.
-        if bench.is_none() {
-            let shell = Arc::clone(&services.shell);
-            explorer::spawn_thread("editor-apps", move || {
-                let apps = shell.editor_apps();
-                // Icons come from each exe (icon only, no thumbnail provider).
-                let icons = apps
-                    .iter()
-                    .map(|(_, exe)| shell.file_icon(exe, 32))
-                    .collect();
-                explorer::set_open_with(apps, icons);
-            });
-        }
         // The integration API (`api.rs`): `WM_COPYDATA` to any window, and the resident pipe.
         let api_queue = start_api(cx, &services);
         if bench.is_none() {
             follow_drive_removals(cx, Arc::clone(&services.remotes));
-            teracopy::detect_in_background();
-            quicklook::detect_in_background();
         }
         if resident && bench.is_none() {
             install_tray(cx, &services, &store);
@@ -581,9 +663,15 @@ fn app_main(mut args: Args) {
         }
         // The shell registration follows the setting in every process that is running, resident
         // or not (a standalone Arke started through the folder verb keeps it repaired too).
+        // Only the resident Arke answers COM, so only it decides whether the verbs use it.
         if bench.is_none()
             && let Some(handler) = folder_handler::Handler::real()
         {
+            let handler = if resident {
+                handler.with_com_check(Arc::new(win_folder_com::works))
+            } else {
+                handler
+            };
             folder_handler::follow_setting(&store, handler, cx);
         }
         if bench.is_none() {
@@ -602,7 +690,7 @@ fn app_main(mut args: Args) {
         }
         // Auto-update: delete the old binary left from last time; check a bit after startup so it
         // doesn't compete, then every hour while Arke keeps running (it can stay in the
-        // notification area for days). `auto_check` only checks when 20 hours have passed.
+        // notification area for days). `auto_check` skips a tick that comes too soon after a check.
         // A download that is waiting (from before Windows restarted) waits again; with
         // automatic updates on it goes in when Arke quits (`update_quiet.rs`).
         if bench.is_none() {
@@ -613,6 +701,10 @@ fn app_main(mut args: Args) {
             update_quiet::mark_resident(resident, background);
             cx.on_app_quit(|cx| {
                 update_quiet::on_quit(cx);
+                // Arke's windows leave the shell's window list with it (#319).
+                win_folder_visit::end_all();
+                // Clipboard formats nobody asked for yet are made now, or they die with Arke.
+                win_fileops::render_clipboard_on_quit();
                 // The process ends right after: the last lines (why it quit) go in the file first.
                 crashlog::flush(Duration::from_millis(200));
                 async {}
@@ -672,6 +764,8 @@ fn app_main(mut args: Args) {
         }
         if !benchmarking {
             prewarm_shell_host();
+            // What the system drive's Recycle Bin holds, for the first delete (#379).
+            win_fast_recycle::warm_up();
             // How pinned Windows commands looked, for the first menu (#278).
             let pinned = settings::SettingsStore::global(cx)
                 .read(cx)
@@ -801,8 +895,7 @@ fn follow_takeover_setting(
     let services = services.clone();
     cx.spawn(async move |cx| {
         while let Ok(request) = rx.recv_async().await {
-            let opened = cx.update(|cx| open_taken_over(cx, &services, &request));
-            let _ = request.reply.send(opened);
+            cx.update(|cx| answer_taken_over(cx, &services, request));
         }
     })
     .detach();
@@ -910,15 +1003,139 @@ fn follow_win_e_hook(
     .detach();
 }
 
+/// Answers one request of "Open folders in Arke" ([`open_taken_over`]). A network folder the early
+/// path took without looking ([`win_takeover::OpenRequest::unchecked`]) is looked at off the UI
+/// thread first ([`open_unchecked`]) and answered once that is done; requests after it don't wait
+/// for it.
+fn answer_taken_over(cx: &mut App, services: &Services, request: win_takeover::OpenRequest) {
+    if !request.unchecked {
+        let opened = open_taken_over(cx, services, &request);
+        let _ = request.reply.send(opened);
+        return;
+    }
+    let services = services.clone();
+    cx.spawn(async move |cx| {
+        let opened = open_unchecked(cx, &services, &request).await;
+        let _ = request.reply.send(opened);
+    })
+    .detach();
+}
+
+/// [`open_taken_over`] for a network folder nobody looked at (#285): it is looked at on a thread
+/// of its own, since the server may take seconds to answer. Opens nothing and answers `false` when
+/// it is not a folder (missing, a file, the server unreachable, credentials needed): File Explorer
+/// then gets it back and shows its own prompt or error. Also opens nothing once nobody waits for
+/// the answer: the takeover thread gave it back to File Explorer already.
+async fn open_unchecked(
+    cx: &mut gpui::AsyncApp,
+    services: &Services,
+    request: &win_takeover::OpenRequest,
+) -> bool {
+    let Target::Folder(folder) = &request.target else {
+        return cx.update(|cx| open_taken_over(cx, services, request));
+    };
+    let started = Instant::now();
+    let (tx, rx) = flume::bounded(1);
+    let (fs, path) = (Arc::clone(&services.fs), folder.clone());
+    explorer::spawn_thread("takeover-check", move || {
+        let _ = tx.send(fs.stat(&path).map(|entry| entry.is_dir_like()));
+    });
+    let why = match rx.recv_async().await {
+        Ok(Ok(true)) => None,
+        Ok(Ok(false)) => Some("not a folder".to_owned()),
+        Ok(Err(err)) => Some(err.to_string()),
+        Err(_) => Some("the check did not finish".to_owned()),
+    };
+    let ms = started.elapsed().as_millis();
+    if let Some(why) = why {
+        log::info!(
+            "takeover: network folder {} given back to File Explorer after {ms} ms: {why}",
+            folder.display()
+        );
+        return false;
+    }
+    if request.reply.is_disconnected() {
+        log::info!(
+            "takeover: network folder {} found after {ms} ms, too late: File Explorer has it",
+            folder.display()
+        );
+        return false;
+    }
+    log::debug!(
+        "takeover: network folder {} found after {ms} ms",
+        folder.display()
+    );
+    cx.update(|cx| open_taken_over(cx, services, request))
+}
+
 /// Opens a window showing what an Explorer window showed. Answers whether Arke has a window.
+///
+/// The early path (#285) ends File Explorer's launcher before it opens a window, and the tab it
+/// opens here is marked (`Workspace::mark_early`). If that launcher had handed the folder over
+/// already, the window comes anyway and arrives here from the watcher like any other: while the
+/// marked tab still shows that folder, it comes forward with the window's selection instead of a
+/// second tab or window. The same happens for any other window on it then; nothing is closed
+/// without Arke showing it.
 fn open_taken_over(cx: &mut App, services: &Services, request: &win_takeover::OpenRequest) -> bool {
-    open_target(
+    let explorer_thread = Some(request.explorer_thread);
+    if !request.early && merge_into_early_tab(cx, &request.target, &request.select, explorer_thread)
+    {
+        return true;
+    }
+    let Some(window) = open_target_in(
         cx,
         services,
         request.target.clone(),
         &request.select,
-        Some(request.explorer_thread),
-    )
+        explorer_thread,
+        None,
+    ) else {
+        return false;
+    };
+    if request.early {
+        let _ = window.update(cx, |workspace, _, cx| {
+            workspace.mark_early(&request.target, cx);
+        });
+    }
+    true
+}
+
+/// A File Explorer window on `target` while a tab the early path opened still shows it (see
+/// [`open_taken_over`]): that tab comes forward, in whichever window it is, with `select` selected,
+/// and its mark is used up. With several, the newest mark wins: two quick launches of the same
+/// folder each get their own tab, and the window the second couldn't keep away goes to the
+/// second's. False when there is no such tab (closed, gone elsewhere, or used already).
+fn merge_into_early_tab(
+    cx: &mut App,
+    target: &Target,
+    select: &[String],
+    explorer_thread: Option<u32>,
+) -> bool {
+    let select: Vec<Arc<str>> = select.iter().map(|n| Arc::from(n.as_str())).collect();
+    let newest = {
+        let app: &App = cx;
+        app.windows()
+            .into_iter()
+            .filter_map(|w| w.downcast::<Workspace>())
+            .filter_map(|w| Some((w, w.read(app).ok()?.early_mark(target, app)?)))
+            .max_by_key(|&(_, mark)| mark)
+    };
+    let Some((handle, _)) = newest else {
+        return false;
+    };
+    let merged = handle.update(cx, |workspace, window, cx| {
+        let merged = workspace.merge_early(target, select, window, cx);
+        if merged {
+            bring_to_front(window, explorer_thread);
+        }
+        merged
+    });
+    if !matches!(merged, Ok(true)) {
+        return false;
+    }
+    log::info!("takeover: shown in the tab opened early for {target:?}");
+    cx.activate(true);
+    true
 }
 
 /// Shows a folder, Home or the Recycle Bin (with `select` selected) and brings it to the front: in
@@ -944,27 +1161,36 @@ fn open_target_timed(
     explorer_thread: Option<u32>,
     received: Option<Instant>,
 ) -> bool {
+    open_target_in(cx, services, target, select, explorer_thread, received).is_some()
+}
+
+/// [`open_target_timed`], giving the window `target` now shows in (its active tab).
+fn open_target_in(
+    cx: &mut App,
+    services: &Services,
+    target: Target,
+    select: &[String],
+    explorer_thread: Option<u32>,
+    received: Option<Instant>,
+) -> Option<gpui::WindowHandle<Workspace>> {
     let select: Vec<Arc<str>> = select.iter().map(|n| Arc::from(n.as_str())).collect();
     if let Some(host) = tab_host(cx)
         && show_in_tab(cx, host, target.clone(), select.clone(), explorer_thread)
     {
-        return true;
+        return Some(host);
     }
     // Win+E (File Explorer's Home) with no window open: Arke starting, as "New windows open to"
     // says (the last session, say).
     let asked =
         (target != Target::Home || last_window(cx).is_some()).then_some(Asked { target, select });
-    let opened = open_explorer_window(cx, services, asked, None, Instant::now(), received);
-    let Some(window) = opened else {
-        return false;
-    };
+    let window = open_explorer_window(cx, services, asked, None, Instant::now(), received)?;
     let shown = window.update(cx, |_, window, _| {
         bring_to_front(window, explorer_thread);
     });
     if shown.is_ok() {
         cx.activate(true);
     }
-    shown.is_ok()
+    shown.is_ok().then_some(window)
 }
 
 /// The window a folder from another program, Win+E or Arke started again open in as a tab: the
@@ -1314,11 +1540,12 @@ fn follow_language_setting(store: &gpui::Entity<settings::SettingsStore>, cx: &m
     apply_language(&store.read(cx).settings.language.locale(), cx);
 }
 
-/// Starts looking up Windows' names for file types the built-in table doesn't have; windows
+/// Starts looking up Windows' names for file types (all of them, when Arke speaks Windows' language); windows
 /// repaint (and re-sort by type) when names arrive.
 fn start_type_names(cx: &mut App) {
     let (tx, rx) = flume::bounded::<()>(1);
     let notify = tx.clone();
+    arke_core::format::set_windows_language(win::system_display_locale());
     arke_core::format::start_type_names(win_dragimage::registered_type_name, move || {
         let _ = tx.try_send(());
     });
@@ -1333,11 +1560,16 @@ fn start_type_names(cx: &mut App) {
     .detach();
 }
 
-/// Switches strings and the CJK font fallback order to `locale`, repainting if either changed.
+/// Switches strings and the text locale to `locale`, repainting if either changed.
 fn apply_language(locale: &str, cx: &mut App) {
-    // Fonts follow the UI language so Simplified text gets Simplified glyphs on a Traditional
-    // system and vice versa (see `theme::cjk_fallbacks`).
-    let mut changed = theme::set_ui_language(locale, win::system_locale());
+    // Text is laid out in the UI language's locale, so DirectWrite falls back to fonts of that
+    // language: Simplified text gets Simplified glyphs on a Traditional system and vice versa
+    // (see `win::text_locale`).
+    let text_locale = win::text_locale(locale, &win::user_locale_name());
+    let mut changed = cx.text_system().set_locale(text_locale);
+    if changed {
+        theme::touch();
+    }
     if *rust_i18n::locale() != *locale {
         rust_i18n::set_locale(locale);
         arke_core::format::language_changed();
@@ -2129,6 +2361,23 @@ mod arg_tests {
         parse_args_from(args.iter().map(std::ffi::OsString::from))
     }
 
+    /// A folder whose name has a lone surrogate (valid on NTFS, not valid Unicode) no longer
+    /// panics at startup: the flags are still read, the folder keeps its exact name.
+    #[cfg(windows)]
+    #[test]
+    fn a_folder_name_that_isnt_unicode_doesnt_stop_startup() {
+        use std::os::windows::ffi::{OsStrExt as _, OsStringExt as _};
+        let mut wide: Vec<u16> = r"C:\a".encode_utf16().collect();
+        wide.push(0xD800);
+        let folder = std::ffi::OsString::from_wide(&wide);
+        let flags = text_args_from(["arke.exe".into(), "--api".into(), folder.clone()].into_iter());
+        assert_eq!(flags[1], "--api");
+        assert_eq!(flags[2], "C:\\a\u{FFFD}");
+        let args = parse_args_from([folder].into_iter());
+        let kept: Vec<u16> = args.path.unwrap().as_os_str().encode_wide().collect();
+        assert_eq!(kept, wide, "the folder argument is read as it is");
+    }
+
     #[test]
     fn the_shells_drive_root_argument_gets_its_backslash_back() {
         // `"arke.exe" "C:\"` arrives as `C:"`.
@@ -2142,6 +2391,17 @@ mod arg_tests {
             Some(PathBuf::from(r"D:\my docs"))
         );
         assert_eq!(parse(&[r"C:\"]).path, Some(PathBuf::from(r"C:\")));
+    }
+
+    /// The copy started again without RedirectionGuard reads its arguments like the first one.
+    #[test]
+    fn the_relaunch_marker_is_not_a_path() {
+        use crate::redirection_guard::RELAUNCHED_ARG;
+        let args = parse(&[RELAUNCHED_ARG]);
+        assert!(args.path.is_none() && args.page.is_none() && !args.new_window);
+        let args = parse(&[RELAUNCHED_ARG, r"D:\work", "--new-window"]);
+        assert_eq!(args.path, Some(PathBuf::from(r"D:\work")));
+        assert!(args.new_window);
     }
 
     #[test]
@@ -2219,6 +2479,14 @@ mod arg_tests {
         assert_eq!(args.window_bench(), None);
         assert_eq!(args.bench_out, Some(PathBuf::from(r"C:\out.txt")));
         assert_eq!(args.path, None);
+    }
+
+    #[test]
+    fn bench_list_takes_a_folder_and_no_window() {
+        let args = parse(&[r"C:\big", "--bench", "list"]);
+        assert_eq!(args.bench, Some(BenchArg::List));
+        assert_eq!(args.window_bench(), None);
+        assert_eq!(args.path, Some(PathBuf::from(r"C:\big")));
     }
 
     #[test]

@@ -447,7 +447,7 @@ fn notes_from_feed(content: &str) -> String {
 }
 
 pub(crate) fn updates_dir() -> Option<PathBuf> {
-    crate::settings::data_dir().map(|dir| dir.join("updates"))
+    crate::paths::updates_dir()
 }
 
 /// Download the new version (background thread) and verify SHA-256. `progress(downloaded, total)`.
@@ -974,12 +974,14 @@ pub(crate) fn release_setup() {
 /// without changing anything, and Arke, still open, says the update didn't happen. Quitting right
 /// away would leave the user with no Arke and nothing to say why.
 fn run_setup(exe: &Path, cx: &mut App) {
+    use crate::update_quiet::Host as _;
     use std::sync::atomic::Ordering;
     if SETUP_RUNNING.swap(true, Ordering::SeqCst) {
         return;
     }
+    let per_user = crate::update_quiet::RealHost.installs_silently();
     match std::process::Command::new(exe)
-        .args(SETUP_SILENT)
+        .args(setup_flags(per_user))
         .arg(SETUP_LAUNCH)
         .spawn()
     {
@@ -993,6 +995,22 @@ fn run_setup(exe: &Path, cx: &mut App) {
 
 /// The installer's flags for an update: no wizard, no questions (`installer/arke.iss`).
 pub(crate) const SETUP_SILENT: [&str; 3] = ["/VERYSILENT", "/SUPPRESSMSGBOXES", "/NORESTART"];
+/// With [`SETUP_SILENT`] for a per-user install: no RedirectionGuard. Inno Setup would pass it on
+/// to the Arke it starts, which then couldn't open junctions a standard user made (#406), and a
+/// Setup that runs as the user without approval has nothing for it to guard. An all-users install's
+/// Setup runs elevated and keeps it (Inno Setup 6.7.4 doesn't pass it on to the Arke it starts as
+/// the user).
+pub(crate) const SETUP_NO_REDIRECTION_GUARD: &str = "/NOREDIRECTIONGUARD";
+
+/// What [`run_setup`] and a background update pass the installer: [`SETUP_SILENT`], and
+/// [`SETUP_NO_REDIRECTION_GUARD`] when Arke is installed for this user (`per_user`).
+pub(crate) fn setup_flags(per_user: bool) -> Vec<&'static str> {
+    let mut flags = SETUP_SILENT.to_vec();
+    if per_user {
+        flags.push(SETUP_NO_REDIRECTION_GUARD);
+    }
+    flags
+}
 /// The installer starts Arke again when it is done, with the tabs that were open.
 pub(crate) const SETUP_LAUNCH: &str = "/LAUNCH";
 /// With [`SETUP_LAUNCH`]: in the background instead, no window (`--background`).
@@ -1107,8 +1125,14 @@ pub(crate) fn channel_changed(channel: Channel, cx: &mut App) {
 }
 
 // Fork: automatic update check disabled (manual check in Settings still works).
-// /// Automatic check after startup: when enabled and more than 20 hours since the last check
-// /// (nightly ships daily).
+// /// Least time between two automatic checks. A release can follow another within hours (0.10.0
+// /// and 0.10.1 came out the same day), so Arke looks about once an hour, as VS Code does; just
+// /// under the hour, so the hourly timer in `main.rs` isn't skipped by a few seconds' drift. When
+// /// many people share one address the API limit falls back to the releases feed (`check`).
+// const CHECK_EVERY_SECS: u64 = 50 * 60;
+//
+// /// Automatic check after startup and on the hourly timer: when enabled and at least
+// /// [`CHECK_EVERY_SECS`] since the last check.
 // pub(crate) fn auto_check(cx: &mut App) {
 //     let settings = crate::settings::SettingsStore::global(cx)
 //         .read(cx)
@@ -1118,16 +1142,30 @@ pub(crate) fn channel_changed(channel: Channel, cx: &mut App) {
 //     {
 //         return;
 //     }
-//     let due = settings
-//         .update_checked
-//         .is_none_or(|at| unix_now().saturating_sub(at) > 20 * 3600);
-//     if due {
+//     if check_due(settings.update_checked, unix_now()) {
 //         start_check(settings.update_channel(), cx);
 //     } else {
 //         // Found on a metered connection: download it once the connection allows.
 //         crate::update_quiet::resume(cx);
 //     }
 // }
+
+/// Least time between two automatic checks. A release can follow another within hours (0.10.0
+/// and 0.10.1 came out the same day), so Arke looks about once an hour, as VS Code does; just
+/// under the hour, so the hourly timer in `main.rs` isn't skipped by a few seconds' drift. When
+/// many people share one address the API limit falls back to the releases feed (`check`).
+const CHECK_EVERY_SECS: u64 = 50 * 60;
+
+/// Whether an automatic check is due at `now`, the last one having been at `last` (Unix seconds).
+/// A last check in the future means the clock was set back: due, or checks would wait for the
+/// clock to catch up.
+#[allow(
+    dead_code,
+    reason = "only called from the disabled auto_check and its test"
+)]
+fn check_due(last: Option<u64>, now: u64) -> bool {
+    last.is_none_or(|at| now < at || now - at >= CHECK_EVERY_SECS)
+}
 
 fn unix_now() -> u64 {
     std::time::SystemTime::now()
@@ -1138,6 +1176,23 @@ fn unix_now() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The hourly timer checks on every tick, even one a little early, and never twice in a row
+    /// right after a check (a restart soon after starting doesn't ask GitHub again).
+    #[test]
+    fn automatic_checks_come_about_hourly() {
+        let at = 1_000_000;
+        assert!(check_due(None, at), "never checked");
+        assert!(!check_due(Some(at), at + 60), "a minute later");
+        assert!(check_due(Some(at), at + 3600), "an hour later");
+        assert!(check_due(Some(at), at + 3590), "a tick a few seconds early");
+        assert!(check_due(Some(at), at + 20 * 3600), "after a day away");
+        // A clock set back doesn't hold checks until it catches up.
+        assert!(
+            check_due(Some(at), at - 3 * 86_400),
+            "clock set back three days"
+        );
+    }
 
     #[test]
     fn detects_scoop_and_winget_installs() {
@@ -1166,6 +1221,24 @@ mod tests {
 
     fn v(s: &str) -> Version {
         Version::parse(s).unwrap_or_else(|| panic!("{s}"))
+    }
+
+    #[test]
+    fn per_user_updates_turn_redirection_guard_off() {
+        assert_eq!(
+            setup_flags(true),
+            [
+                "/VERYSILENT",
+                "/SUPPRESSMSGBOXES",
+                "/NORESTART",
+                "/NOREDIRECTIONGUARD"
+            ]
+        );
+        // An all-users install's Setup runs elevated: it keeps the protection.
+        assert_eq!(
+            setup_flags(false),
+            ["/VERYSILENT", "/SUPPRESSMSGBOXES", "/NORESTART"]
+        );
     }
 
     #[test]
@@ -1366,7 +1439,8 @@ mod tests {
         let proxy = std::env::var("ARKE_TEST_PROXY").expect("ARKE_TEST_PROXY=host:port");
         crate::update_route::set(&proxy);
         let url = "https://github.com/Koimsurai/Arke/releases/download/v0.8.1/arke-0.8.1-setup.exe";
-        let path = std::env::temp_dir().join(format!("arke-live-route-{}.exe", std::process::id()));
+        let tmp_dir = tempfile::tempdir().unwrap();
+        let path = tmp_dir.path().join("arke-live-route.exe");
         let mut file = std::fs::OpenOptions::new()
             .create(true)
             .truncate(true)
@@ -1389,7 +1463,6 @@ mod tests {
         })
         .unwrap();
         let bytes = std::fs::read(&path).unwrap();
-        let _ = std::fs::remove_file(&path);
         crate::update_route::set("");
         let actual = Sha256::digest(&bytes)
             .iter()
@@ -1474,9 +1547,8 @@ mod tests {
 
     #[test]
     fn a_new_exe_that_cant_start_is_rolled_back() {
-        let dir = std::env::temp_dir().join(format!("arke-test-rollback-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
+        let tmp_dir = tempfile::tempdir().unwrap();
+        let dir = tmp_dir.path().to_path_buf();
         let exe = dir.join("arke.exe");
         // What `install` leaves: the new exe in place, the running one beside it as .old.
         std::fs::write(&exe, b"new").unwrap();
@@ -1488,7 +1560,6 @@ mod tests {
         std::fs::write(&exe, b"new").unwrap();
         assert!(roll_back(&exe).is_err());
         assert_eq!(std::fs::read(&exe).unwrap(), b"new");
-        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
@@ -1515,9 +1586,8 @@ mod tests {
     /// newer partial one for the next try); what went in already or was overtaken goes.
     #[test]
     fn startup_keeps_only_a_newer_download() {
-        let dir = std::env::temp_dir().join(format!("arke-test-pending-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
+        let tmp_dir = tempfile::tempdir().unwrap();
+        let dir = tmp_dir.path().to_path_buf();
         for name in [
             "arke-0.3.0.exe",
             "arke-0.4.0.exe",
@@ -1539,15 +1609,13 @@ mod tests {
         assert_eq!(left, ["arke-0.6.0.exe", "arke-0.7.0.part"]);
         assert_eq!(keep_pending(&dir, &v("0.7.0"), ""), None, "all went in");
         assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 0);
-        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     /// The new exe goes in by two renames after the copy, the old one stays as `.old`.
     #[test]
     fn swaps_the_exe_keeping_the_old_one() {
-        let dir = std::env::temp_dir().join(format!("arke-test-swap-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
+        let tmp_dir = tempfile::tempdir().unwrap();
+        let dir = tmp_dir.path().to_path_buf();
         let exe = dir.join("arke.exe");
         let new = dir.join("arke-0.5.0.exe");
         std::fs::write(&exe, b"old").unwrap();
@@ -1556,19 +1624,16 @@ mod tests {
         assert_eq!(std::fs::read(&exe).unwrap(), b"new");
         assert_eq!(std::fs::read(old_path(&exe)).unwrap(), b"old");
         assert!(!new.exists() && !dir.join("arke.exe.new").exists());
-        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
     fn tells_installed_copies_by_the_uninstaller_next_to_them() {
-        let dir = std::env::temp_dir().join(format!("arke-test-setup-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
+        let tmp_dir = tempfile::tempdir().unwrap();
+        let dir = tmp_dir.path().to_path_buf();
         let exe = dir.join("arke.exe");
         std::fs::write(&exe, b"").unwrap();
         assert!(!setup_install_at(&exe));
         std::fs::write(dir.join(SETUP_UNINSTALLER), b"").unwrap();
         assert!(setup_install_at(&exe));
-        std::fs::remove_dir_all(&dir).unwrap();
     }
 }

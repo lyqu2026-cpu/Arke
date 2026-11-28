@@ -13,6 +13,9 @@ When gpui-pre is upgraded:
 
 Zed's Windows platform crate (Apache-2.0), unchanged except for:
 
+- `src/platform.rs` `Platform::drag_threshold`: reports `SM_CXDRAG` and `SM_CYDRAG` (at 96 DPI, so
+  logical pixels) for the drag threshold of gpui-pre (see there). Usually 4 px; GPUI's own was 2 px,
+  twice as sensitive as File Explorer.
 - `src/directx_renderer.rs`: the two path intermediate textures (one of them 4x MSAA) are made on
   the first frame that draws a path, and dropped when the window is resized or on the next frame
   without paths, instead of being kept for every window at all times. Together they take 20 of the
@@ -35,6 +38,10 @@ Zed's Windows platform crate (Apache-2.0), unchanged except for:
     recovery doesn't wait for the next frame.
 
   Worth offering upstream (Zed has the same loop).
+- Quieter log (`src/window.rs` `calculate_window_bounds` and `mouse_position`): a failed
+  `GetWindowPlacement` is logged only while the window still exists (it fails for every window
+  being closed), and a failed `GetCursorPos` (the screen is locked) is a debug line, not an
+  error.
 - Touchpad gestures over an idle window (`src/events.rs` `handle_dm_pointer_hit_test` and
   `draw_window`, `src/direct_manipulation.rs` `interacting`): Direct Manipulation's updates are
   only read in `draw_window`, and an idle window doesn't draw (see Idle vsync above). A touchpad
@@ -112,11 +119,89 @@ Zed's Windows platform crate (Apache-2.0), unchanged except for:
   Asking could only fail: during a drag out of Arke it logged a "RefCell already borrowed" error on
   every mouse move. Arke's `crates/app/src/win_fileops.rs` `drag_out` holds the drag guard; the
   input count is kept by the wrapper `on_input` puts around the callback. (#338, #343)
+- `src/window.rs` `a11y_init`: the accessibility adapter starts out knowing the window is focused
+  when it is the active window (`GetActiveWindow`, what `WM_ACTIVATE` reports), not only when it
+  is the foreground window. The first `WM_ACTIVATE` comes before the adapter exists, and the
+  window isn't always the foreground one yet at that point; when it becomes so, no second
+  `WM_ACTIVATE` follows. The adapter then thought the window never had focus, so screen readers
+  were given no focused element: NVDA read nothing in the main window or Settings. (#322)
+- `src/window.rs` `a11y_init` (second change) and `src/destination_list.rs`: some stripped
+  Windows installs lack DLLs that Arke delay-loads, and a failed delayed load ends the process.
+  `a11y_init` returns without making the adapter when `uiautomationcore.dll` can't be mapped from
+  the system folder, so there is no screen reader support but also no crash (every other a11y
+  path does nothing without an adapter). `create_destination_list` counts the description's
+  UTF-16 units itself instead of calling ICU's `u_strlen`, so `icuuc.dll` isn't needed. (#462)
+- Windows 10 top border, ported from Zed PR #63821 (not merged upstream yet; every hunk is marked
+  `zed#63821`): `src/util.rs` `is_windows_10`, `top_border_color` and `configure_dwm_dark_mode`;
+  `src/events.rs` `top_border_height`, `needs_win10_top_border`, `update_top_border`,
+  `update_frame_margins`, `handle_size_msg`, `handle_activate_msg`, `handle_create_msg` and
+  `handle_system_theme_changed`; `src/directx_renderer.rs` `DirectComposition`, `TopBorderVisual`,
+  `draw`, `draw_top_border`, `set_top_border_visible` and `resize`; `src/window.rs`
+  `WindowsWindowState::active`, `WindowsWindow::new` and `draw`. A window that hides its title bar
+  gives the whole top edge to its client area, and Windows 10 (build < 22000) then draws no top
+  border at all. The DWM frame is extended 1 px into the client area and the renderer clears that
+  row, so DWM draws the active border there; while the window is inactive, a DirectComposition
+  visual (one premultiplied pixel, `[43, 43, 43, 128]`, stretched to the window's width) draws it
+  instead. These windows ask DWM for a dark frame in either theme, or the border is drawn white.
+  None of it runs on Windows 11 except the root visual the scene now hangs off. Arke's own
+  change to it: anchored popups (menus) are left out, since they have no frame and are never
+  active. Re-apply on every GPUI upgrade until upstream has it, then take upstream's version.
+  (#420)
+- DirectX devices made ahead on another thread (`src/directx_devices.rs` `PendingDevices`;
+  `src/platform.rs` `new`, `pending_devices`, `attach_pending`, `connect_initially`,
+  `finish_attach`, `attach_gpu`, `detach_gpu`, `is_windowed`, `run` and `open_window`). Upstream
+  makes the devices in `run` on the UI thread before the app's launch callback, and loading the
+  driver and making the shaders took about 220 ms of a 370 ms cold start. `WindowsPlatform::new`
+  now starts a `DirectXDevices` thread when the default windowed start can show windows (the
+  check `connect_initially` makes). It makes the devices with the same `DirectXDevices::new` (same
+  adapter loop from 0, same flags), hands them over, then makes the renderer's shaders while
+  holding the device's shader cache. `run` no longer waits for them: the platform counts as
+  windowed, and the first `open_window` (or the end of the launch callback, if it opened none)
+  takes them and does the rest of `attach_gpu` (DirectWrite's GPU state, vsync) as before. So the
+  work overlaps DirectWrite, the platform window and the app's launch callback, and the first
+  window waits only for what isn't ready yet. If the app starts headless after all, the devices
+  are dropped unused; if the thread can't start or panics, they are made on the UI thread. A
+  failure still panics with "failed to initialize DirectX", now at the first window instead of
+  before the launch callback. Device lost is handled as before. The log says how long the devices
+  took and how long the UI thread waited for them.
+- Shaders shared per device (`src/directx_renderer.rs` `PipelineShader`, `PipelineShaders`,
+  `ShaderCache`, `PipelineState::new`, `DirectXRenderPipelines::new`, `DirectXRenderer::new`,
+  `handle_device_lost_impl`; `src/directx_devices.rs` `DirectXDevices::shaders`). Upstream every
+  window's renderer made the eight pipelines' sixteen shaders and their blend states again, so
+  each menu level (an `AnchoredPopup` window) did too, and debug builds compiled them from
+  source each time. They are made once per device and shared; each window only makes its
+  instance buffers. New devices after a device lost start with an empty cache, which the first
+  window recovering onto them fills. `RUST_LOG=gpui_windows=debug` logs each window renderer's
+  creation time.
+
+  Both worth offering upstream.
+- Text locale (`src/direct_write.rs` `DirectWriteState::layout_locale`, `set_locale`,
+  `layout_line_without_separators`, and the user locale read in `DirectWriteTextSystem::new`):
+  text formats take the locale given to `PlatformTextSystem::set_locale` (see gpui-pre below)
+  instead of always the user's (`GetUserDefaultLocaleName`, which `None` restores). DirectWrite's
+  system font fallback picks fonts for characters missing from the UI font by that locale, so Han
+  characters shared by Chinese, Japanese and Korean get the shapes of the app's UI language
+  rather than the system's. This replaced Arke's hard-coded fallback list (YaHei, JhengHei, Yu
+  Gothic in an order per UI language), which covered no other language. Font names are still read in the user's locale, and no font cache depends on the layout
+  locale. The user locale is kept without the buffer's trailing NULs, so it compares equal to the
+  same name passed in. Worth offering upstream with the gpui-pre half.
 
 ## gpui-pre 0.3.11
 
 Zed's GPUI (Apache-2.0), unchanged except for:
 
+- `src/platform.rs` `Platform::drag_threshold` (default method, 2 px per axis), `src/app.rs`
+  `App::drag_threshold`, `src/elements/div.rs` (the check that turns a press into a drag) and
+  `src/platform/test/platform.rs`, `src/app/test_context.rs` (`TestAppContext::set_drag_threshold`):
+  how far the pointer must move before `on_drag` starts is asked of the platform, per axis (a
+  rectangle centered on the press, like Windows' `SM_CXDRAG`/`SM_CYDRAG`), instead of the fixed 2 px
+  radius. Other platforms keep 2 px. Arke's own thresholds (marquee, right-button drag) use the same
+  value. Worth offering upstream.
+- `src/elements/div.rs` `InteractiveElement::on_focused_bounds` (`Interactivity::focused_bounds_listener`,
+  called in `Interactivity::prepaint`): a listener given the element's bounds each time it is
+  prepainted while it has the focus. Arke's Settings scroll the control Tab moved to into view with
+  it (`crates/app/src/keynav.rs`); upstream has no way to learn where an implicitly focusable element
+  is. (#322)
 - `src/elements/div.rs` `a11y_click_listeners` and the accessibility block of `Interactivity::paint`:
   an assistive technology's Click on an element with click listeners runs them, as Enter on the
   focused element does (`ClickEvent::Keyboard`). Upstream, Click falls back to a synthetic mouse
@@ -124,6 +209,24 @@ Zed's GPUI (Apache-2.0), unchanged except for:
   location…" in a short window, a Settings button below the fold) couldn't be pressed with a
   screen reader, and the click could land on whatever was drawn there instead. Elements that
   handle Click themselves (`on_a11y_action`) are left alone. (#322)
+- `src/elements/div.rs` `StatefulInteractiveElement::a11y_key` and `a11y_parent` (applied in the
+  accessibility block of `Interactivity::prepaint`) and `src/window/a11y.rs` `A11yNodeBuilder`
+  `name_current`, `move_current_under` and `apply_moves` (run in `finalize`): an element's node
+  can be put under a node named earlier in the frame instead of its nearest ancestor's, like
+  `aria-owns`. Arke's sidebar draws its folder tree as a flat list of rows, so every row was a
+  sibling of the others under the tree, and NVDA, which counts a tree item's level from the tree
+  items above it rather than reading its level, read every folder as "level 1". Each row now goes
+  under its parent folder's row (`crates/app/src/a11y.rs` `a11y_tree_row`), with no change to
+  layout. (#322)
+- `src/platform.rs` `PlatformTextSystem::set_locale` (default: unsupported, returns `false`) and
+  `src/text_system.rs` `TextSystem::set_locale`: the app sets the locale text is laid out in, which
+  picks locale-specific glyphs and fallback fonts (Han characters in Traditional or Simplified
+  Chinese, Japanese or Korean shapes). Upstream always uses the user's locale, so an app whose UI
+  language differs from it can't get its language's glyphs without naming fallback fonts. On a
+  change, cached line layouts are dropped (the font generation `add_fonts` also bumps) and the
+  line wrappers' char width caches are emptied (the pool's entries stay, since handles out of it
+  put their cache back under the same key). Arke calls it with `win::text_locale` when the UI
+  language is applied (`crates/app/src/main.rs` `apply_language`).
 
 The test platform, which only builds with the `test-support` feature:
 

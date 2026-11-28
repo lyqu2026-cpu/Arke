@@ -79,7 +79,7 @@ fn same(a: &Arc<RenderImage>, b: &Arc<RenderImage>) -> bool {
 }
 
 fn file() -> Option<PathBuf> {
-    std::env::var_os("LOCALAPPDATA").map(|d| PathBuf::from(d).join("Arke").join("menu-icons.bin"))
+    crate::paths::menu_icons_file()
 }
 
 /// Reads what was saved, for the commands still in `pinned`, keeping anything noted meanwhile.
@@ -119,8 +119,7 @@ fn save_soon() {
             }
             // Written whole, then put in place: a crash midway leaves the old file.
             let tmp = path.with_extension("tmp");
-            if let Err(e) = std::fs::write(&tmp, bytes).and_then(|()| std::fs::rename(&tmp, &path))
-            {
+            if let Err(e) = arke_core::fs::replace_file(&path, &tmp, bytes) {
                 log::warn!("menu icons not saved: {e}");
             }
         });
