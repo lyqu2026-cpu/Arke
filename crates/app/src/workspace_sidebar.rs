@@ -1903,6 +1903,7 @@ impl Workspace {
                         None,
                         icon,
                         0,
+                        None,
                         current,
                         true,
                         &mut group_rows,

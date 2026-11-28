@@ -86,7 +86,7 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           CHANNEL: ${{ inputs.channel }}
           ARCH: ${{ inputs.arch }}
-        run: |
+        run: | # zizmor: ignore[use-trusted-publishing] publishes a GitHub release, not a package index
           if [ "$ARCH" = "both" ]; then
             cargo xtask publish "$CHANNEL" --prebuilt
           else
